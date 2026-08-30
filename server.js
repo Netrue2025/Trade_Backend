@@ -11,6 +11,7 @@ const rootDir = fs.existsSync(path.join(workspaceRootDir, ".env")) && !fs.exists
 const frontendDir = fs.existsSync(path.join(workspaceRootDir, "frontend", "public", "index.html"))
   ? path.join(workspaceRootDir, "frontend", "public")
   : path.join(rootDir, "public");
+const DEFAULT_FRONTEND_ORIGIN = "https://trade-frontend-jwu2.onrender.com";
 
 function loadEnvFile() {
   const envPath = path.join(rootDir, ".env");
@@ -655,10 +656,14 @@ function normalizeOrigin(value) {
 }
 
 function getAllowedCorsOrigins() {
-  return getEnvValue("FRONTEND_ORIGIN", "FRONTEND_URL", "CORS_ORIGIN", "CORS_ORIGINS", "ALLOWED_ORIGINS")
-    .split(",")
+  const origins = [
+    DEFAULT_FRONTEND_ORIGIN,
+    ...getEnvValue("FRONTEND_ORIGIN", "FRONTEND_URL", "CORS_ORIGIN", "CORS_ORIGINS", "ALLOWED_ORIGINS").split(","),
+  ]
     .map(normalizeOrigin)
     .filter(Boolean);
+
+  return [...new Set(origins)];
 }
 
 function getRequestOrigin(req) {

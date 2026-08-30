@@ -11,7 +11,7 @@ npm start
 ```
 
 Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment.
-If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact frontend URL, for example `https://trade-frontend.onrender.com`.
+If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact frontend URL, for example `https://trade-frontend-jwu2.onrender.com`.
 
 ## Scripts
 
