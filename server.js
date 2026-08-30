@@ -56,6 +56,11 @@ const { AutoTradeService } = require("./src/services/autoTradeService");
 const { SocketSignalService } = require("./src/services/socketSignalService");
 const { SignalEngine } = require("./src/services/signalEngine");
 const { SignalController } = require("./src/controllers/signalController");
+const {
+  cancelFuturesOrder: cancelBinanceFuturesOrder,
+  closeFuturesPosition: closeBinanceFuturesPosition,
+  getFuturesAccount: getBinanceFuturesAccount,
+} = require("./lib/binance");
 
 const DEFAULT_PORT = 3000;
 const MAX_PORT_RETRIES = 10;
@@ -4169,6 +4174,93 @@ async function handleApi(req, res, url) {
       await syncCanceledOrderInTrades(user, order, symbol);
       persist();
       sendJson(res, 200, { order, exchange });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/binance/futures/account") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+
+    const account = getExchangeAccount(user, "binance");
+    if (!account) {
+      sendJson(res, 404, { error: "No Binance account connected yet." });
+      return true;
+    }
+
+    try {
+      const snapshot = await getBinanceFuturesAccount(account);
+      account.lastValidatedAt = nowIso();
+      persist();
+      sendJson(res, 200, snapshot);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const cancelFuturesOpenOrderMatch = url.pathname.match(/^\/api\/binance\/futures\/open-orders\/([^/]+)\/cancel$/);
+  if (req.method === "POST" && cancelFuturesOpenOrderMatch) {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+
+    const account = getExchangeAccount(user, "binance");
+    if (!account) {
+      sendJson(res, 400, { error: "No Binance account connected yet." });
+      return true;
+    }
+
+    const body = await readBody(req);
+    const symbol = String(body.symbol || "").trim().toUpperCase();
+    const orderId = decodeURIComponent(cancelFuturesOpenOrderMatch[1] || "").trim();
+    if (!symbol || !orderId) {
+      sendJson(res, 400, { error: "Futures order symbol and order id are required." });
+      return true;
+    }
+
+    try {
+      const order = await cancelBinanceFuturesOrder(account, symbol, orderId);
+      account.lastValidatedAt = nowIso();
+      persist();
+      sendJson(res, 200, { order, exchange: "binance", market: "futures" });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/binance/futures/positions/close") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+
+    const account = getExchangeAccount(user, "binance");
+    if (!account) {
+      sendJson(res, 400, { error: "No Binance account connected yet." });
+      return true;
+    }
+
+    const body = await readBody(req);
+    const symbol = String(body.symbol || "").trim().toUpperCase();
+    const positionSide = String(body.positionSide || "BOTH").trim().toUpperCase();
+    const quantity = Number(body.quantity || 0);
+    if (!symbol) {
+      sendJson(res, 400, { error: "Futures position symbol is required." });
+      return true;
+    }
+
+    try {
+      const order = await closeBinanceFuturesPosition(account, symbol, positionSide, quantity);
+      account.lastValidatedAt = nowIso();
+      persist();
+      sendJson(res, 200, { order, exchange: "binance", market: "futures" });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
