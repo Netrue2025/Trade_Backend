@@ -11,6 +11,7 @@ npm start
 ```
 
 Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment.
+If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact frontend URL, for example `https://trade-frontend.onrender.com`.
 
 ## Scripts
 
@@ -21,4 +22,4 @@ Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before prod
 
 ## Deployment Notes
 
-This backend exposes normal HTTP API routes plus websocket endpoints. If you deploy the frontend separately, configure the frontend domain to proxy `/api`, `/ws`, and `/socket.io` to this backend or set the frontend API base URL.
+This backend exposes normal HTTP API routes plus websocket endpoints. If you deploy the frontend separately, set `FRONTEND_ORIGIN` here and set `TRADE_API_BASE_URL` on the frontend service.

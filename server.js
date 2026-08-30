@@ -641,6 +641,72 @@ function buildSecurityHeaders() {
   };
 }
 
+function normalizeOrigin(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "");
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return raw;
+  }
+}
+
+function getAllowedCorsOrigins() {
+  return getEnvValue("FRONTEND_ORIGIN", "FRONTEND_URL", "CORS_ORIGIN", "CORS_ORIGINS", "ALLOWED_ORIGINS")
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean);
+}
+
+function getRequestOrigin(req) {
+  return normalizeOrigin(req.headers.origin);
+}
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) {
+    return false;
+  }
+
+  return getAllowedCorsOrigins().includes(origin);
+}
+
+function buildCorsHeaders(req) {
+  const origin = getRequestOrigin(req);
+  if (!isAllowedCorsOrigin(origin)) {
+    return {};
+  }
+
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": req.headers["access-control-request-headers"] || "Content-Type, Authorization",
+    "Vary": "Origin",
+  };
+}
+
+function applyCorsHeaders(req, res) {
+  for (const [key, value] of Object.entries(buildCorsHeaders(req))) {
+    res.setHeader(key, value);
+  }
+}
+
+function handleCorsPreflight(req, res) {
+  if (req.method !== "OPTIONS") {
+    return false;
+  }
+
+  res.writeHead(204, {
+    ...buildSecurityHeaders(),
+    ...buildCorsHeaders(req),
+  });
+  res.end();
+  return true;
+}
+
 function getRequestIp(req) {
   return String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "")
     .split(",")[0]
@@ -3111,12 +3177,22 @@ function isSecureRequest(req) {
   return forwardedProto.includes("https");
 }
 
+function shouldUseCrossSiteCookie(req) {
+  const origin = getRequestOrigin(req);
+  if (!origin || !isAllowedCorsOrigin(origin)) {
+    return false;
+  }
+
+  const requestOrigin = normalizeOrigin(`${isSecureRequest(req) ? "https" : "http"}://${req.headers.host || ""}`);
+  return origin !== requestOrigin && isSecureRequest(req);
+}
+
 function buildSessionCookie(req, value, maxAgeSeconds = 0) {
   const parts = [
     `sid=${encodeURIComponent(value)}`,
     "HttpOnly",
     "Path=/",
-    "SameSite=Lax",
+    shouldUseCrossSiteCookie(req) ? "SameSite=None" : "SameSite=Lax",
   ];
 
   if (maxAgeSeconds > 0) {
@@ -3143,6 +3219,14 @@ function clearSessionCookie(req, res) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    sendJson(res, 200, {
+      ok: true,
+      storage: shouldUseMongo() ? "mongodb" : "local-json",
+    });
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { user: user ? sanitizeUser(user) : null, exchanges: listExchanges() });
@@ -4594,6 +4678,11 @@ function serveStatic(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  applyCorsHeaders(req, res);
+
+  if (handleCorsPreflight(req, res)) {
+    return;
+  }
 
   try {
     const handled = await handleApi(req, res, url);
