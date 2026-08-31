@@ -1098,17 +1098,17 @@ class FinancialService {
 
   normalizeWithdrawalDestination(currency, input = {}) {
     if (currency === "USDT") {
-      const address = String(input.address || input.walletAddress || "").trim();
-      const network = String(input.network || "").trim();
+      const address = String(input.address || input.walletAddress || input.usdtAddress || input.destinationAddress || "").trim();
+      const network = String(input.network || input.usdtNetwork || input.chain || this.db.systemSettings.deposit.usdtNetwork || "").trim();
       if (!address || !network) {
         throw new Error("USDT withdrawal address and network are required.");
       }
       return { type: "USDT_WALLET", address, network };
     }
 
-    const bankName = String(input.bankName || "").trim();
-    const accountName = String(input.accountName || "").trim();
-    const accountNumber = String(input.accountNumber || "").replace(/\s+/g, "").trim();
+    const bankName = String(input.bankName || input.bank || input.bank_name || "").trim();
+    const accountName = String(input.accountName || input.accountHolder || input.accountHolderName || input.name || "").trim();
+    const accountNumber = String(input.accountNumber || input.accountNo || input.account || input.number || "").replace(/\D/g, "").trim();
     if (!bankName || !accountName || !/^\d{10}$/.test(accountNumber)) {
       throw new Error("Bank name, account name, and a 10-digit account number are required.");
     }

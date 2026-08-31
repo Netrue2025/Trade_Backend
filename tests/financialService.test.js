@@ -137,6 +137,46 @@ test("withdrawal rejection refunds reserved funds", () => {
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "0");
 });
 
+test("USDT withdrawal accepts wallet aliases and configured network", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "100");
+  service.updateSettings(admin, {
+    deposit: {
+      usdtNetwork: "TRC20",
+    },
+  });
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20",
+    currency: "USDT",
+    destination: {
+      walletAddress: "TUserWalletAddress",
+    },
+  });
+
+  assert.equal(withdrawal.destination.address, "TUserWalletAddress");
+  assert.equal(withdrawal.destination.network, "TRC20");
+});
+
+test("NGN withdrawal accepts account aliases and formatted account number", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "25000");
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "12000",
+    currency: "NGN",
+    destination: {
+      bank: "Test Bank",
+      accountHolderName: "Ada User",
+      accountNo: "123-456 7890",
+    },
+  });
+
+  assert.equal(withdrawal.destination.bankName, "Test Bank");
+  assert.equal(withdrawal.destination.accountName, "Ada User");
+  assert.equal(withdrawal.destination.accountNumber, "1234567890");
+});
+
 test("daily performance compounds from current eligible balance and does not double apply", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
