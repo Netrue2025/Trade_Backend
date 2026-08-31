@@ -1358,6 +1358,40 @@ async function buildSettingsUsersPayload(user, { refreshWallets = true } = {}) {
   };
 }
 
+async function getAdminBybitMirrorPnl() {
+  const admin = db.users.find((item) => item.role === "admin" && item.bybit);
+  if (!admin?.bybit) {
+    return null;
+  }
+
+  const cachedSnapshot = getCachedAccountSnapshot(admin.bybit, "bybit");
+  try {
+    const snapshot = cachedSnapshot && isCachedAccountSnapshotFresh(cachedSnapshot, 15_000)
+      ? cachedSnapshot
+      : await getAccountSnapshot(admin.bybit, "bybit");
+    admin.bybit.lastValidatedAt = nowIso();
+    persist();
+    return {
+      source: "ADMIN_BYBIT",
+      todayPnlPercent: Number(snapshot.todayPnlPercent || 0),
+      todayPnlValue: Number(snapshot.todayPnlValue || 0),
+      updatedAt: snapshot.updatedAt || snapshot.cachedAt || nowIso(),
+      stale: !!snapshot.stale,
+    };
+  } catch {
+    if (!cachedSnapshot) {
+      return null;
+    }
+    return {
+      source: "ADMIN_BYBIT",
+      todayPnlPercent: Number(cachedSnapshot.todayPnlPercent || 0),
+      todayPnlValue: Number(cachedSnapshot.todayPnlValue || 0),
+      updatedAt: cachedSnapshot.updatedAt || cachedSnapshot.cachedAt || null,
+      stale: true,
+    };
+  }
+}
+
 async function getUsdtToNgnRate() {
   if (Number(process.env.BYBIT_USDT_NGN_RATE || 0) > 0) {
     return Number(process.env.BYBIT_USDT_NGN_RATE);
@@ -2359,9 +2393,6 @@ function normalizeOrderInput(body) {
   if (type === "MARKET" && !quantity && !quoteOrderQty) {
     throw new Error("Provide quantity or quote order size for market orders.");
   }
-  if (type === "MARKET" && side === "SELL" && !quantity) {
-    throw new Error("Market sells require the asset quantity, not just the quote amount.");
-  }
   if (type === "LIMIT" && (!quantity || !price)) {
     throw new Error("Limit orders require both quantity and entry price.");
   }
@@ -2644,6 +2675,45 @@ async function getMaxSellQuantityForAccount(
   return normalizedQuantity;
 }
 
+async function resolveSellOrderInputForExchange(account, orderInput, exchangeInfoOverride = null) {
+  if (orderInput.side !== "SELL") {
+    return orderInput;
+  }
+
+  if (orderInput.type !== "MARKET" || !orderInput.quoteOrderQty || orderInput.quantity) {
+    return {
+      ...orderInput,
+      quoteOrderQty: undefined,
+    };
+  }
+
+  const exchange = getAccountExchange(account);
+  const ticker = await getTickerPrice(orderInput.symbol, account.testnet, exchange);
+  const price = Number(ticker.price || 0);
+  const requestedQuoteValue = Number(orderInput.quoteOrderQty || 0);
+
+  if (!price) {
+    throw new Error(`Unable to determine a live price for ${orderInput.symbol} before selling.`);
+  }
+  if (!requestedQuoteValue) {
+    throw new Error("Enter a sell amount before placing the order.");
+  }
+
+  const quantity = await getMaxSellQuantityForAccount(
+    account,
+    orderInput.symbol,
+    exchangeInfoOverride,
+    orderInput.type,
+    requestedQuoteValue / price
+  );
+
+  return {
+    ...orderInput,
+    quantity,
+    quoteOrderQty: undefined,
+  };
+}
+
 async function executeOrderForUser(user, orderInput, purpose, exchange) {
   const normalizedExchange = normalizeExchange(exchange, getPreferredExchange(user));
   const account = getExchangeAccount(user, normalizedExchange);
@@ -2661,9 +2731,14 @@ async function executeOrderForUser(user, orderInput, purpose, exchange) {
 
   try {
     const exchangeInfo = await getExchangeInfo(orderInput.symbol, account.testnet, normalizedExchange);
-    const normalizedOrderInput = await normalizeOrderForExchange(
+    const resolvedOrderInput = await resolveSellOrderInputForExchange(
       { ...account, exchange: normalizedExchange },
       orderInput,
+      exchangeInfo
+    );
+    const normalizedOrderInput = await normalizeOrderForExchange(
+      { ...account, exchange: normalizedExchange },
+      resolvedOrderInput,
       exchangeInfo
     );
     await validateNotionalRule({ ...account, exchange: normalizedExchange }, normalizedOrderInput, exchangeInfo);
@@ -2777,7 +2852,8 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   }
 
   const exchangeInfo = await getExchangeInfo(orderInput.symbol, adminAccount.testnet, exchange);
-  const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, orderInput, exchangeInfo);
+  const resolvedOrderInput = await resolveSellOrderInputForExchange({ ...adminAccount, exchange }, orderInput, exchangeInfo);
+  const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, resolvedOrderInput, exchangeInfo);
   await validateNotionalRule({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
   const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, normalizedOrderInput, exchange);
   const trade = {
@@ -3345,7 +3421,9 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    sendJson(res, 200, financialService.getDashboard(user));
+    const dashboard = financialService.getDashboard(user);
+    const mirrorPnl = await getAdminBybitMirrorPnl();
+    sendJson(res, 200, mirrorPnl ? financialService.applyMirroredPnlToDashboard(dashboard, mirrorPnl) : dashboard);
     return true;
   }
 

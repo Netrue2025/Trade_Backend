@@ -266,6 +266,53 @@ class FinancialService {
     };
   }
 
+  getWalletHistory(user, { limit = 80 } = {}) {
+    this.ensureState();
+    const canSee = (record) => user.role === "admin" || record.userId === user.id;
+    const deposits = this.db.deposits
+      .filter(canSee)
+      .map((deposit) => ({
+        id: deposit.id,
+        kind: "DEPOSIT",
+        type: "DEPOSIT",
+        status: deposit.status,
+        currency: deposit.currency,
+        amount: deposit.amount,
+        displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(deposit.amount, deposit.currency, deposit.exchangeRate),
+        reference: deposit.transactionHash || deposit.id,
+        description: "Deposit",
+        createdAt: deposit.submittedAt,
+        userId: deposit.userId,
+      }));
+    const withdrawals = this.db.withdrawals
+      .filter(canSee)
+      .map((withdrawal) => ({
+        id: withdrawal.id,
+        kind: "WITHDRAWAL",
+        type: "WITHDRAWAL",
+        status: withdrawal.status,
+        currency: withdrawal.currency,
+        amount: `-${withdrawal.amount}`,
+        displayAmounts: withdrawal.displayAmounts || this.getDisplayAmounts(withdrawal.amount, withdrawal.currency, withdrawal.exchangeRate),
+        reference: withdrawal.externalTransactionReference || withdrawal.id,
+        description: "Withdrawal",
+        createdAt: withdrawal.submittedAt,
+        userId: withdrawal.userId,
+      }));
+    const ledgerTransactions = this.db.transactions
+      .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL"].includes(transaction.type))
+      .map((transaction) => ({
+        ...clone(transaction),
+        kind: "LEDGER",
+        displayAmounts: transaction.metadata?.displayAmounts || this.getDisplayAmounts(transaction.amount, transaction.currency),
+      }));
+
+    return [...deposits, ...withdrawals, ...ledgerTransactions]
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      .slice(0, limit)
+      .map((item) => this.enrichUserRecord(item));
+  }
+
   listNotifications(user, { limit = 20 } = {}) {
     this.ensureState();
     return this.db.notifications
@@ -354,11 +401,46 @@ class FinancialService {
           .reduce((sum, transaction) => add(sum, transaction.amount), "0"),
       },
       recentTransactions: this.getTransactions(user.id, { limit: 10 }),
+      walletHistory: this.getWalletHistory(user, { limit: 80 }),
       notifications: this.listNotifications(user, { limit: 12 }),
       settings: {
         deposit: clone(this.db.systemSettings.deposit),
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
+      },
+    };
+  }
+
+  applyMirroredPnlToDashboard(dashboard, mirror = {}) {
+    const percentage = String(mirror.todayPnlPercent ?? mirror.percent ?? "0");
+    const baseUsdt = String(dashboard?.totalBalance?.usdt || "0");
+    const rate = String(dashboard?.totalBalance?.usdtToNgnRate || this.db.systemSettings.exchangeRate.usdtToNgn);
+    const pnlUsdt = multiplyRatio(baseUsdt, percentage, "100");
+    const liveUsdt = add(baseUsdt, pnlUsdt);
+    const liveNgn = this.convertAmount(liveUsdt, "USDT", "NGN", rate);
+    return {
+      ...dashboard,
+      totalBalance: {
+        ...dashboard.totalBalance,
+        baseUsdt,
+        baseNgnEquivalent: dashboard.totalBalance.ngnEquivalent,
+        usdt: liveUsdt,
+        ngnEquivalent: liveNgn,
+      },
+      performance: {
+        ...dashboard.performance,
+        todayUsdt: pnlUsdt,
+        todayPercentage: percentage,
+        mirroredFrom: mirror.source || "ADMIN_BYBIT",
+      },
+      mirrorPnl: {
+        source: mirror.source || "ADMIN_BYBIT",
+        percent: percentage,
+        amountUsdt: pnlUsdt,
+        baseUsdt,
+        liveUsdt,
+        stale: !!mirror.stale,
+        updatedAt: mirror.updatedAt || mirror.cachedAt || null,
       },
     };
   }

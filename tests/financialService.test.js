@@ -98,6 +98,29 @@ test("admin rate setting drives deposit equivalents", () => {
   assert.equal(deposit.displayAmounts.NGN, "3000");
 });
 
+test("wallet history includes deposit and withdrawal request statuses", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "100");
+
+  const approvedDeposit = service.createDeposit(user, { amount: "10", currency: "USDT", transactionHash: "0xok" });
+  service.approveDeposit(admin, approvedDeposit.id);
+  const rejectedDeposit = service.createDeposit(user, { amount: "12", currency: "USDT", transactionHash: "0xreject" });
+  service.rejectDeposit(admin, rejectedDeposit.id);
+  const pendingWithdrawal = service.createWithdrawal(user, {
+    amount: "5",
+    currency: "USDT",
+    destination: {
+      address: "TUserWalletAddress",
+      network: "TRC20",
+    },
+  });
+
+  const history = service.getDashboard(user).walletHistory;
+  assert.ok(history.some((item) => item.id === approvedDeposit.id && item.kind === "DEPOSIT" && item.status === "APPROVED"));
+  assert.ok(history.some((item) => item.id === rejectedDeposit.id && item.kind === "DEPOSIT" && item.status === "REJECTED"));
+  assert.ok(history.some((item) => item.id === pendingWithdrawal.id && item.kind === "WITHDRAWAL" && item.status === "PENDING"));
+});
+
 test("withdrawal completion reserves funds and clears locked balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
@@ -203,6 +226,25 @@ test("daily performance compounds from current eligible balance and does not dou
   const secondApply = service.applyDailyPerformance(admin, dayTwo.id);
   assert.equal(secondApply.appliedCount, 1);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100.98");
+});
+
+test("mirrored pnl overlay dynamically adjusts unified user balance", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "10");
+  setWallet(service, user.id, "NGN", "16000");
+
+  const dashboard = service.getDashboard(user);
+  const mirrored = service.applyMirroredPnlToDashboard(dashboard, {
+    todayPnlPercent: "5",
+    source: "ADMIN_BYBIT",
+  });
+
+  assert.equal(dashboard.totalBalance.usdt, "20");
+  assert.equal(mirrored.totalBalance.baseUsdt, "20");
+  assert.equal(mirrored.totalBalance.usdt, "21");
+  assert.equal(mirrored.totalBalance.ngnEquivalent, "33600");
+  assert.equal(mirrored.performance.todayUsdt, "1");
+  assert.equal(mirrored.performance.todayPercentage, "5");
 });
 
 test("daily withdrawal limit is enforced", () => {
