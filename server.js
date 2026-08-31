@@ -3378,6 +3378,21 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const notificationReadMatch = url.pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (req.method === "POST" && notificationReadMatch) {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    try {
+      const notification = financialService.markNotificationRead(user, decodeURIComponent(notificationReadMatch[1] || "").trim());
+      sendJson(res, 200, { notification });
+    } catch (error) {
+      sendJson(res, 404, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/deposits") {
     const user = requireAuth(req, res, "user");
     if (!user) {

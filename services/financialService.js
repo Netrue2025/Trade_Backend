@@ -175,7 +175,7 @@ class FinancialService {
     };
 
     if (patch.exchangeRate?.usdtToNgn !== undefined) {
-      normalizeAmount(patch.exchangeRate.usdtToNgn, "USDT to NGN rate");
+      next.exchangeRate.usdtToNgn = normalizeAmount(patch.exchangeRate.usdtToNgn, "USDT to NGN rate");
       next.exchangeRate.updatedAt = this.clock();
       next.exchangeRate.updatedBy = admin.id;
     }
@@ -185,6 +185,27 @@ class FinancialService {
     this.audit(admin, "SETTINGS_UPDATED", "SystemSettings", "current", { sections: Object.keys(patch) }, requestMeta);
     this.persist();
     return this.getSettings();
+  }
+
+  convertAmount(amount, fromCurrency, toCurrency, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
+    const from = normalizeCurrency(fromCurrency);
+    const to = normalizeCurrency(toCurrency);
+    if (from === to) {
+      return String(amount);
+    }
+    normalizeAmount(rate, "USDT to NGN rate");
+    return from === "USDT"
+      ? multiplyRatio(amount, rate, "1")
+      : multiplyRatio(amount, "1", rate);
+  }
+
+  getDisplayAmounts(amount, currency, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
+    const normalizedCurrency = normalizeCurrency(currency);
+    return {
+      USDT: normalizedCurrency === "USDT" ? String(amount) : this.convertAmount(amount, "NGN", "USDT", rate),
+      NGN: normalizedCurrency === "NGN" ? String(amount) : this.convertAmount(amount, "USDT", "NGN", rate),
+      rate: String(rate),
+    };
   }
 
   ensureWallet(userId, currency) {
@@ -248,10 +269,21 @@ class FinancialService {
   listNotifications(user, { limit = 20 } = {}) {
     this.ensureState();
     return this.db.notifications
-      .filter((item) => user.role === "admin" || item.userId === user.id)
+      .filter((item) => item.userId === user.id)
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(0, limit)
       .map((item) => this.enrichUserRecord(item));
+  }
+
+  markNotificationRead(user, notificationId) {
+    this.ensureState();
+    const notification = this.db.notifications.find((item) => item.id === notificationId && item.userId === user.id);
+    if (!notification) {
+      throw new Error("Notification not found.");
+    }
+    notification.readAt = notification.readAt || this.clock();
+    this.persist();
+    return clone(notification);
   }
 
   createNotification(input = {}) {
@@ -280,8 +312,12 @@ class FinancialService {
     this.ensureState();
     const wallets = this.getWallets(user.id);
     const usdtWallet = wallets.find((wallet) => wallet.currency === "USDT");
+    const ngnWallet = wallets.find((wallet) => wallet.currency === "NGN");
     const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
-    const totalNgnEquivalent = multiplyRatio(usdtWallet.availableBalance, rate, "1");
+    const availableUsdtEquivalent = add(usdtWallet.availableBalance, this.convertAmount(ngnWallet.availableBalance, "NGN", "USDT", rate));
+    const totalNgnEquivalent = add(ngnWallet.availableBalance, this.convertAmount(usdtWallet.availableBalance, "USDT", "NGN", rate));
+    const lockedUsdtEquivalent = add(usdtWallet.lockedBalance, this.convertAmount(ngnWallet.lockedBalance, "NGN", "USDT", rate));
+    const lockedNgnEquivalent = add(ngnWallet.lockedBalance, this.convertAmount(usdtWallet.lockedBalance, "USDT", "NGN", rate));
     const today = this.clock().slice(0, 10);
     const todayTransactions = this.db.transactions
       .filter(
@@ -304,8 +340,10 @@ class FinancialService {
       },
       wallets,
       totalBalance: {
-        usdt: usdtWallet.availableBalance,
+        usdt: availableUsdtEquivalent,
         ngnEquivalent: totalNgnEquivalent,
+        lockedUsdt: lockedUsdtEquivalent,
+        lockedNgnEquivalent,
         usdtToNgnRate: rate,
       },
       performance: {
@@ -350,6 +388,8 @@ class FinancialService {
       userId: user.id,
       amount,
       currency,
+      exchangeRate: this.db.systemSettings.exchangeRate.usdtToNgn,
+      displayAmounts: this.getDisplayAmounts(amount, currency),
       depositAddress: currency === "USDT" ? settings.usdtAddress : "",
       network: currency === "USDT" ? settings.usdtNetwork : "BANK",
       status: "PENDING",
@@ -415,6 +455,9 @@ class FinancialService {
       description: `Manual ${deposit.currency} deposit approved by admin.`,
       createdBy: admin.id,
       createdAt: this.clock(),
+      metadata: {
+        displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(deposit.amount, deposit.currency, deposit.exchangeRate),
+      },
     });
     this.createNotification({
       userId: deposit.userId,
@@ -571,25 +614,21 @@ class FinancialService {
       return [{ wallet: primaryWallet, currency, amount }];
     }
 
-    if (currency !== "USDT") {
-      throw new Error("Insufficient available balance.");
-    }
-
     const sources = [];
-    let remainingUsdt = amount;
+    let remainingAmount = amount;
     if (compare(primaryWallet.availableBalance, "0") > 0) {
-      sources.push({ wallet: primaryWallet, currency: "USDT", amount: primaryWallet.availableBalance });
-      remainingUsdt = subtract(remainingUsdt, primaryWallet.availableBalance);
+      sources.push({ wallet: primaryWallet, currency, amount: primaryWallet.availableBalance });
+      remainingAmount = subtract(remainingAmount, primaryWallet.availableBalance);
     }
 
-    const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
-    const ngnAmount = multiplyRatio(remainingUsdt, rate, "1");
-    const ngnWallet = this.ensureWallet(userId, "NGN");
-    if (compare(ngnWallet.availableBalance, ngnAmount) < 0) {
+    const alternateCurrency = currency === "USDT" ? "NGN" : "USDT";
+    const alternateAmount = this.convertAmount(remainingAmount, currency, alternateCurrency);
+    const alternateWallet = this.ensureWallet(userId, alternateCurrency);
+    if (compare(alternateWallet.availableBalance, alternateAmount) < 0) {
       throw new Error("Insufficient available balance.");
     }
 
-    sources.push({ wallet: ngnWallet, currency: "NGN", amount: ngnAmount });
+    sources.push({ wallet: alternateWallet, currency: alternateCurrency, amount: alternateAmount });
     return sources;
   }
 
@@ -612,6 +651,7 @@ class FinancialService {
       currency,
       status: "PENDING",
       exchangeRate: this.db.systemSettings.exchangeRate.usdtToNgn,
+      displayAmounts: this.getDisplayAmounts(amount, currency),
       destination: this.normalizeWithdrawalDestination(currency, input.destination || input),
       fee: currency === "USDT" ? this.db.systemSettings.withdrawal.usdtFee : this.db.systemSettings.withdrawal.ngnFee,
       submittedAt: this.clock(),

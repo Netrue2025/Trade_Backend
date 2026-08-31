@@ -68,10 +68,34 @@ test("naira deposit approval credits NGN wallet", () => {
   });
 
   assert.equal(deposit.currency, "NGN");
+  assert.equal(deposit.displayAmounts.USDT, "3.125");
+  assert.equal(deposit.displayAmounts.NGN, "5000");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
+  assert.equal(service.getDashboard(user).totalBalance.usdt, "4.6875");
+  assert.equal(service.getDashboard(user).totalBalance.ngnEquivalent, "7500");
+});
+
+test("admin rate setting drives deposit equivalents", () => {
+  const { admin, service, user } = createHarness();
+  const settings = service.updateSettings(admin, {
+    exchangeRate: {
+      usdtToNgn: "1500",
+    },
+  });
+
+  const deposit = service.createDeposit(user, {
+    amount: "3000",
+    currency: "NGN",
+    transactionHash: "bank-ref-rate",
+  });
+
+  assert.equal(settings.exchangeRate.usdtToNgn, "1500");
+  assert.equal(deposit.exchangeRate, "1500");
+  assert.equal(deposit.displayAmounts.USDT, "2");
+  assert.equal(deposit.displayAmounts.NGN, "3000");
 });
 
 test("withdrawal completion reserves funds and clears locked balance", () => {
@@ -224,6 +248,44 @@ test("USDT withdrawal can reserve NGN equivalent when USDT wallet is short", () 
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "5");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "0");
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "32000");
+});
+
+test("NGN withdrawal can reserve USDT equivalent when naira wallet is short", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "8000");
+  setWallet(service, user.id, "USDT", "10");
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "16000",
+    currency: "NGN",
+    destination: {
+      bankName: "Test Bank",
+      accountName: "Ada User",
+      accountNumber: "1234567890",
+    },
+  });
+
+  assert.deepEqual(withdrawal.fundingSources, [
+    { currency: "NGN", amount: "8000" },
+    { currency: "USDT", amount: "5" },
+  ]);
+  assert.equal(withdrawal.displayAmounts.USDT, "10");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "8000");
+  assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "5");
+});
+
+test("notification can be marked as read by owner", () => {
+  const { service, user } = createHarness();
+  const notification = service.createNotification({
+    userId: user.id,
+    type: "MESSAGE",
+    title: "Hello",
+    message: "Check support.",
+  });
+
+  const read = service.markNotificationRead(user, notification.id);
+  assert.ok(read.readAt);
+  assert.equal(service.listNotifications(user)[0].readAt, read.readAt);
 });
 
 test("admin can delete selected finance history records", () => {
