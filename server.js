@@ -98,6 +98,13 @@ const SIGNAL_AUTO_TRADE_DEFAULT_SECOND_BALANCE_PERCENT = 100;
 const SIGNAL_AUTO_TRADE_DEFAULT_MAX_SIMULTANEOUS_TRADES = 2;
 const SIGNAL_AUTO_TRADE_STRATEGY_TYPE = "SIGNAL_AUTO";
 const SIGNAL_INGEST_SECRET = String(getEnvValue("SIGNAL_INGEST_SECRET") || "").trim();
+const PERFORMANCE_TIME_ZONE = "Africa/Lagos";
+const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  timeZone: PERFORMANCE_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
 
 let db = null;
 let financialService = null;
@@ -518,6 +525,8 @@ function sanitizeStoredAccountSnapshot(snapshot, fallbackExchange = "bybit") {
     todayOpeningUsdt: Number(cloned.todayOpeningUsdt || 0),
     todayClosingUsdt: Number(cloned.todayClosingUsdt || 0),
     todayLabel: String(cloned.todayLabel || ""),
+    todayTimeZone: String(cloned.todayTimeZone || ""),
+    todayAssetPnl: Array.isArray(cloned.todayAssetPnl) ? cloned.todayAssetPnl : [],
     monthPnlValue: Number(cloned.monthPnlValue || 0),
     monthPnlPercent: Number(cloned.monthPnlPercent || 0),
     monthOpeningUsdt: Number(cloned.monthOpeningUsdt || 0),
@@ -941,14 +950,24 @@ function addBalanceFiatValue(balances, usdtNgnRate) {
   }));
 }
 
-function getGmtDateKey(value = new Date()) {
+function getPerformanceDateParts(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
-  return date.toISOString().slice(0, 10);
+  return PERFORMANCE_DATE_FORMATTER.formatToParts(date).reduce((parts, part) => {
+    if (["year", "month", "day"].includes(part.type)) {
+      parts[part.type] = part.value;
+    }
+    return parts;
+  }, {});
 }
 
-function getGmtMonthKey(value = new Date()) {
-  const date = value instanceof Date ? value : new Date(value);
-  return date.toISOString().slice(0, 7);
+function getPerformanceDateKey(value = new Date()) {
+  const parts = getPerformanceDateParts(value);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function getPerformanceMonthKey(value = new Date()) {
+  const parts = getPerformanceDateParts(value);
+  return `${parts.year}-${parts.month}`;
 }
 
 function ensureAccountPerformance(account) {
@@ -977,6 +996,33 @@ function getBalanceQuantityMap(balances = []) {
   );
 }
 
+function getAssetValueMap(balances = [], fallbackTotalUsdt = 0) {
+  const values = new Map(
+    (Array.isArray(balances) ? balances : [])
+      .filter((asset) => asset?.asset)
+      .map((asset) => [String(asset.asset || "").toUpperCase(), Number(asset.usdtValue || 0)])
+  );
+
+  if (!values.size && Number(fallbackTotalUsdt || 0) > 0) {
+    values.set("PORTFOLIO", Number(fallbackTotalUsdt || 0));
+  }
+
+  return values;
+}
+
+function mapToNumberObject(map) {
+  return Object.fromEntries(
+    [...map.entries()]
+      .filter(([, value]) => Math.abs(Number(value || 0)) >= 0.000001)
+      .map(([key, value]) => [key, Number(value || 0)])
+      .sort(([a], [b]) => a.localeCompare(b))
+  );
+}
+
+function sumNumberObject(values = {}) {
+  return Object.values(values || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
 function getComparableAssetPrice(previousAsset, currentAsset) {
   const previousPrice = Number(previousAsset?.price || 0);
   const currentPrice = Number(currentAsset?.price || 0);
@@ -986,11 +1032,11 @@ function getComparableAssetPrice(previousAsset, currentAsset) {
   return currentPrice || previousPrice || 0;
 }
 
-function estimateNetExternalFlowUsdt(previousBalances = [], currentBalances = []) {
+function estimateAssetNetExternalFlowsUsdt(previousBalances = [], currentBalances = []) {
   const previousMap = getBalanceQuantityMap(previousBalances);
   const currentMap = getBalanceQuantityMap(currentBalances);
   const assetKeys = new Set([...previousMap.keys(), ...currentMap.keys()]);
-  let estimatedFlow = 0;
+  const estimatedFlows = new Map();
 
   for (const assetKey of assetKeys) {
     const previousAsset = previousMap.get(assetKey);
@@ -1003,16 +1049,24 @@ function estimateNetExternalFlowUsdt(previousBalances = [], currentBalances = []
     }
 
     const price = getComparableAssetPrice(previousAsset, currentAsset);
-    estimatedFlow += quantityDelta * price;
+    const flow = quantityDelta * price;
+    if (Math.abs(flow) >= 0.000001) {
+      estimatedFlows.set(assetKey, flow);
+    }
   }
 
-  return Math.abs(estimatedFlow) < 0.000001 ? 0 : estimatedFlow;
+  return estimatedFlows;
+}
+
+function estimateNetExternalFlowUsdt(previousBalances = [], currentBalances = []) {
+  return [...estimateAssetNetExternalFlowsUsdt(previousBalances, currentBalances).values()]
+    .reduce((sum, value) => sum + Number(value || 0), 0);
 }
 
 function buildPerformanceSnapshot(performance, now, totalUsdt) {
   const timestamp = now instanceof Date ? now : new Date(now);
-  const todayKey = getGmtDateKey(timestamp);
-  const currentMonthKey = getGmtMonthKey(timestamp);
+  const todayKey = getPerformanceDateKey(timestamp);
+  const currentMonthKey = getPerformanceMonthKey(timestamp);
   const ledger = (performance?.dailyLedger || [])
     .filter((entry) => entry && entry.dayKey)
     .sort((a, b) => String(a.dayKey).localeCompare(String(b.dayKey)));
@@ -1032,12 +1086,16 @@ function buildPerformanceSnapshot(performance, now, totalUsdt) {
 
   return {
     todayLabel: todayKey,
+    todayTimeZone: PERFORMANCE_TIME_ZONE,
     todayPnlValue: Number(todayEntry.pnlValue || 0),
     todayPnlPercent: todayCapitalBase
       ? (Number(todayEntry.pnlValue || 0) / todayCapitalBase) * 100
       : 0,
     todayOpeningUsdt: Number(todayEntry.openingUsdt || 0),
     todayClosingUsdt: Number(todayEntry.closingUsdt || totalUsdt || 0),
+    todayAssetPnl: Object.entries(todayEntry.assetPnlValues || {})
+      .map(([asset, pnlValue]) => ({ asset, pnlValue: Number(pnlValue || 0) }))
+      .sort((a, b) => Math.abs(b.pnlValue) - Math.abs(a.pnlValue)),
     monthLabel: currentMonthKey,
     monthPnlValue,
     monthPnlPercent: monthCapitalBase ? (monthPnlValue / monthCapitalBase) * 100 : 0,
@@ -1045,34 +1103,67 @@ function buildPerformanceSnapshot(performance, now, totalUsdt) {
   };
 }
 
-function updateAccountPerformance(account, totalUsdt, netExternalFlowUsdt = 0) {
+function updateAccountPerformance(account, totalUsdt, netExternalFlowUsdt = 0, currentBalances = [], assetExternalFlows = new Map()) {
   const performance = ensureAccountPerformance(account);
   const now = new Date();
-  const todayKey = getGmtDateKey(now);
+  const todayKey = getPerformanceDateKey(now);
+  const currentAssetValues = getAssetValueMap(currentBalances, totalUsdt);
   const ledger = performance.dailyLedger
     .filter((entry) => entry && entry.dayKey)
     .sort((a, b) => String(a.dayKey).localeCompare(String(b.dayKey)));
-  const latestPreviousEntry = [...ledger].reverse().find((entry) => String(entry.dayKey) < todayKey) || null;
   let todayEntry = ledger.find((entry) => entry.dayKey === todayKey) || null;
 
   if (!todayEntry) {
+    const currentValueObject = mapToNumberObject(currentAssetValues);
     todayEntry = {
       dayKey: todayKey,
-      openingUsdt: Number(latestPreviousEntry?.closingUsdt ?? totalUsdt),
+      timeZone: PERFORMANCE_TIME_ZONE,
+      openingUsdt: Number(totalUsdt || 0),
       closingUsdt: Number(totalUsdt || 0),
       pnlValue: 0,
       netFlowUsdt: 0,
+      assetOpeningValues: currentValueObject,
+      assetClosingValues: currentValueObject,
+      assetNetFlowUsdt: {},
+      assetPnlValues: {},
       updatedAt: now.toISOString(),
     };
     ledger.push(todayEntry);
   }
 
-  todayEntry.netFlowUsdt = Number(todayEntry.netFlowUsdt || 0) + Number(netExternalFlowUsdt || 0);
+  const closingValues = mapToNumberObject(currentAssetValues);
+  const assetNetFlowUsdt = {
+    ...(todayEntry.assetNetFlowUsdt || {}),
+  };
+  for (const [asset, flow] of assetExternalFlows.entries()) {
+    assetNetFlowUsdt[asset] = Number(assetNetFlowUsdt[asset] || 0) + Number(flow || 0);
+  }
+
+  const assetKeys = new Set([
+    ...Object.keys(todayEntry.assetOpeningValues || {}),
+    ...Object.keys(closingValues),
+    ...Object.keys(assetNetFlowUsdt),
+  ]);
+  const assetPnlValues = {};
+  for (const asset of assetKeys) {
+    const closingValue = Number(closingValues[asset] || 0);
+    const openingValue = Number(todayEntry.assetOpeningValues?.[asset] || 0);
+    const flowValue = Number(assetNetFlowUsdt[asset] || 0);
+    const pnlValue = closingValue - openingValue - flowValue;
+    if (Math.abs(pnlValue) >= 0.000001) {
+      assetPnlValues[asset] = pnlValue;
+    }
+  }
+
+  todayEntry.timeZone = PERFORMANCE_TIME_ZONE;
+  todayEntry.netFlowUsdt = Object.keys(assetNetFlowUsdt).length
+    ? sumNumberObject(assetNetFlowUsdt)
+    : Number(todayEntry.netFlowUsdt || 0) + Number(netExternalFlowUsdt || 0);
   todayEntry.closingUsdt = Number(totalUsdt || 0);
-  todayEntry.pnlValue =
-    Number(todayEntry.closingUsdt || 0)
-    - Number(todayEntry.openingUsdt || 0)
-    - Number(todayEntry.netFlowUsdt || 0);
+  todayEntry.assetClosingValues = closingValues;
+  todayEntry.assetNetFlowUsdt = mapToNumberObject(new Map(Object.entries(assetNetFlowUsdt)));
+  todayEntry.assetPnlValues = assetPnlValues;
+  todayEntry.pnlValue = sumNumberObject(assetPnlValues);
   todayEntry.updatedAt = now.toISOString();
 
   performance.dailyLedger = ledger.slice(-400);
@@ -1209,8 +1300,19 @@ async function getAccountSnapshot(account, exchange) {
     exchangeInfo
   );
   const pnl = calculatePortfolioPnl(balances);
-  const netExternalFlowUsdt = estimateNetExternalFlowUsdt(previousSnapshot?.balances || [], balances);
-  const performance = updateAccountPerformance(account, pnl.totalUsdt, netExternalFlowUsdt);
+  const previousSnapshotDay = previousSnapshot?.updatedAt || previousSnapshot?.cachedAt
+    ? getPerformanceDateKey(previousSnapshot.updatedAt || previousSnapshot.cachedAt)
+    : "";
+  const currentDay = getPerformanceDateKey();
+  const canComparePreviousSnapshot =
+    previousSnapshotDay === currentDay &&
+    Array.isArray(previousSnapshot?.balances) &&
+    previousSnapshot.balances.length > 0;
+  const assetExternalFlows = canComparePreviousSnapshot
+    ? estimateAssetNetExternalFlowsUsdt(previousSnapshot.balances, balances)
+    : new Map();
+  const netExternalFlowUsdt = [...assetExternalFlows.values()].reduce((sum, value) => sum + Number(value || 0), 0);
+  const performance = updateAccountPerformance(account, pnl.totalUsdt, netExternalFlowUsdt, balances, assetExternalFlows);
   const snapshot = {
     exchange,
     balances,
@@ -1225,6 +1327,8 @@ async function getAccountSnapshot(account, exchange) {
     todayOpeningUsdt: performance.todayOpeningUsdt,
     todayClosingUsdt: performance.todayClosingUsdt,
     todayLabel: performance.todayLabel,
+    todayTimeZone: performance.todayTimeZone,
+    todayAssetPnl: performance.todayAssetPnl,
     monthPnlValue: performance.monthPnlValue,
     monthPnlPercent: performance.monthPnlPercent,
     monthOpeningUsdt: performance.monthOpeningUsdt,
