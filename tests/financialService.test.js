@@ -125,6 +125,7 @@ test("daily performance compounds from current eligible balance and does not dou
   const firstApply = service.applyDailyPerformance(admin, dayOne.id);
   assert.equal(firstApply.appliedCount, 1);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "102");
+  assert.equal(service.getDashboard(user).performance.todayPercentage, "2");
 
   const duplicateApply = service.applyDailyPerformance(admin, dayOne.id);
   assert.equal(duplicateApply.appliedCount, 0);

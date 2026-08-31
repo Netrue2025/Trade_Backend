@@ -283,14 +283,18 @@ class FinancialService {
     const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
     const totalNgnEquivalent = multiplyRatio(usdtWallet.availableBalance, rate, "1");
     const today = this.clock().slice(0, 10);
-    const todayPerformance = this.db.transactions
+    const todayTransactions = this.db.transactions
       .filter(
         (transaction) =>
           transaction.userId === user.id &&
           ["TRADING_PROFIT", "TRADING_LOSS"].includes(transaction.type) &&
           String(transaction.createdAt || "").startsWith(today)
-      )
+      );
+    const todayPerformance = todayTransactions
       .reduce((sum, transaction) => add(sum, transaction.amount), "0");
+    const todayMirroredPercentage = todayTransactions
+      .find((transaction) => transaction.metadata?.profitLossPercentage)
+      ?.metadata?.profitLossPercentage || "0";
 
     return {
       user: {
@@ -306,6 +310,7 @@ class FinancialService {
       },
       performance: {
         todayUsdt: todayPerformance,
+        todayPercentage: todayMirroredPercentage,
         totalUsdt: this.db.transactions
           .filter((transaction) => transaction.userId === user.id && ["TRADING_PROFIT", "TRADING_LOSS"].includes(transaction.type))
           .reduce((sum, transaction) => add(sum, transaction.amount), "0"),
@@ -854,7 +859,7 @@ class FinancialService {
       if (compare(eligibleBalance, "0") <= 0) {
         continue;
       }
-      let userPnl = multiplyRatio(eligibleBalance, performance.profitLoss, performance.startingCapital);
+      let userPnl = multiplyRatio(eligibleBalance, performance.profitLossPercentage, "100");
       if (compare(userPnl, "0") < 0) {
         userPnl = `-${clampDebit(userPnl.slice(1), eligibleBalance)}`;
       }
