@@ -56,6 +56,24 @@ test("deposit approval credits once and second approval is rejected", () => {
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
 });
 
+test("naira deposit approval credits NGN wallet", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "2500");
+
+  const deposit = service.createDeposit(user, {
+    amount: "5000",
+    currency: "NGN",
+    transactionHash: "bank-ref-1",
+    depositorName: "Ada User",
+  });
+
+  assert.equal(deposit.currency, "NGN");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
+
+  service.approveDeposit(admin, deposit.id);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
+});
+
 test("withdrawal completion reserves funds and clears locked balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

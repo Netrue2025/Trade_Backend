@@ -51,10 +51,13 @@ function defaultSettings() {
       maintenanceMode: false,
     },
     deposit: {
+      ngnEnabled: true,
       usdtAddress: getEnvValue("DEPOSIT_USDT_ADDRESS") || "",
       usdtNetwork: getEnvValue("DEPOSIT_USDT_NETWORK") || "TRC20",
       minUsdt: getEnvValue("MIN_DEPOSIT_USDT") || "1",
       maxUsdt: getEnvValue("MAX_DEPOSIT_USDT") || "1000000",
+      minNgn: getEnvValue("MIN_DEPOSIT_NGN") || "1000",
+      maxNgn: getEnvValue("MAX_DEPOSIT_NGN") || "1000000000",
     },
     withdrawal: {
       ngnEnabled: true,
@@ -217,7 +220,7 @@ class FinancialService {
     const usdtWallet = wallets.find((wallet) => wallet.currency === "USDT");
     const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
     const totalNgnEquivalent = multiplyRatio(usdtWallet.availableBalance, rate, "1");
-    const today = new Date().toISOString().slice(0, 10);
+    const today = this.clock().slice(0, 10);
     const todayPerformance = this.db.transactions
       .filter(
         (transaction) =>
@@ -261,28 +264,36 @@ class FinancialService {
       return idempotent;
     }
 
+    const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Deposit amount");
     const settings = this.db.systemSettings.deposit;
-    if (compare(amount, settings.minUsdt) < 0 || compare(amount, settings.maxUsdt) > 0) {
-      throw new Error(`Deposit amount must be between ${settings.minUsdt} and ${settings.maxUsdt} USDT.`);
+    if (currency === "NGN" && settings.ngnEnabled === false) {
+      throw new Error("NGN deposits are currently disabled.");
+    }
+
+    const min = currency === "NGN" ? settings.minNgn || "1000" : settings.minUsdt || "1";
+    const max = currency === "NGN" ? settings.maxNgn || "1000000000" : settings.maxUsdt || "1000000";
+    if (compare(amount, min) < 0 || compare(amount, max) > 0) {
+      throw new Error(`Deposit amount must be between ${min} and ${max} ${currency}.`);
     }
 
     const deposit = {
       id: this.idGenerator(12),
       userId: user.id,
       amount,
-      currency: "USDT",
-      depositAddress: settings.usdtAddress,
-      network: settings.usdtNetwork,
+      currency,
+      depositAddress: currency === "USDT" ? settings.usdtAddress : "",
+      network: currency === "USDT" ? settings.usdtNetwork : "BANK",
       status: "PENDING",
       transactionHash: String(input.transactionHash || "").trim(),
+      depositorName: String(input.depositorName || "").trim(),
       submittedAt: this.clock(),
       reviewedAt: null,
       reviewedBy: null,
       adminNote: "",
     };
     this.db.deposits.unshift(deposit);
-    this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency: "USDT" }, requestMeta);
+    this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency }, requestMeta);
     this.saveIdempotent("deposit:create", user.id, requestMeta.idempotencyKey, deposit);
     this.persist();
     return clone(deposit);
@@ -326,7 +337,7 @@ class FinancialService {
       balanceAfter: wallet.availableBalance,
       reference: deposit.id,
       status: "APPROVED",
-      description: "Manual USDT deposit approved by admin.",
+      description: `Manual ${deposit.currency} deposit approved by admin.`,
       createdBy: admin.id,
       createdAt: this.clock(),
     });
@@ -645,7 +656,7 @@ class FinancialService {
   }
 
   getTodayPnl() {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = this.clock().slice(0, 10);
     return this.db.transactions
       .filter((transaction) => ["TRADING_PROFIT", "TRADING_LOSS"].includes(transaction.type) && String(transaction.createdAt || "").startsWith(today))
       .reduce((sum, transaction) => add(sum, transaction.amount), "0");
@@ -703,7 +714,7 @@ class FinancialService {
     if (!maxDailyCount) {
       return;
     }
-    const today = new Date().toISOString().slice(0, 10);
+    const today = this.clock().slice(0, 10);
     const count = this.db.withdrawals.filter(
       (withdrawal) =>
         withdrawal.userId === userId &&
