@@ -91,6 +91,14 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function toDecimalText(value, fallback = "0") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return number.toFixed(8).replace(/\.?0+$/, "") || "0";
+}
+
 class FinancialService {
   constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso } = {}) {
     this.db = db;
@@ -411,8 +419,20 @@ class FinancialService {
     };
   }
 
+  getMirrorPnlPercentage(mirror = {}) {
+    const rawPercentage = toDecimalText(mirror.todayPnlPercent ?? mirror.percent ?? "0");
+    const adminPnlValue = toDecimalText(mirror.todayPnlValue ?? mirror.amountUsdt ?? "0");
+    const adminCapitalBase = toDecimalText(mirror.todayCapitalBase ?? mirror.todayOpeningUsdt ?? mirror.baseUsdt ?? "0");
+
+    if (compare(rawPercentage, "0") !== 0 || compare(adminPnlValue, "0") === 0 || compare(adminCapitalBase, "0") === 0) {
+      return rawPercentage;
+    }
+
+    return multiplyRatio(adminPnlValue, "100", adminCapitalBase);
+  }
+
   applyMirroredPnlToDashboard(dashboard, mirror = {}) {
-    const percentage = String(mirror.todayPnlPercent ?? mirror.percent ?? "0");
+    const percentage = this.getMirrorPnlPercentage(mirror);
     const baseUsdt = String(dashboard?.totalBalance?.usdt || "0");
     const rate = String(dashboard?.totalBalance?.usdtToNgnRate || this.db.systemSettings.exchangeRate.usdtToNgn);
     const pnlUsdt = multiplyRatio(baseUsdt, percentage, "100");
@@ -437,6 +457,9 @@ class FinancialService {
         source: mirror.source || "ADMIN_BYBIT",
         percent: percentage,
         amountUsdt: pnlUsdt,
+        adminAmountUsdt: String(mirror.todayPnlValue ?? mirror.amountUsdt ?? "0"),
+        adminCapitalBase: String(mirror.todayCapitalBase ?? mirror.todayOpeningUsdt ?? "0"),
+        assetPnl: Array.isArray(mirror.todayAssetPnl) ? clone(mirror.todayAssetPnl) : [],
         baseUsdt,
         liveUsdt,
         stale: !!mirror.stale,

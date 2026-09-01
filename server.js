@@ -522,6 +522,7 @@ function sanitizeStoredAccountSnapshot(snapshot, fallbackExchange = "bybit") {
     estimatedPnlPercent: Number(cloned.estimatedPnlPercent || 0),
     todayPnlValue: Number(cloned.todayPnlValue || 0),
     todayPnlPercent: Number(cloned.todayPnlPercent || 0),
+    todayCapitalBase: Number(cloned.todayCapitalBase || 0),
     todayOpeningUsdt: Number(cloned.todayOpeningUsdt || 0),
     todayClosingUsdt: Number(cloned.todayClosingUsdt || 0),
     todayLabel: String(cloned.todayLabel || ""),
@@ -1091,6 +1092,7 @@ function buildPerformanceSnapshot(performance, now, totalUsdt) {
     todayPnlPercent: todayCapitalBase
       ? (Number(todayEntry.pnlValue || 0) / todayCapitalBase) * 100
       : 0,
+    todayCapitalBase,
     todayOpeningUsdt: Number(todayEntry.openingUsdt || 0),
     todayClosingUsdt: Number(todayEntry.closingUsdt || totalUsdt || 0),
     todayAssetPnl: Object.entries(todayEntry.assetPnlValues || {})
@@ -1103,7 +1105,14 @@ function buildPerformanceSnapshot(performance, now, totalUsdt) {
   };
 }
 
-function updateAccountPerformance(account, totalUsdt, netExternalFlowUsdt = 0, currentBalances = [], assetExternalFlows = new Map()) {
+function updateAccountPerformance(
+  account,
+  totalUsdt,
+  netExternalFlowUsdt = 0,
+  currentBalances = [],
+  assetExternalFlows = new Map(),
+  openingBalanceBaseline = []
+) {
   const performance = ensureAccountPerformance(account);
   const now = new Date();
   const todayKey = getPerformanceDateKey(now);
@@ -1129,6 +1138,19 @@ function updateAccountPerformance(account, totalUsdt, netExternalFlowUsdt = 0, c
       updatedAt: now.toISOString(),
     };
     ledger.push(todayEntry);
+  }
+
+  if (!todayEntry.assetOpeningValues || !Object.keys(todayEntry.assetOpeningValues).length) {
+    const baselineValues = getAssetValueMap(
+      Array.isArray(openingBalanceBaseline) && openingBalanceBaseline.length ? openingBalanceBaseline : currentBalances,
+      totalUsdt
+    );
+    const baselineObject = mapToNumberObject(baselineValues);
+    todayEntry.assetOpeningValues = baselineObject;
+    todayEntry.openingUsdt = sumNumberObject(baselineObject);
+  }
+  if (!todayEntry.assetNetFlowUsdt || typeof todayEntry.assetNetFlowUsdt !== "object") {
+    todayEntry.assetNetFlowUsdt = {};
   }
 
   const closingValues = mapToNumberObject(currentAssetValues);
@@ -1312,7 +1334,14 @@ async function getAccountSnapshot(account, exchange) {
     ? estimateAssetNetExternalFlowsUsdt(previousSnapshot.balances, balances)
     : new Map();
   const netExternalFlowUsdt = [...assetExternalFlows.values()].reduce((sum, value) => sum + Number(value || 0), 0);
-  const performance = updateAccountPerformance(account, pnl.totalUsdt, netExternalFlowUsdt, balances, assetExternalFlows);
+  const performance = updateAccountPerformance(
+    account,
+    pnl.totalUsdt,
+    netExternalFlowUsdt,
+    balances,
+    assetExternalFlows,
+    canComparePreviousSnapshot ? previousSnapshot.balances : []
+  );
   const snapshot = {
     exchange,
     balances,
@@ -1324,6 +1353,7 @@ async function getAccountSnapshot(account, exchange) {
     estimatedPnlPercent: pnl.estimatedPnlPercent,
     todayPnlValue: performance.todayPnlValue,
     todayPnlPercent: performance.todayPnlPercent,
+    todayCapitalBase: performance.todayCapitalBase,
     todayOpeningUsdt: performance.todayOpeningUsdt,
     todayClosingUsdt: performance.todayClosingUsdt,
     todayLabel: performance.todayLabel,
@@ -1479,6 +1509,10 @@ async function getAdminBybitMirrorPnl() {
       source: "ADMIN_BYBIT",
       todayPnlPercent: Number(snapshot.todayPnlPercent || 0),
       todayPnlValue: Number(snapshot.todayPnlValue || 0),
+      todayCapitalBase: Number(snapshot.todayCapitalBase || 0),
+      todayOpeningUsdt: Number(snapshot.todayOpeningUsdt || 0),
+      todayClosingUsdt: Number(snapshot.todayClosingUsdt || 0),
+      todayAssetPnl: Array.isArray(snapshot.todayAssetPnl) ? snapshot.todayAssetPnl : [],
       updatedAt: snapshot.updatedAt || snapshot.cachedAt || nowIso(),
       stale: !!snapshot.stale,
     };
@@ -1490,6 +1524,10 @@ async function getAdminBybitMirrorPnl() {
       source: "ADMIN_BYBIT",
       todayPnlPercent: Number(cachedSnapshot.todayPnlPercent || 0),
       todayPnlValue: Number(cachedSnapshot.todayPnlValue || 0),
+      todayCapitalBase: Number(cachedSnapshot.todayCapitalBase || 0),
+      todayOpeningUsdt: Number(cachedSnapshot.todayOpeningUsdt || 0),
+      todayClosingUsdt: Number(cachedSnapshot.todayClosingUsdt || 0),
+      todayAssetPnl: Array.isArray(cachedSnapshot.todayAssetPnl) ? cachedSnapshot.todayAssetPnl : [],
       updatedAt: cachedSnapshot.updatedAt || cachedSnapshot.cachedAt || null,
       stale: true,
     };

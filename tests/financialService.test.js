@@ -247,6 +247,22 @@ test("mirrored pnl overlay dynamically adjusts unified user balance", () => {
   assert.equal(mirrored.performance.todayPercentage, "5");
 });
 
+test("mirrored pnl overlay derives percentage from admin amount and capital base", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "50");
+
+  const mirrored = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "0",
+    todayPnlValue: "8",
+    todayCapitalBase: "200",
+    source: "ADMIN_BYBIT",
+  });
+
+  assert.equal(mirrored.performance.todayUsdt, "2");
+  assert.equal(mirrored.performance.todayPercentage, "4");
+  assert.equal(mirrored.totalBalance.usdt, "52");
+});
+
 test("daily withdrawal limit is enforced", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
