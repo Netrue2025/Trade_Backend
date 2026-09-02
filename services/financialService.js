@@ -446,36 +446,35 @@ class FinancialService {
     return user.pnlLots;
   }
 
-  createPnlLotForDeposit(userId, deposit, mirror = {}) {
-    const lots = this.getUserPnlLots(userId);
-    if (lots.some((lot) => lot.depositId === deposit.id)) {
+  getAvailableUsdtEquivalent(userId, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
+    const usdtWallet = this.ensureWallet(userId, "USDT");
+    const ngnWallet = this.ensureWallet(userId, "NGN");
+    return add(usdtWallet.availableBalance, this.convertAmount(ngnWallet.availableBalance, "NGN", "USDT", rate));
+  }
+
+  resetPnlLotsToCurrentBalance(userId, mirror = {}, { source = "BALANCE_BASELINE", referenceId = "" } = {}) {
+    const user = this.db.users.find((item) => item.id === userId);
+    if (!user) {
       return null;
     }
-
+    const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
+    const principalUsdt = this.getAvailableUsdtEquivalent(userId, rate);
     const baselinePercent = this.getMirrorPnlPercentage(mirror);
     const dayKey = this.getMirrorDayKey(mirror);
-    const principalUsdt = deposit.currency === "USDT"
-      ? String(deposit.amount)
-      : this.convertAmount(deposit.amount, "NGN", "USDT", deposit.exchangeRate || this.db.systemSettings.exchangeRate.usdtToNgn);
-    const principalNgn = deposit.currency === "NGN"
-      ? String(deposit.amount)
-      : this.convertAmount(deposit.amount, "USDT", "NGN", deposit.exchangeRate || this.db.systemSettings.exchangeRate.usdtToNgn);
-    const lot = {
+    const principalNgn = this.convertAmount(principalUsdt, "USDT", "NGN", rate);
+    user.pnlLots = compare(principalUsdt, "0") > 0 ? [{
       id: this.idGenerator(12),
-      depositId: deposit.id,
-      source: "DEPOSIT",
-      currency: deposit.currency,
+      referenceId,
+      source,
+      currency: "USDT",
       principalUsdt,
       principalNgn,
       baselinePercent,
       lastMirrorPercent: baselinePercent,
       dayKey,
       createdAt: this.clock(),
-    };
-    lots.push(lot);
-    deposit.pnlBaselinePercent = baselinePercent;
-    deposit.pnlBaselineDayKey = dayKey;
-    return lot;
+    }] : [];
+    return user.pnlLots[0] || null;
   }
 
   ensurePnlBaselineForBalance(userId, baseUsdt, rate, mirror = {}) {
@@ -497,6 +496,33 @@ class FinancialService {
       createdAt: this.clock(),
     });
     return true;
+  }
+
+  calculatePnlLotsAtMirror(userId, mirror = {}) {
+    const lots = this.getUserPnlLots(userId);
+    const percentage = this.getMirrorPnlPercentage(mirror);
+    return lots.reduce((sum, lot) => {
+      const deltaPercent = subtract(percentage, toDecimalText(lot.baselinePercent || "0"));
+      return add(sum, multiplyRatio(lot.principalUsdt || "0", deltaPercent, "100"));
+    }, "0");
+  }
+
+  settleCurrentUserPnl(userId, mirror = {}) {
+    const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
+    const baseUsdt = this.getAvailableUsdtEquivalent(userId, rate);
+    const baselineCreated = this.ensurePnlBaselineForBalance(userId, baseUsdt, rate, mirror);
+    const daySettlement = this.settleUserPnlLotsForMirror(userId, mirror);
+    const pnlUsdt = this.calculatePnlLotsAtMirror(userId, mirror);
+    if (compare(pnlUsdt, "0") !== 0) {
+      const wallet = this.ensureWallet(userId, "USDT");
+      wallet.availableBalance = add(wallet.availableBalance, pnlUsdt);
+      wallet.updatedAt = this.clock();
+    }
+    this.resetPnlLotsToCurrentBalance(userId, mirror, { source: "PNL_SETTLED" });
+    return {
+      pnlUsdt,
+      changed: baselineCreated || daySettlement.changed || compare(pnlUsdt, "0") !== 0,
+    };
   }
 
   settleUserPnlLotsForMirror(userId, mirror = {}) {
@@ -681,10 +707,13 @@ class FinancialService {
       throw new Error("Deposit request is no longer pending.");
     }
 
-    this.createPnlLotForDeposit(deposit.userId, deposit, input.pnlBaselineMirror || {
+    const pnlBaselineMirror = input.pnlBaselineMirror || {
       todayPnlPercent: input.pnlBaselinePercent || "0",
       todayLabel: input.pnlBaselineDayKey || this.clock().slice(0, 10),
-    });
+    };
+    this.settleCurrentUserPnl(deposit.userId, pnlBaselineMirror);
+    deposit.pnlBaselinePercent = this.getMirrorPnlPercentage(pnlBaselineMirror);
+    deposit.pnlBaselineDayKey = this.getMirrorDayKey(pnlBaselineMirror);
     const wallet = this.ensureWallet(deposit.userId, deposit.currency);
     if (!deposit.creditedAt) {
       const balanceBefore = wallet.availableBalance;
@@ -712,6 +741,7 @@ class FinancialService {
         },
       });
     }
+    this.resetPnlLotsToCurrentBalance(deposit.userId, pnlBaselineMirror, { source: "BALANCE_TOPUP", referenceId: deposit.id });
     deposit.status = "APPROVED";
     deposit.reviewedAt = this.clock();
     deposit.reviewedBy = admin.id;
@@ -811,10 +841,16 @@ class FinancialService {
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Bonus amount");
     const note = String(input.note || "Bonus").trim();
+    const pnlBaselineMirror = input.pnlBaselineMirror || {
+      todayPnlPercent: input.pnlBaselinePercent || "0",
+      todayLabel: input.pnlBaselineDayKey || this.clock().slice(0, 10),
+    };
+    this.settleCurrentUserPnl(targetUser.id, pnlBaselineMirror);
     const wallet = this.ensureWallet(targetUser.id, currency);
     const balanceBefore = wallet.availableBalance;
     wallet.availableBalance = add(wallet.availableBalance, amount);
     wallet.updatedAt = this.clock();
+    this.resetPnlLotsToCurrentBalance(targetUser.id, pnlBaselineMirror, { source: "BALANCE_TOPUP", referenceId: "BONUS" });
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
@@ -856,10 +892,16 @@ class FinancialService {
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeNonNegativeAmount(input.amount, "Balance");
     const note = String(input.note || "Balance updated").trim();
+    const pnlBaselineMirror = input.pnlBaselineMirror || {
+      todayPnlPercent: input.pnlBaselinePercent || "0",
+      todayLabel: input.pnlBaselineDayKey || this.clock().slice(0, 10),
+    };
+    this.settleCurrentUserPnl(targetUser.id, pnlBaselineMirror);
     const wallet = this.ensureWallet(targetUser.id, currency);
     const balanceBefore = wallet.availableBalance;
     wallet.availableBalance = amount;
     wallet.updatedAt = this.clock();
+    this.resetPnlLotsToCurrentBalance(targetUser.id, pnlBaselineMirror, { source: "BALANCE_ADJUSTMENT" });
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
@@ -949,6 +991,11 @@ class FinancialService {
     const amount = normalizeAmount(input.amount, "Withdrawal amount");
     this.validateWithdrawalSettings(currency, amount);
     this.validateDailyWithdrawalLimit(user.id);
+    const pnlBaselineMirror = input.pnlBaselineMirror || {
+      todayPnlPercent: input.pnlBaselinePercent || "0",
+      todayLabel: input.pnlBaselineDayKey || this.clock().slice(0, 10),
+    };
+    this.settleCurrentUserPnl(user.id, pnlBaselineMirror);
     const fundingSources = this.resolveWithdrawalFunding(user.id, currency, amount);
     const destinationInput = currency === "NGN"
       ? this.mergeBankDestination(user.bankAccount, input.destination || input)
@@ -1012,6 +1059,7 @@ class FinancialService {
         },
       });
     }
+    this.resetPnlLotsToCurrentBalance(user.id, pnlBaselineMirror, { source: "WITHDRAWAL_BASELINE", referenceId: withdrawal.id });
 
     this.db.withdrawals.unshift(withdrawal);
     this.notifyAdmins({

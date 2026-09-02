@@ -638,6 +638,7 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.writeHead(statusCode, {
     ...buildSecurityHeaders(),
     "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
     ...extraHeaders,
   });
   res.end(JSON.stringify(payload));
@@ -1444,14 +1445,22 @@ async function getConnectedWalletDetailsLive(user, usdtNgnRate) {
   ).then((items) => items.filter(Boolean));
 }
 
-async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = false } = {}) {
+async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = false, mirrorPnl = null } = {}) {
   const financeProfile = financialService.getUserFinanceProfile(user.id);
+  const dashboard = mirrorPnl
+    ? financialService.applyMirroredPnlToDashboard(financialService.getDashboard(user), mirrorPnl)
+    : financialService.getDashboard(user);
   return {
     ...sanitizeUser(user),
     mirrorStatus: user.mirrorEnabled ? "ACTIVE" : "OFF",
     connectedExchanges: listExchanges().filter((exchange) => !!user[exchange.id]),
     passwordStoredSecurely: true,
     ledgerWallets: financeProfile.wallets,
+    financeSummary: {
+      totalBalance: dashboard.totalBalance,
+      performance: dashboard.performance,
+      mirrorPnl: dashboard.mirrorPnl || null,
+    },
     recentTransactions: financeProfile.recentTransactions,
     walletDetails: refreshWallets
       ? await getConnectedWalletDetailsLive(user, usdtNgnRate)
@@ -1461,13 +1470,14 @@ async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = fal
 
 async function buildSettingsUsersPayload(user, { refreshWallets = true } = {}) {
   const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
+  const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
 
   if (user.role === "admin") {
     const users = await Promise.all(
       db.users
         .filter((item) => item.role === "user")
         .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
-        .map((item) => buildManagedUserSummary(item, usdtNgnRate, { refreshWallets }))
+        .map((item) => buildManagedUserSummary(item, usdtNgnRate, { refreshWallets, mirrorPnl }))
     );
 
     return {
@@ -3661,7 +3671,9 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const withdrawal = financialService.createWithdrawal(user, await readBody(req), getRequestMeta(req));
+      const body = await readBody(req);
+      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
+      const withdrawal = financialService.createWithdrawal(user, { ...body, pnlBaselineMirror: mirrorPnl }, getRequestMeta(req));
       sendJson(res, 201, { withdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -4721,11 +4733,12 @@ async function handleApi(req, res, url) {
       return true;
     }
     const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
+    const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
     const users = await Promise.all(
       db.users
         .filter((user) => user.role === "user")
         .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
-        .map((user) => buildManagedUserSummary(user, usdtNgnRate))
+        .map((user) => buildManagedUserSummary(user, usdtNgnRate, { mirrorPnl }))
     );
     sendJson(res, 200, { users });
     return true;
@@ -4738,8 +4751,23 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const profile = financialService.getUserFinanceProfile(decodeURIComponent(adminUserFinanceMatch[1] || "").trim());
-      sendJson(res, 200, profile);
+      const userId = decodeURIComponent(adminUserFinanceMatch[1] || "").trim();
+      const profile = financialService.getUserFinanceProfile(userId);
+      const targetUser = db.users.find((item) => item.id === userId && item.role === "user");
+      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
+      const dashboard = targetUser && mirrorPnl
+        ? financialService.applyMirroredPnlToDashboard(financialService.getDashboard(targetUser), mirrorPnl)
+        : null;
+      sendJson(res, 200, {
+        ...profile,
+        financeSummary: dashboard
+          ? {
+              totalBalance: dashboard.totalBalance,
+              performance: dashboard.performance,
+              mirrorPnl: dashboard.mirrorPnl || null,
+            }
+          : null,
+      });
     } catch (error) {
       sendJson(res, 404, { error: error.message });
     }
@@ -4753,10 +4781,12 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      const body = await readBody(req);
+      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const result = financialService.addBonus(
         admin,
         decodeURIComponent(adminUserBonusMatch[1] || "").trim(),
-        await readBody(req),
+        { ...body, pnlBaselineMirror: mirrorPnl },
         getRequestMeta(req)
       );
       scheduleSettingsUsersBroadcast("admin_bonus_added");
@@ -4775,10 +4805,12 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      const body = await readBody(req);
+      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const result = financialService.setUserBalance(
         admin,
         decodeURIComponent(adminUserBalanceMatch[1] || "").trim(),
-        await readBody(req),
+        { ...body, pnlBaselineMirror: mirrorPnl },
         getRequestMeta(req)
       );
       scheduleSettingsUsersBroadcast("admin_balance_updated");

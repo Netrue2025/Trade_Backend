@@ -298,6 +298,70 @@ test("approved deposit starts pnl from current admin baseline", () => {
   assert.equal(mirrored.totalBalance.liveUsdt, "100.5");
 });
 
+test("new topup compounds from the current live balance baseline", () => {
+  const { admin, service, user } = createHarness();
+
+  const firstDeposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xfirst" });
+  service.approveDeposit(admin, firstDeposit.id, {
+    pnlBaselineMirror: {
+      todayPnlPercent: "0",
+      todayLabel: "2026-08-30",
+    },
+  });
+  service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "1",
+    todayLabel: "2026-08-30",
+  });
+
+  const secondDeposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xsecond" });
+  service.approveDeposit(admin, secondDeposit.id, {
+    pnlBaselineMirror: {
+      todayPnlPercent: "1",
+      todayLabel: "2026-08-30",
+    },
+  });
+
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "201");
+  const mirrored = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "2",
+    todayLabel: "2026-08-30",
+  });
+  assert.equal(mirrored.performance.todayUsdt, "2.01");
+  assert.equal(mirrored.totalBalance.liveUsdt, "203.01");
+});
+
+test("withdrawal preserves settled pnl before reserving funds", () => {
+  const { admin, service, user } = createHarness();
+  service.updateSettings(admin, { exchangeRate: { usdtToNgn: "1000" } });
+  setWallet(service, user.id, "NGN", "200000");
+  service.resetPnlLotsToCurrentBalance(user.id, {
+    todayPnlPercent: "0",
+    todayLabel: "2026-08-30",
+  });
+
+  const liveBefore = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "0.2",
+    todayLabel: "2026-08-30",
+  });
+  assert.equal(liveBefore.totalBalance.liveNgnEquivalent, "200400");
+
+  service.createWithdrawal(user, {
+    amount: "100000",
+    currency: "NGN",
+    destination: {
+      bankName: "Test Bank",
+      accountName: "Ada User",
+      accountNumber: "1234567890",
+    },
+    pnlBaselineMirror: {
+      todayPnlPercent: "0.2",
+      todayLabel: "2026-08-30",
+    },
+  });
+
+  assert.equal(service.getDashboard(user).totalBalance.ngnEquivalent, "100400");
+});
+
 test("user pnl settlement carries balance across daily reset", () => {
   const { admin, service, user } = createHarness();
   const deposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xrollover" });
