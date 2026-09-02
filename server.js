@@ -2544,6 +2544,7 @@ function serializeTradeInvestment(investment) {
     joinedAt: investment.joinedAt,
     stoppedAt: investment.stoppedAt || null,
     settledPnlUsdt: investment.settledPnlUsdt || "0",
+    fundingSources: getInvestmentFundingSources(investment),
   };
 }
 
@@ -2553,6 +2554,123 @@ function toMoneyDecimal(value, digits = 8) {
     return "0";
   }
   return number.toFixed(digits).replace(/\.?0+$/, "") || "0";
+}
+
+function getInvestmentFundingSources(investment) {
+  return Array.isArray(investment?.fundingSources)
+    ? investment.fundingSources
+        .map((source) => ({
+          currency: String(source.currency || "USDT").toUpperCase(),
+          amount: String(source.amount || "0"),
+        }))
+        .filter((source) => ["USDT", "NGN"].includes(source.currency) && compare(source.amount, "0") > 0)
+    : [];
+}
+
+function getFundingSourceUsdtEquivalent(source, rate) {
+  return source.currency === "USDT"
+    ? String(source.amount || "0")
+    : financialService.convertAmount(source.amount || "0", source.currency, "USDT", rate);
+}
+
+function getReservedInvestmentUsdt(investment, rate) {
+  return getInvestmentFundingSources(investment).reduce(
+    (sum, source) => add(sum, getFundingSourceUsdtEquivalent(source, rate)),
+    "0"
+  );
+}
+
+function reserveTradeInvestmentFunds(user, amountUsdt, reference) {
+  const fundingSources = financialService.resolveWithdrawalFunding(user.id, "USDT", amountUsdt);
+
+  for (const source of fundingSources) {
+    const balanceBefore = source.wallet.availableBalance;
+    const lockedBefore = source.wallet.lockedBalance;
+    source.wallet.availableBalance = subtract(source.wallet.availableBalance, source.amount);
+    source.wallet.lockedBalance = add(source.wallet.lockedBalance, source.amount);
+    source.wallet.updatedAt = nowIso();
+    db.transactions.unshift({
+      id: randomId(12),
+      userId: user.id,
+      type: "TRADE_INVESTMENT_LOCK",
+      currency: source.currency,
+      amount: `-${source.amount}`,
+      balanceBefore,
+      balanceAfter: source.wallet.availableBalance,
+      reference,
+      status: "APPROVED",
+      description: "Trade investment locked.",
+      createdBy: user.id,
+      createdAt: nowIso(),
+      metadata: {
+        requestedCurrency: "USDT",
+        requestedAmount: amountUsdt,
+        lockedBalanceBefore: lockedBefore,
+        lockedBalanceAfter: source.wallet.lockedBalance,
+      },
+    });
+  }
+
+  return fundingSources.map((source) => ({
+    currency: source.currency,
+    amount: source.amount,
+  }));
+}
+
+function releaseTradeInvestmentFunds(user, investment, settledPnlUsdt) {
+  const fundingSources = getInvestmentFundingSources(investment);
+  if (!fundingSources.length) {
+    const wallet = financialService.ensureWallet(user.id, "USDT");
+    wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
+    wallet.updatedAt = nowIso();
+    return {
+      releasedPrincipalUsdt: "0",
+      netSettlementUsdt: settledPnlUsdt,
+      releasedSources: [],
+    };
+  }
+
+  const rate = db.systemSettings.exchangeRate.usdtToNgn;
+  const principalUsdt = fundingSources.reduce(
+    (sum, source) => add(sum, getFundingSourceUsdtEquivalent(source, rate)),
+    "0"
+  );
+  let netSettlementUsdt = add(principalUsdt, settledPnlUsdt);
+  if (compare(netSettlementUsdt, "0") < 0) {
+    netSettlementUsdt = "0";
+  }
+
+  const releasedSources = fundingSources.map((source) => {
+    const wallet = financialService.ensureWallet(user.id, source.currency);
+    if (compare(wallet.lockedBalance, source.amount) < 0) {
+      throw new Error("Investment locked balance is out of sync.");
+    }
+    const sourceUsdt = getFundingSourceUsdtEquivalent(source, rate);
+    const releaseUsdt = compare(principalUsdt, "0") === 0 ? "0" : multiplyRatio(sourceUsdt, netSettlementUsdt, principalUsdt);
+    const releaseAmount = source.currency === "USDT"
+      ? releaseUsdt
+      : financialService.convertAmount(releaseUsdt, "USDT", source.currency, rate);
+    const balanceBefore = wallet.availableBalance;
+    const lockedBefore = wallet.lockedBalance;
+    wallet.lockedBalance = subtract(wallet.lockedBalance, source.amount);
+    wallet.availableBalance = add(wallet.availableBalance, releaseAmount);
+    wallet.updatedAt = nowIso();
+    return {
+      currency: source.currency,
+      lockedAmount: source.amount,
+      releasedAmount: releaseAmount,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      lockedBalanceBefore: lockedBefore,
+      lockedBalanceAfter: wallet.lockedBalance,
+    };
+  });
+
+  return {
+    releasedPrincipalUsdt: principalUsdt,
+    netSettlementUsdt,
+    releasedSources,
+  };
 }
 
 function getTradeEntryPriceSnapshot(trade) {
@@ -2590,9 +2708,10 @@ async function getTradePnlPercentSnapshot(trade, marketCache = new Map()) {
 
 async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
   const dashboard = financialService.getDashboard(user);
-  const baseUsdt = String(dashboard.totalBalance.usdt || "0");
   const rate = String(dashboard.totalBalance.usdtToNgnRate || "1600");
   const activeInvestments = getActiveUserTradeInvestments(user.id);
+  const reservedActiveUsdt = activeInvestments.reduce((sum, investment) => add(sum, getReservedInvestmentUsdt(investment, rate)), "0");
+  const baseUsdt = add(String(dashboard.totalBalance.usdt || "0"), reservedActiveUsdt);
   const enriched = [];
   let pnlUsdt = "0";
 
@@ -2616,20 +2735,32 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
 
   const liveUsdt = add(baseUsdt, pnlUsdt);
   const liveNgn = financialService.convertAmount(liveUsdt, "USDT", "NGN", rate);
+  const baseNgn = financialService.convertAmount(baseUsdt, "USDT", "NGN", rate);
+  const dashboardTodayUsdt = String(dashboard.performance?.todayUsdt || "0");
+  const dashboardTodayPercentage = String(dashboard.performance?.todayPercentage || "0");
+  const realizedTodayPercentage = dashboardTodayPercentage !== "0" || compare(dashboardTodayUsdt, "0") === 0 || compare(baseUsdt, "0") === 0
+    ? dashboardTodayPercentage
+    : multiplyRatio(dashboardTodayUsdt, "100", baseUsdt);
+  const performance = enriched.length
+    ? {
+        ...dashboard.performance,
+        todayUsdt: pnlUsdt,
+        todayPercentage: compare(baseUsdt, "0") === 0 ? "0" : multiplyRatio(pnlUsdt, "100", baseUsdt),
+        source: "JOINED_TRADES",
+      }
+    : {
+        ...dashboard.performance,
+        todayPercentage: realizedTodayPercentage,
+      };
   return {
     totalBalance: {
       ...dashboard.totalBalance,
       baseUsdt,
-      baseNgnEquivalent: dashboard.totalBalance.ngnEquivalent,
+      baseNgnEquivalent: baseNgn,
       liveUsdt,
       liveNgnEquivalent: liveNgn,
     },
-    performance: {
-      ...dashboard.performance,
-      todayUsdt: pnlUsdt,
-      todayPercentage: compare(baseUsdt, "0") === 0 ? "0" : multiplyRatio(pnlUsdt, "100", baseUsdt),
-      source: "JOINED_TRADES",
-    },
+    performance,
     activeInvestments: enriched,
   };
 }
@@ -5066,8 +5197,10 @@ async function handleApi(req, res, url) {
 
       const body = await readBody(req);
       const availableUsdt = financialService.getAvailableUsdtEquivalent(user.id);
-      const activeAmountUsdt = getActiveUserTradeInvestments(user.id).reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
-      const freeUsdt = subtract(availableUsdt, activeAmountUsdt);
+      const legacyActiveAmountUsdt = getActiveUserTradeInvestments(user.id)
+        .filter((item) => !getInvestmentFundingSources(item).length)
+        .reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
+      const freeUsdt = subtract(availableUsdt, legacyActiveAmountUsdt);
       const amountUsdt = String(body.amountUsdt || body.amount || freeUsdt || "").replace(/,/g, "").trim();
       if (compare(amountUsdt, "0") <= 0) {
         sendJson(res, 400, { error: "Enter an investment amount." });
@@ -5078,14 +5211,17 @@ async function handleApi(req, res, url) {
         return true;
       }
 
+      const investmentId = randomId(12);
+      const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
       const marketCache = new Map();
       const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
       const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
       const investment = {
-        id: randomId(12),
+        id: investmentId,
         userId: user.id,
         tradeId: trade.id,
         amountUsdt,
+        fundingSources,
         baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
         baselinePrice: String(Number(baselinePrice || 0).toFixed(8)),
         status: "ACTIVE",
@@ -5123,14 +5259,14 @@ async function handleApi(req, res, url) {
       const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
       const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
       const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
-      const wallet = financialService.ensureWallet(user.id, "USDT");
-      const balanceBefore = wallet.availableBalance;
-      wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
-      wallet.updatedAt = nowIso();
+      const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
+      const settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
+      const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
       investment.status = "STOPPED";
       investment.stoppedAt = nowIso();
       investment.stopPnlPercent = String(Number(currentPnlPercent.toFixed(8)));
       investment.settledPnlUsdt = settledPnlUsdt;
+      investment.netSettlementUsdt = settlement.netSettlementUsdt;
       db.transactions.unshift({
         id: randomId(12),
         userId: user.id,
@@ -5138,7 +5274,7 @@ async function handleApi(req, res, url) {
         currency: "USDT",
         amount: settledPnlUsdt,
         balanceBefore,
-        balanceAfter: wallet.availableBalance,
+        balanceAfter,
         reference: investment.id,
         status: "APPROVED",
         description: `Stopped ${trade.symbol} investment.`,
@@ -5148,6 +5284,9 @@ async function handleApi(req, res, url) {
           tradeId: trade.id,
           baselinePnlPercent: investment.baselinePnlPercent,
           stopPnlPercent: investment.stopPnlPercent,
+          releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
+          netSettlementUsdt: settlement.netSettlementUsdt,
+          releasedSources: settlement.releasedSources,
         },
       });
       persist();
