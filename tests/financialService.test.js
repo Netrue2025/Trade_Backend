@@ -276,16 +276,11 @@ test("mirrored pnl overlay derives percentage from admin amount and capital base
   assert.equal(mirrored.totalBalance.usdt, "50");
 });
 
-test("approved deposit starts pnl from current admin baseline", () => {
+test("approved deposit remains idle until user joins a trade", () => {
   const { admin, service, user } = createHarness();
 
   const deposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xbaseline" });
-  service.approveDeposit(admin, deposit.id, {
-    pnlBaselineMirror: {
-      todayPnlPercent: "-0.5",
-      todayLabel: "2026-08-30",
-    },
-  });
+  service.approveDeposit(admin, deposit.id);
 
   const mirrored = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
     todayPnlPercent: "0",
@@ -293,99 +288,50 @@ test("approved deposit starts pnl from current admin baseline", () => {
     source: "ADMIN_BYBIT",
   });
 
-  assert.equal(mirrored.performance.todayUsdt, "0.5");
-  assert.equal(mirrored.performance.todayPercentage, "0.5");
-  assert.equal(mirrored.totalBalance.liveUsdt, "100.5");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
+  assert.equal(mirrored.performance.todayUsdt, "0");
+  assert.equal(mirrored.performance.todayPercentage, "0");
+  assert.equal(mirrored.totalBalance.liveUsdt, "100");
 });
 
-test("new topup compounds from the current live balance baseline", () => {
+test("new topup adds to idle wallet balance without automatic pnl", () => {
   const { admin, service, user } = createHarness();
 
   const firstDeposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xfirst" });
-  service.approveDeposit(admin, firstDeposit.id, {
-    pnlBaselineMirror: {
-      todayPnlPercent: "0",
-      todayLabel: "2026-08-30",
-    },
-  });
-  service.applyMirroredPnlToDashboard(service.getDashboard(user), {
-    todayPnlPercent: "1",
-    todayLabel: "2026-08-30",
-  });
-
+  service.approveDeposit(admin, firstDeposit.id);
   const secondDeposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xsecond" });
-  service.approveDeposit(admin, secondDeposit.id, {
-    pnlBaselineMirror: {
-      todayPnlPercent: "1",
-      todayLabel: "2026-08-30",
-    },
-  });
+  service.approveDeposit(admin, secondDeposit.id);
 
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "201");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "200");
   const mirrored = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
     todayPnlPercent: "2",
     todayLabel: "2026-08-30",
   });
-  assert.equal(mirrored.performance.todayUsdt, "2.01");
-  assert.equal(mirrored.totalBalance.liveUsdt, "203.01");
+  assert.equal(mirrored.performance.todayUsdt, "0");
+  assert.equal(mirrored.totalBalance.liveUsdt, "200");
 });
 
-test("withdrawal preserves settled pnl before reserving funds", () => {
+test("withdrawal is blocked while user has an active trade investment", () => {
   const { admin, service, user } = createHarness();
-  service.updateSettings(admin, { exchangeRate: { usdtToNgn: "1000" } });
-  setWallet(service, user.id, "NGN", "200000");
-  service.resetPnlLotsToCurrentBalance(user.id, {
-    todayPnlPercent: "0",
-    todayLabel: "2026-08-30",
+  setWallet(service, user.id, "USDT", "100");
+  service.db.tradeInvestments.push({
+    id: "investment-1",
+    userId: user.id,
+    tradeId: "trade-1",
+    amountUsdt: "50",
+    baselinePnlPercent: "0",
+    status: "ACTIVE",
+    joinedAt: "2026-08-30T10:00:00.000Z",
   });
 
-  const liveBefore = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
-    todayPnlPercent: "0.2",
-    todayLabel: "2026-08-30",
-  });
-  assert.equal(liveBefore.totalBalance.liveNgnEquivalent, "200400");
-
-  service.createWithdrawal(user, {
+  assert.throws(() => service.createWithdrawal(user, {
     amount: "100000",
-    currency: "NGN",
+    currency: "USDT",
     destination: {
-      bankName: "Test Bank",
-      accountName: "Ada User",
-      accountNumber: "1234567890",
+      address: "TUserWalletAddress",
+      network: "TRC20",
     },
-    pnlBaselineMirror: {
-      todayPnlPercent: "0.2",
-      todayLabel: "2026-08-30",
-    },
-  });
-
-  assert.equal(service.getDashboard(user).totalBalance.ngnEquivalent, "100400");
-});
-
-test("user pnl settlement carries balance across daily reset", () => {
-  const { admin, service, user } = createHarness();
-  const deposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xrollover" });
-  service.approveDeposit(admin, deposit.id, {
-    pnlBaselineMirror: {
-      todayPnlPercent: "0",
-      todayLabel: "2026-08-30",
-    },
-  });
-
-  service.applyMirroredPnlToDashboard(service.getDashboard(user), {
-    todayPnlPercent: "1",
-    todayLabel: "2026-08-30",
-    source: "ADMIN_BYBIT",
-  });
-  const nextDay = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
-    todayPnlPercent: "0",
-    todayLabel: "2026-08-31",
-    source: "ADMIN_BYBIT",
-  });
-
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "101");
-  assert.equal(nextDay.performance.todayUsdt, "0");
-  assert.equal(nextDay.totalBalance.usdt, "101");
+  }), /stop active trades/i);
 });
 
 test("daily withdrawal limit is enforced", () => {

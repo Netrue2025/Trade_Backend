@@ -40,6 +40,7 @@ loadEnvFile();
 const { loadDb, saveDb, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
+const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { emitOrderExecuted, orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
@@ -1445,22 +1446,16 @@ async function getConnectedWalletDetailsLive(user, usdtNgnRate) {
   ).then((items) => items.filter(Boolean));
 }
 
-async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = false, mirrorPnl = null } = {}) {
+async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = false } = {}) {
   const financeProfile = financialService.getUserFinanceProfile(user.id);
-  const dashboard = mirrorPnl
-    ? financialService.applyMirroredPnlToDashboard(financialService.getDashboard(user), mirrorPnl)
-    : financialService.getDashboard(user);
+  const financeSummary = await buildUserTradeInvestmentSummary(user);
   return {
     ...sanitizeUser(user),
     mirrorStatus: user.mirrorEnabled ? "ACTIVE" : "OFF",
     connectedExchanges: listExchanges().filter((exchange) => !!user[exchange.id]),
     passwordStoredSecurely: true,
     ledgerWallets: financeProfile.wallets,
-    financeSummary: {
-      totalBalance: dashboard.totalBalance,
-      performance: dashboard.performance,
-      mirrorPnl: dashboard.mirrorPnl || null,
-    },
+    financeSummary,
     recentTransactions: financeProfile.recentTransactions,
     walletDetails: refreshWallets
       ? await getConnectedWalletDetailsLive(user, usdtNgnRate)
@@ -1470,14 +1465,12 @@ async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = fal
 
 async function buildSettingsUsersPayload(user, { refreshWallets = true } = {}) {
   const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
-  const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
-
   if (user.role === "admin") {
     const users = await Promise.all(
       db.users
         .filter((item) => item.role === "user")
         .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
-        .map((item) => buildManagedUserSummary(item, usdtNgnRate, { refreshWallets, mirrorPnl }))
+        .map((item) => buildManagedUserSummary(item, usdtNgnRate, { refreshWallets }))
     );
 
     return {
@@ -2499,6 +2492,7 @@ function serializeTradeForAdmin(trade) {
 
 function serializeTradeForUser(trade, userId) {
   const mirror = (trade.mirroredExecutions || []).find((item) => item.userId === userId);
+  const investment = getUserTradeInvestment(trade.id, userId);
   const exits = (trade.exitOrders || []).map((item) => ({
     ...item,
     mirroredExecution: (item.mirroredExecutions || []).find((row) => row.userId === userId) || null,
@@ -2519,7 +2513,116 @@ function serializeTradeForUser(trade, userId) {
     lifecycleStatus: deriveTradeLifecycle(trade),
     adminExecution: trade.adminExecution,
     mirroredExecution: mirror || null,
+    userInvestment: investment ? serializeTradeInvestment(investment) : null,
     exitOrders: exits,
+  };
+}
+
+function ensureTradeInvestmentsState() {
+  db.tradeInvestments = Array.isArray(db.tradeInvestments) ? db.tradeInvestments : [];
+  return db.tradeInvestments;
+}
+
+function getUserTradeInvestment(tradeId, userId) {
+  return ensureTradeInvestmentsState()
+    .find((item) => item.tradeId === tradeId && item.userId === userId && item.status === "ACTIVE") || null;
+}
+
+function getActiveUserTradeInvestments(userId) {
+  return ensureTradeInvestmentsState().filter((item) => item.userId === userId && item.status === "ACTIVE");
+}
+
+function serializeTradeInvestment(investment) {
+  return {
+    id: investment.id,
+    tradeId: investment.tradeId,
+    userId: investment.userId,
+    amountUsdt: investment.amountUsdt,
+    baselinePnlPercent: investment.baselinePnlPercent,
+    baselinePrice: investment.baselinePrice,
+    status: investment.status,
+    joinedAt: investment.joinedAt,
+    stoppedAt: investment.stoppedAt || null,
+    settledPnlUsdt: investment.settledPnlUsdt || "0",
+  };
+}
+
+function getTradeEntryPriceSnapshot(trade) {
+  return getExecutionAveragePrice(trade.adminExecution) || Number(trade.price || 0);
+}
+
+async function getTradeCurrentPriceSnapshot(trade, marketCache = new Map()) {
+  const lifecycle = deriveTradeLifecycle(trade);
+  if (lifecycle === "CLOSED") {
+    return getWeightedAverageExecutionPrice(getFilledExitExecutions(trade)) || getTradeEntryPriceSnapshot(trade);
+  }
+
+  const cacheKey = `${getTradeExchange(trade)}:${trade.symbol}`;
+  if (marketCache.has(cacheKey)) {
+    return marketCache.get(cacheKey);
+  }
+  const admin = db.users.find((user) => user.id === trade.createdByUserId) || db.users.find((user) => user.role === "admin");
+  const exchange = getTradeExchange(trade);
+  const adminAccount = getExchangeAccount(admin, exchange);
+  const ticker = await getTickerPrice(trade.symbol, adminAccount?.testnet, exchange).catch(() => null);
+  const price = Number(ticker?.price || getTradeEntryPriceSnapshot(trade) || 0);
+  marketCache.set(cacheKey, price);
+  return price;
+}
+
+async function getTradePnlPercentSnapshot(trade, marketCache = new Map()) {
+  const entryPrice = getTradeEntryPriceSnapshot(trade);
+  const currentPrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
+  if (!entryPrice || !currentPrice) {
+    return 0;
+  }
+  const multiplier = trade.side === "SELL" ? -1 : 1;
+  return ((currentPrice - entryPrice) / entryPrice) * 100 * multiplier;
+}
+
+async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
+  const dashboard = financialService.getDashboard(user);
+  const baseUsdt = String(dashboard.totalBalance.usdt || "0");
+  const rate = String(dashboard.totalBalance.usdtToNgnRate || "1600");
+  const activeInvestments = getActiveUserTradeInvestments(user.id);
+  const enriched = [];
+  let pnlUsdt = "0";
+
+  for (const investment of activeInvestments) {
+    const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (!trade || !["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+      continue;
+    }
+    const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
+    const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
+    const investmentPnlUsdt = multiplyRatio(investment.amountUsdt || "0", String(pnlDeltaPercent), "100");
+    pnlUsdt = add(pnlUsdt, investmentPnlUsdt);
+    enriched.push({
+      ...serializeTradeInvestment(investment),
+      symbol: trade.symbol,
+      currentPnlPercent,
+      pnlDeltaPercent,
+      pnlUsdt: investmentPnlUsdt,
+    });
+  }
+
+  const liveUsdt = add(baseUsdt, pnlUsdt);
+  const liveNgn = financialService.convertAmount(liveUsdt, "USDT", "NGN", rate);
+  return {
+    totalBalance: {
+      ...dashboard.totalBalance,
+      baseUsdt,
+      baseNgnEquivalent: dashboard.totalBalance.ngnEquivalent,
+      liveUsdt,
+      liveNgnEquivalent: liveNgn,
+    },
+    performance: {
+      ...dashboard.performance,
+      todayUsdt: pnlUsdt,
+      todayPercentage: compare(baseUsdt, "0") === 0 ? "0" : multiplyRatio(pnlUsdt, "100", baseUsdt),
+      source: "JOINED_TRADES",
+    },
+    activeInvestments: enriched,
   };
 }
 
@@ -3029,23 +3132,25 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     strategyContext: options.strategyContext || null,
   };
 
-  for (const follower of getMirroringUsers(exchange)) {
-    const mirroredOrderInput = await buildMirroredEntryOrderForUser(follower, normalizedOrderInput, exchange)
-      .catch((error) => ({
-        __mirrorError: error.message,
-      }));
-    const child = mirroredOrderInput?.__mirrorError
-      ? {
-          userId: follower.id,
-          userName: follower.name,
-          exchange,
-          purpose: "ENTRY",
-          status: "SKIPPED",
-          error: mirroredOrderInput.__mirrorError,
-          order: null,
-        }
-      : await executeOrderForUser(follower, mirroredOrderInput, "ENTRY", exchange);
-    trade.mirroredExecutions.push(child);
+  if (options.autoMirrorUsers === true) {
+    for (const follower of getMirroringUsers(exchange)) {
+      const mirroredOrderInput = await buildMirroredEntryOrderForUser(follower, normalizedOrderInput, exchange)
+        .catch((error) => ({
+          __mirrorError: error.message,
+        }));
+      const child = mirroredOrderInput?.__mirrorError
+        ? {
+            userId: follower.id,
+            userName: follower.name,
+            exchange,
+            purpose: "ENTRY",
+            status: "SKIPPED",
+            error: mirroredOrderInput.__mirrorError,
+            order: null,
+          }
+        : await executeOrderForUser(follower, mirroredOrderInput, "ENTRY", exchange);
+      trade.mirroredExecutions.push(child);
+    }
   }
 
   db.tradeIntents.unshift(trade);
@@ -3574,8 +3679,13 @@ async function handleApi(req, res, url) {
       return true;
     }
     const dashboard = financialService.getDashboard(user);
-    const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
-    sendJson(res, 200, mirrorPnl ? financialService.applyMirroredPnlToDashboard(dashboard, mirrorPnl) : dashboard);
+    const financeSummary = await buildUserTradeInvestmentSummary(user);
+    sendJson(res, 200, {
+      ...dashboard,
+      totalBalance: financeSummary.totalBalance,
+      performance: financeSummary.performance,
+      activeInvestments: financeSummary.activeInvestments,
+    });
     return true;
   }
 
@@ -3671,9 +3781,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const body = await readBody(req);
-      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
-      const withdrawal = financialService.createWithdrawal(user, { ...body, pnlBaselineMirror: mirrorPnl }, getRequestMeta(req));
+      const withdrawal = financialService.createWithdrawal(user, await readBody(req), getRequestMeta(req));
       sendJson(res, 201, { withdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -3744,15 +3852,10 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const body = await readBody(req);
-      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const deposit = financialService.approveDeposit(
         admin,
         decodeURIComponent(adminDepositApproveMatch[1]),
-        {
-          ...body,
-          pnlBaselineMirror: mirrorPnl,
-        },
+        await readBody(req),
         getRequestMeta(req)
       );
       sendJson(res, 200, { deposit });
@@ -4733,12 +4836,11 @@ async function handleApi(req, res, url) {
       return true;
     }
     const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
-    const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
     const users = await Promise.all(
       db.users
         .filter((user) => user.role === "user")
         .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
-        .map((user) => buildManagedUserSummary(user, usdtNgnRate, { mirrorPnl }))
+        .map((user) => buildManagedUserSummary(user, usdtNgnRate))
     );
     sendJson(res, 200, { users });
     return true;
@@ -4754,19 +4856,10 @@ async function handleApi(req, res, url) {
       const userId = decodeURIComponent(adminUserFinanceMatch[1] || "").trim();
       const profile = financialService.getUserFinanceProfile(userId);
       const targetUser = db.users.find((item) => item.id === userId && item.role === "user");
-      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
-      const dashboard = targetUser && mirrorPnl
-        ? financialService.applyMirroredPnlToDashboard(financialService.getDashboard(targetUser), mirrorPnl)
-        : null;
+      const financeSummary = targetUser ? await buildUserTradeInvestmentSummary(targetUser) : null;
       sendJson(res, 200, {
         ...profile,
-        financeSummary: dashboard
-          ? {
-              totalBalance: dashboard.totalBalance,
-              performance: dashboard.performance,
-              mirrorPnl: dashboard.mirrorPnl || null,
-            }
-          : null,
+        financeSummary,
       });
     } catch (error) {
       sendJson(res, 404, { error: error.message });
@@ -4781,12 +4874,10 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const body = await readBody(req);
-      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const result = financialService.addBonus(
         admin,
         decodeURIComponent(adminUserBonusMatch[1] || "").trim(),
-        { ...body, pnlBaselineMirror: mirrorPnl },
+        await readBody(req),
         getRequestMeta(req)
       );
       scheduleSettingsUsersBroadcast("admin_bonus_added");
@@ -4805,12 +4896,10 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const body = await readBody(req);
-      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const result = financialService.setUserBalance(
         admin,
         decodeURIComponent(adminUserBalanceMatch[1] || "").trim(),
-        { ...body, pnlBaselineMirror: mirrorPnl },
+        await readBody(req),
         getRequestMeta(req)
       );
       scheduleSettingsUsersBroadcast("admin_balance_updated");
@@ -4942,6 +5031,122 @@ async function handleApi(req, res, url) {
             )
             .map((trade) => serializeTradeForUser(trade, user.id));
     sendJson(res, 200, { trades });
+    return true;
+  }
+
+  const joinTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/join$/);
+  if (req.method === "POST" && joinTradeMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(joinTradeMatch[1] || ""));
+      if (!trade) {
+        sendJson(res, 404, { error: "Trade not found." });
+        return true;
+      }
+      const lifecycleStatus = deriveTradeLifecycle(trade);
+      if (!["OPEN", "PENDING"].includes(lifecycleStatus)) {
+        sendJson(res, 400, { error: "Only open trades can be joined." });
+        return true;
+      }
+      if (getUserTradeInvestment(trade.id, user.id)) {
+        sendJson(res, 400, { error: "You already joined this trade." });
+        return true;
+      }
+
+      const body = await readBody(req);
+      const availableUsdt = financialService.getAvailableUsdtEquivalent(user.id);
+      const activeAmountUsdt = getActiveUserTradeInvestments(user.id).reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
+      const freeUsdt = subtract(availableUsdt, activeAmountUsdt);
+      const amountUsdt = String(body.amountUsdt || body.amount || freeUsdt || "").replace(/,/g, "").trim();
+      if (compare(amountUsdt, "0") <= 0) {
+        sendJson(res, 400, { error: "Enter an investment amount." });
+        return true;
+      }
+      if (compare(amountUsdt, freeUsdt) > 0) {
+        sendJson(res, 400, { error: "Investment amount is higher than your free balance." });
+        return true;
+      }
+
+      const marketCache = new Map();
+      const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
+      const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
+      const investment = {
+        id: randomId(12),
+        userId: user.id,
+        tradeId: trade.id,
+        amountUsdt,
+        baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
+        baselinePrice: String(Number(baselinePrice || 0).toFixed(8)),
+        status: "ACTIVE",
+        joinedAt: nowIso(),
+        stoppedAt: null,
+        settledPnlUsdt: "0",
+      };
+      ensureTradeInvestmentsState().unshift(investment);
+      persist();
+      sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const stopTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/stop$/);
+  if (req.method === "POST" && stopTradeMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(stopTradeMatch[1] || ""));
+      if (!trade) {
+        sendJson(res, 404, { error: "Trade not found." });
+        return true;
+      }
+      const investment = getUserTradeInvestment(trade.id, user.id);
+      if (!investment) {
+        sendJson(res, 404, { error: "No active investment found for this trade." });
+        return true;
+      }
+      const marketCache = new Map();
+      const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
+      const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
+      const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", String(pnlDeltaPercent), "100");
+      const wallet = financialService.ensureWallet(user.id, "USDT");
+      const balanceBefore = wallet.availableBalance;
+      wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
+      wallet.updatedAt = nowIso();
+      investment.status = "STOPPED";
+      investment.stoppedAt = nowIso();
+      investment.stopPnlPercent = String(Number(currentPnlPercent.toFixed(8)));
+      investment.settledPnlUsdt = settledPnlUsdt;
+      db.transactions.unshift({
+        id: randomId(12),
+        userId: user.id,
+        type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
+        currency: "USDT",
+        amount: settledPnlUsdt,
+        balanceBefore,
+        balanceAfter: wallet.availableBalance,
+        reference: investment.id,
+        status: "APPROVED",
+        description: `Stopped ${trade.symbol} investment.`,
+        createdBy: user.id,
+        createdAt: nowIso(),
+        metadata: {
+          tradeId: trade.id,
+          baselinePnlPercent: investment.baselinePnlPercent,
+          stopPnlPercent: investment.stopPnlPercent,
+        },
+      });
+      persist();
+      sendJson(res, 200, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
