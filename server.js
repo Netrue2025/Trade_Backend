@@ -2547,6 +2547,14 @@ function serializeTradeInvestment(investment) {
   };
 }
 
+function toMoneyDecimal(value, digits = 8) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) {
+    return "0";
+  }
+  return number.toFixed(digits).replace(/\.?0+$/, "") || "0";
+}
+
 function getTradeEntryPriceSnapshot(trade) {
   return getExecutionAveragePrice(trade.adminExecution) || Number(trade.price || 0);
 }
@@ -2595,7 +2603,7 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
     }
     const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
     const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
-    const investmentPnlUsdt = multiplyRatio(investment.amountUsdt || "0", String(pnlDeltaPercent), "100");
+    const investmentPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
     pnlUsdt = add(pnlUsdt, investmentPnlUsdt);
     enriched.push({
       ...serializeTradeInvestment(investment),
@@ -5114,7 +5122,7 @@ async function handleApi(req, res, url) {
       const marketCache = new Map();
       const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
       const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
-      const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", String(pnlDeltaPercent), "100");
+      const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
       const wallet = financialService.ensureWallet(user.id, "USDT");
       const balanceBefore = wallet.availableBalance;
       wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
