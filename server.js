@@ -5186,8 +5186,8 @@ async function handleApi(req, res, url) {
         return true;
       }
       const lifecycleStatus = deriveTradeLifecycle(trade);
-      if (!["OPEN", "PENDING"].includes(lifecycleStatus)) {
-        sendJson(res, 400, { error: "Only open trades can be joined." });
+      if (lifecycleStatus !== "OPEN") {
+        sendJson(res, 400, { error: "This order is still queued. You can only join filled open trades." });
         return true;
       }
       if (getUserTradeInvestment(trade.id, user.id)) {
