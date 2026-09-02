@@ -2580,7 +2580,7 @@ function getReservedInvestmentUsdt(investment, rate) {
   );
 }
 
-function reserveTradeInvestmentFunds(user, amountUsdt, reference) {
+function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user.id) {
   const fundingSources = financialService.resolveWithdrawalFunding(user.id, "USDT", amountUsdt);
 
   for (const source of fundingSources) {
@@ -2600,7 +2600,7 @@ function reserveTradeInvestmentFunds(user, amountUsdt, reference) {
       reference,
       status: "APPROVED",
       description: "Trade investment locked.",
-      createdBy: user.id,
+      createdBy: actorId,
       createdAt: nowIso(),
       metadata: {
         requestedCurrency: "USDT",
@@ -5021,6 +5021,91 @@ async function handleApi(req, res, url) {
       );
       scheduleSettingsUsersBroadcast("admin_bonus_added");
       sendJson(res, 201, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminUserJoinTradeMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/trades\/([^/]+)\/join$/);
+  if (req.method === "POST" && adminUserJoinTradeMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const userId = decodeURIComponent(adminUserJoinTradeMatch[1] || "").trim();
+      const tradeId = decodeURIComponent(adminUserJoinTradeMatch[2] || "").trim();
+      const targetUser = db.users.find((item) => item.id === userId && item.role === "user");
+      if (!targetUser) {
+        sendJson(res, 404, { error: "User not found." });
+        return true;
+      }
+      const trade = db.tradeIntents.find((item) => item.id === tradeId);
+      if (!trade) {
+        sendJson(res, 404, { error: "Trade not found." });
+        return true;
+      }
+      if (deriveTradeLifecycle(trade) !== "OPEN") {
+        sendJson(res, 400, { error: "This order is still queued. Users can only join filled open trades." });
+        return true;
+      }
+      if (getUserTradeInvestment(trade.id, targetUser.id)) {
+        sendJson(res, 400, { error: "User already joined this trade." });
+        return true;
+      }
+
+      const body = await readBody(req);
+      const availableUsdt = financialService.getAvailableUsdtEquivalent(targetUser.id);
+      const legacyActiveAmountUsdt = getActiveUserTradeInvestments(targetUser.id)
+        .filter((item) => !getInvestmentFundingSources(item).length)
+        .reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
+      const freeUsdt = subtract(availableUsdt, legacyActiveAmountUsdt);
+      const amountUsdt = String(body.amountUsdt || body.amount || freeUsdt || "").replace(/,/g, "").trim();
+      if (compare(amountUsdt, "0") <= 0) {
+        sendJson(res, 400, { error: "Enter an investment amount." });
+        return true;
+      }
+      if (compare(amountUsdt, freeUsdt) > 0) {
+        sendJson(res, 400, { error: "Investment amount is higher than this user's free balance." });
+        return true;
+      }
+
+      const investmentId = randomId(12);
+      const fundingSources = reserveTradeInvestmentFunds(targetUser, amountUsdt, investmentId, admin.id);
+      const marketCache = new Map();
+      const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
+      const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
+      const investment = {
+        id: investmentId,
+        userId: targetUser.id,
+        tradeId: trade.id,
+        amountUsdt,
+        fundingSources,
+        baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
+        baselinePrice: String(Number(baselinePrice || 0).toFixed(8)),
+        status: "ACTIVE",
+        joinedAt: nowIso(),
+        stoppedAt: null,
+        settledPnlUsdt: "0",
+        joinedBy: admin.id,
+      };
+      ensureTradeInvestmentsState().unshift(investment);
+      financialService.createNotification({
+        userId: targetUser.id,
+        type: "TRADE",
+        title: "Trade joined",
+        message: `Admin added you to ${trade.symbol}.`,
+        entityType: "Trade",
+        entityId: trade.id,
+      });
+      persist();
+      scheduleSettingsUsersBroadcast("admin_user_trade_joined");
+      sendJson(res, 201, {
+        investment: serializeTradeInvestment(investment),
+        trade: serializeTradeForUser(trade, targetUser.id),
+        user: await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
+      });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
