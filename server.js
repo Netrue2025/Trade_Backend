@@ -3563,7 +3563,9 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    sendJson(res, 200, financialService.getDashboard(user));
+    const dashboard = financialService.getDashboard(user);
+    const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
+    sendJson(res, 200, mirrorPnl ? financialService.applyMirroredPnlToDashboard(dashboard, mirrorPnl) : dashboard);
     return true;
   }
 
@@ -3667,6 +3669,20 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "PUT" && url.pathname === "/api/user/bank-account") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const bankAccount = financialService.updateUserBankAccount(user, await readBody(req), getRequestMeta(req));
+      sendJson(res, 200, { bankAccount });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/withdrawals") {
     const user = requireAuth(req, res);
     if (!user) {
@@ -3716,10 +3732,15 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      const body = await readBody(req);
+      const mirrorPnl = await getAdminBybitMirrorPnl().catch(() => null);
       const deposit = financialService.approveDeposit(
         admin,
         decodeURIComponent(adminDepositApproveMatch[1]),
-        await readBody(req),
+        {
+          ...body,
+          pnlBaselineMirror: mirrorPnl,
+        },
         getRequestMeta(req)
       );
       sendJson(res, 200, { deposit });

@@ -43,12 +43,12 @@ function setWallet(service, userId, currency, availableBalance, lockedBalance = 
   return wallet;
 }
 
-test("deposit submission credits once and approval does not duplicate it", () => {
+test("deposit approval credits once and submission does not change balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
 
   const deposit = service.createDeposit(user, { amount: "50", transactionHash: "0xabc" });
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
@@ -70,7 +70,7 @@ test("naira deposit approval credits NGN wallet", () => {
   assert.equal(deposit.currency, "NGN");
   assert.equal(deposit.displayAmounts.USDT, "3.125");
   assert.equal(deposit.displayAmounts.NGN, "5000");
-  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
@@ -98,12 +98,12 @@ test("admin rate setting drives deposit equivalents", () => {
   assert.equal(deposit.displayAmounts.NGN, "3000");
 });
 
-test("rejected pending deposit reverses the principal credit", () => {
+test("rejected pending deposit does not credit wallet", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
 
   const deposit = service.createDeposit(user, { amount: "25", currency: "USDT", transactionHash: "0xreject-credit" });
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "125");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
 
   service.rejectDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
@@ -253,10 +253,10 @@ test("mirrored pnl overlay dynamically adjusts unified user balance", () => {
 
   assert.equal(dashboard.totalBalance.usdt, "20");
   assert.equal(mirrored.totalBalance.baseUsdt, "20");
-  assert.equal(mirrored.totalBalance.usdt, "21");
-  assert.equal(mirrored.totalBalance.ngnEquivalent, "33600");
-  assert.equal(mirrored.performance.todayUsdt, "1");
-  assert.equal(mirrored.performance.todayPercentage, "5");
+  assert.equal(mirrored.totalBalance.usdt, "20");
+  assert.equal(mirrored.totalBalance.liveUsdt, "20");
+  assert.equal(mirrored.performance.todayUsdt, "0");
+  assert.equal(mirrored.performance.todayPercentage, "0");
 });
 
 test("mirrored pnl overlay derives percentage from admin amount and capital base", () => {
@@ -270,9 +270,58 @@ test("mirrored pnl overlay derives percentage from admin amount and capital base
     source: "ADMIN_BYBIT",
   });
 
-  assert.equal(mirrored.performance.todayUsdt, "2");
-  assert.equal(mirrored.performance.todayPercentage, "4");
-  assert.equal(mirrored.totalBalance.usdt, "52");
+  assert.equal(mirrored.performance.todayUsdt, "0");
+  assert.equal(mirrored.performance.todayPercentage, "0");
+  assert.equal(mirrored.mirrorPnl.adminPercent, "4");
+  assert.equal(mirrored.totalBalance.usdt, "50");
+});
+
+test("approved deposit starts pnl from current admin baseline", () => {
+  const { admin, service, user } = createHarness();
+
+  const deposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xbaseline" });
+  service.approveDeposit(admin, deposit.id, {
+    pnlBaselineMirror: {
+      todayPnlPercent: "-0.5",
+      todayLabel: "2026-08-30",
+    },
+  });
+
+  const mirrored = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "0",
+    todayLabel: "2026-08-30",
+    source: "ADMIN_BYBIT",
+  });
+
+  assert.equal(mirrored.performance.todayUsdt, "0.5");
+  assert.equal(mirrored.performance.todayPercentage, "0.5");
+  assert.equal(mirrored.totalBalance.liveUsdt, "100.5");
+});
+
+test("user pnl settlement carries balance across daily reset", () => {
+  const { admin, service, user } = createHarness();
+  const deposit = service.createDeposit(user, { amount: "100", currency: "USDT", transactionHash: "0xrollover" });
+  service.approveDeposit(admin, deposit.id, {
+    pnlBaselineMirror: {
+      todayPnlPercent: "0",
+      todayLabel: "2026-08-30",
+    },
+  });
+
+  service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "1",
+    todayLabel: "2026-08-30",
+    source: "ADMIN_BYBIT",
+  });
+  const nextDay = service.applyMirroredPnlToDashboard(service.getDashboard(user), {
+    todayPnlPercent: "0",
+    todayLabel: "2026-08-31",
+    source: "ADMIN_BYBIT",
+  });
+
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "101");
+  assert.equal(nextDay.performance.todayUsdt, "0");
+  assert.equal(nextDay.totalBalance.usdt, "101");
 });
 
 test("daily withdrawal limit is enforced", () => {
