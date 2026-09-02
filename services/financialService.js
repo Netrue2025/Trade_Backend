@@ -879,9 +879,14 @@ class FinancialService {
     const amount = normalizeNonNegativeAmount(input.amount, "Balance");
     const note = String(input.note || "Balance updated").trim();
     const wallet = this.ensureWallet(targetUser.id, currency);
+    const alternateCurrency = currency === "USDT" ? "NGN" : "USDT";
+    const alternateWallet = this.ensureWallet(targetUser.id, alternateCurrency);
     const balanceBefore = wallet.availableBalance;
+    const alternateBalanceBefore = alternateWallet.availableBalance;
     wallet.availableBalance = amount;
+    alternateWallet.availableBalance = "0";
     wallet.updatedAt = this.clock();
+    alternateWallet.updatedAt = this.clock();
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
@@ -895,6 +900,11 @@ class FinancialService {
       description: note,
       createdBy: admin.id,
       createdAt: this.clock(),
+      metadata: {
+        overwriteUnifiedBalance: true,
+        clearedCurrency: alternateCurrency,
+        clearedBalanceBefore: alternateBalanceBefore,
+      },
     };
     this.db.transactions.unshift(transaction);
     this.createNotification({

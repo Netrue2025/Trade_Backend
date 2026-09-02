@@ -382,6 +382,7 @@ test("admin bonus credits user wallet and creates notification", () => {
 test("admin can set a user balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "15");
+  setWallet(service, user.id, "NGN", "16000");
 
   const result = service.setUserBalance(admin, user.id, {
     currency: "USDT",
@@ -390,8 +391,10 @@ test("admin can set a user balance", () => {
   });
 
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "42");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "0");
   assert.equal(result.transaction.type, "BALANCE_ADJUSTMENT");
   assert.equal(result.transaction.amount, "27");
+  assert.equal(result.transaction.metadata.clearedCurrency, "NGN");
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
 });
 
