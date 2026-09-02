@@ -3563,9 +3563,7 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    const dashboard = financialService.getDashboard(user);
-    const mirrorPnl = await getAdminBybitMirrorPnl();
-    sendJson(res, 200, mirrorPnl ? financialService.applyMirroredPnlToDashboard(dashboard, mirrorPnl) : dashboard);
+    sendJson(res, 200, financialService.getDashboard(user));
     return true;
   }
 
@@ -4879,9 +4877,15 @@ async function handleApi(req, res, url) {
         ? db.tradeIntents.filter((trade) => getTradeExchange(trade) === exchange).map(serializeTradeForAdmin)
         : db.tradeIntents
             .filter(
-              (trade) =>
-                getTradeExchange(trade) === exchange &&
-                trade.mirroredExecutions.some((row) => row.userId === user.id)
+              (trade) => {
+                if (getTradeExchange(trade) !== exchange) {
+                  return false;
+                }
+                if (trade.mirroredExecutions.some((row) => row.userId === user.id)) {
+                  return true;
+                }
+                return ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
+              }
             )
             .map((trade) => serializeTradeForUser(trade, user.id));
     sendJson(res, 200, { trades });

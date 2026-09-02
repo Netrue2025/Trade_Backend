@@ -43,12 +43,12 @@ function setWallet(service, userId, currency, availableBalance, lockedBalance = 
   return wallet;
 }
 
-test("deposit approval credits once and second approval is rejected", () => {
+test("deposit submission credits once and approval does not duplicate it", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
 
   const deposit = service.createDeposit(user, { amount: "50", transactionHash: "0xabc" });
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
@@ -70,7 +70,7 @@ test("naira deposit approval credits NGN wallet", () => {
   assert.equal(deposit.currency, "NGN");
   assert.equal(deposit.displayAmounts.USDT, "3.125");
   assert.equal(deposit.displayAmounts.NGN, "5000");
-  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
@@ -96,6 +96,18 @@ test("admin rate setting drives deposit equivalents", () => {
   assert.equal(deposit.exchangeRate, "1500");
   assert.equal(deposit.displayAmounts.USDT, "2");
   assert.equal(deposit.displayAmounts.NGN, "3000");
+});
+
+test("rejected pending deposit reverses the principal credit", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "100");
+
+  const deposit = service.createDeposit(user, { amount: "25", currency: "USDT", transactionHash: "0xreject-credit" });
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "125");
+
+  service.rejectDeposit(admin, deposit.id);
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "100");
+  assert.equal(service.getDashboard(user).walletHistory.find((item) => item.id === deposit.id).status, "REJECTED");
 });
 
 test("wallet history includes deposit and withdrawal request statuses", () => {

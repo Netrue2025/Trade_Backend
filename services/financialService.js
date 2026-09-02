@@ -505,7 +505,31 @@ class FinancialService {
       reviewedBy: null,
       adminNote: "",
     };
+    const wallet = this.ensureWallet(user.id, currency);
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = add(wallet.availableBalance, amount);
+    wallet.updatedAt = this.clock();
+    deposit.creditedAt = this.clock();
+    deposit.creditedBy = user.id;
     this.db.deposits.unshift(deposit);
+    this.db.transactions.unshift({
+      id: this.idGenerator(12),
+      userId: user.id,
+      type: "DEPOSIT",
+      currency,
+      amount,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      reference: deposit.id,
+      status: "PENDING",
+      description: "Deposit pending review.",
+      createdBy: user.id,
+      createdAt: this.clock(),
+      metadata: {
+        displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(amount, currency, deposit.exchangeRate),
+        principalCredit: true,
+      },
+    });
     this.notifyAdmins({
       type: "DEPOSIT",
       title: "Deposit request",
@@ -540,30 +564,41 @@ class FinancialService {
     }
 
     const wallet = this.ensureWallet(deposit.userId, deposit.currency);
-    const balanceBefore = wallet.availableBalance;
-    wallet.availableBalance = add(wallet.availableBalance, deposit.amount);
-    wallet.updatedAt = this.clock();
+    if (!deposit.creditedAt) {
+      const balanceBefore = wallet.availableBalance;
+      wallet.availableBalance = add(wallet.availableBalance, deposit.amount);
+      wallet.updatedAt = this.clock();
+      deposit.creditedAt = this.clock();
+      deposit.creditedBy = admin.id;
+      this.db.transactions.unshift({
+        id: this.idGenerator(12),
+        userId: deposit.userId,
+        type: "DEPOSIT",
+        currency: deposit.currency,
+        amount: deposit.amount,
+        balanceBefore,
+        balanceAfter: wallet.availableBalance,
+        reference: deposit.id,
+        status: "APPROVED",
+        description: `Manual ${deposit.currency} deposit approved by admin.`,
+        createdBy: admin.id,
+        createdAt: this.clock(),
+        metadata: {
+          displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(deposit.amount, deposit.currency, deposit.exchangeRate),
+          principalCredit: true,
+        },
+      });
+    }
     deposit.status = "APPROVED";
     deposit.reviewedAt = this.clock();
     deposit.reviewedBy = admin.id;
     deposit.adminNote = String(input.adminNote || "").trim();
-    this.db.transactions.unshift({
-      id: this.idGenerator(12),
-      userId: deposit.userId,
-      type: "DEPOSIT",
-      currency: deposit.currency,
-      amount: deposit.amount,
-      balanceBefore,
-      balanceAfter: wallet.availableBalance,
-      reference: deposit.id,
-      status: "APPROVED",
-      description: `Manual ${deposit.currency} deposit approved by admin.`,
-      createdBy: admin.id,
-      createdAt: this.clock(),
-      metadata: {
-        displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(deposit.amount, deposit.currency, deposit.exchangeRate),
-      },
-    });
+    for (const transaction of this.db.transactions.filter((item) => item.type === "DEPOSIT" && item.reference === deposit.id)) {
+      transaction.status = "APPROVED";
+      transaction.description = `Manual ${deposit.currency} deposit approved by admin.`;
+      transaction.reviewedAt = deposit.reviewedAt;
+      transaction.reviewedBy = admin.id;
+    }
     this.createNotification({
       userId: deposit.userId,
       type: "DEPOSIT",
@@ -583,10 +618,41 @@ class FinancialService {
     if (deposit.status !== "PENDING") {
       throw new Error("Deposit request is no longer pending.");
     }
+    const wallet = this.ensureWallet(deposit.userId, deposit.currency);
+    if (deposit.creditedAt && !deposit.reversedAt) {
+      const balanceBefore = wallet.availableBalance;
+      wallet.availableBalance = subtract(wallet.availableBalance, deposit.amount);
+      wallet.updatedAt = this.clock();
+      deposit.reversedAt = this.clock();
+      this.db.transactions.unshift({
+        id: this.idGenerator(12),
+        userId: deposit.userId,
+        type: "REVERSAL",
+        currency: deposit.currency,
+        amount: `-${deposit.amount}`,
+        balanceBefore,
+        balanceAfter: wallet.availableBalance,
+        reference: deposit.id,
+        status: "REJECTED",
+        description: "Rejected deposit reversed.",
+        createdBy: admin.id,
+        createdAt: this.clock(),
+        metadata: {
+          displayAmounts: deposit.displayAmounts || this.getDisplayAmounts(deposit.amount, deposit.currency, deposit.exchangeRate),
+          principalCredit: true,
+        },
+      });
+    }
     deposit.status = "REJECTED";
     deposit.reviewedAt = this.clock();
     deposit.reviewedBy = admin.id;
     deposit.adminNote = String(input.adminNote || "").trim();
+    for (const transaction of this.db.transactions.filter((item) => item.type === "DEPOSIT" && item.reference === deposit.id)) {
+      transaction.status = "REJECTED";
+      transaction.description = "Deposit rejected.";
+      transaction.reviewedAt = deposit.reviewedAt;
+      transaction.reviewedBy = admin.id;
+    }
     this.createNotification({
       userId: deposit.userId,
       type: "DEPOSIT",
