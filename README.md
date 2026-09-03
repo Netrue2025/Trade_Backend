@@ -23,3 +23,5 @@ If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact 
 ## Deployment Notes
 
 This backend exposes normal HTTP API routes plus websocket endpoints. If you deploy the frontend separately, set `FRONTEND_ORIGIN` here and set `TRADE_API_BASE_URL` on the frontend service.
+
+Render does not upload local `.env` files. Use `render.yaml` as the Blueprint or add the same keys listed there in the service's **Environment** tab.
