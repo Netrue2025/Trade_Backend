@@ -367,11 +367,11 @@ test("withdrawal is blocked while user has an active trade investment", () => {
   }), /stop active trades/i);
 });
 
-test("daily withdrawal limit is enforced", () => {
+test("daily NGN withdrawal limit is enforced by amount, not request count", () => {
   const { service, user } = createHarness();
-  setWallet(service, user.id, "USDT", "100");
+  setWallet(service, user.id, "USDT", "7000");
 
-  for (let index = 0; index < 2; index += 1) {
+  for (let index = 0; index < 3; index += 1) {
     service.createWithdrawal(user, {
       amount: "10",
       currency: "USDT",
@@ -382,13 +382,22 @@ test("daily withdrawal limit is enforced", () => {
     });
   }
 
+  service.createWithdrawal(user, {
+    amount: "5000",
+    currency: "USDT",
+    destination: {
+      address: "TUserWalletAddressLarge",
+      network: "TRC20",
+    },
+  });
+
   assert.throws(
     () =>
       service.createWithdrawal(user, {
-        amount: "10",
+        amount: "1300",
         currency: "USDT",
         destination: {
-          address: "TUserWalletAddress3",
+          address: "TUserWalletAddressOver",
           network: "TRC20",
         },
       }),

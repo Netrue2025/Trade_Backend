@@ -72,7 +72,8 @@ function defaultSettings() {
       maxUsdt: getEnvValue("MAX_WITHDRAWAL_USDT") || "1000000",
       minNgn: getEnvValue("MIN_WITHDRAWAL_NGN") || "1000",
       maxNgn: getEnvValue("MAX_WITHDRAWAL_NGN") || "1000000000",
-      maxDailyCount: Number(getEnvValue("MAX_DAILY_WITHDRAWALS") || 2),
+      maxDailyCount: 0,
+      maxDailyNgn: getEnvValue("MAX_DAILY_WITHDRAWAL_NGN") || "10000000",
       usdtFee: getEnvValue("WITHDRAWAL_USDT_FEE") || "0",
       ngnFee: getEnvValue("WITHDRAWAL_NGN_FEE") || "0",
     },
@@ -208,7 +209,8 @@ class FinancialService {
       next.exchangeRate.updatedBy = admin.id;
     }
 
-    next.withdrawal.maxDailyCount = Math.max(0, Math.floor(Number(next.withdrawal.maxDailyCount || 0)));
+    next.withdrawal.maxDailyCount = 0;
+    next.withdrawal.maxDailyNgn = normalizeAmount(next.withdrawal.maxDailyNgn || "10000000", "Daily withdrawal limit");
     this.db.systemSettings = next;
     this.audit(admin, "SETTINGS_UPDATED", "SystemSettings", "current", { sections: Object.keys(patch) }, requestMeta);
     this.persist();
@@ -1065,11 +1067,11 @@ class FinancialService {
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Withdrawal amount");
     this.validateWithdrawalSettings(currency, amount);
-    this.validateDailyWithdrawalLimit(user.id);
     const activeInvestments = this.db.tradeInvestments.filter((item) => item.userId === user.id && item.status === "ACTIVE");
     if (activeInvestments.length) {
       throw new Error("Stop active trades before requesting a withdrawal.");
     }
+    this.validateDailyWithdrawalLimit(user.id, currency, amount);
     let destination = null;
     let bank = null;
     if (currency === "NGN") {
@@ -1927,20 +1929,31 @@ class FinancialService {
     }
   }
 
-  validateDailyWithdrawalLimit(userId) {
-    const maxDailyCount = Number(this.db.systemSettings.withdrawal.maxDailyCount || 0);
-    if (!maxDailyCount) {
+  validateDailyWithdrawalLimit(userId, currency, amount) {
+    const maxDailyNgn = String(this.db.systemSettings.withdrawal.maxDailyNgn || "10000000");
+    if (!isPositive(maxDailyNgn)) {
       return;
     }
     const today = this.clock().slice(0, 10);
-    const count = this.db.withdrawals.filter(
-      (withdrawal) =>
+    const requestedNgn = currency === "NGN"
+      ? amount
+      : this.convertAmount(amount, currency, "NGN");
+    const usedTodayNgn = this.db.withdrawals.reduce((sum, withdrawal) => {
+      if (
         withdrawal.userId === userId &&
-        !["REJECTED", "CANCELLED"].includes(withdrawal.status) &&
+        !["REJECTED", "CANCELLED", "FAILED", "REVERSED"].includes(withdrawal.status) &&
         String(withdrawal.submittedAt || "").startsWith(today)
-    ).length;
-    if (count >= maxDailyCount) {
-      throw new Error("Daily withdrawal limit reached.");
+      ) {
+        const withdrawalNgn = withdrawal.currency === "NGN"
+          ? String(withdrawal.amount || "0")
+          : this.convertAmount(withdrawal.amount || "0", withdrawal.currency, "NGN", withdrawal.exchangeRate);
+        return add(sum, withdrawalNgn);
+      }
+      return sum;
+    }, "0");
+    const nextDailyNgn = add(usedTodayNgn, requestedNgn);
+    if (compare(nextDailyNgn, maxDailyNgn) > 0) {
+      throw new Error(`Daily withdrawal limit is ${maxDailyNgn} NGN.`);
     }
   }
 
