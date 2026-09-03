@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
+const crypto = require("node:crypto");
 const { WebSocketServer } = require("ws");
 const { getEnvValue, parseEnvFileValue } = require("./lib/env");
 
@@ -44,6 +45,7 @@ const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { emitOrderExecuted, orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
+const { PaystackService, maskAccountNumber } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
 const { TradeLearningService } = require("./services/tradeLearning");
 const { TradeListener } = require("./services/tradeListener");
@@ -94,6 +96,8 @@ const SETTINGS_USERS_WS_REFRESH_MS = 20_000;
 const SETTINGS_USERS_WS_PATH = "/ws/settings-users";
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5;
+const PAYMENT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const PAYMENT_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const SIGNAL_AUTO_TRADE_DEFAULT_FIRST_BALANCE_PERCENT = 50;
 const SIGNAL_AUTO_TRADE_DEFAULT_SECOND_BALANCE_PERCENT = 100;
 const SIGNAL_AUTO_TRADE_DEFAULT_MAX_SIMULTANEOUS_TRADES = 2;
@@ -110,11 +114,13 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 let db = null;
 let financialService = null;
 const loginAttemptBuckets = new Map();
+const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
 const subscriberModel = new SubscriberModel();
 const telegramTradeService = new TelegramService({
   subscriberModel,
 });
+const paystackService = new PaystackService();
 const tradeListener = new TradeListener({
   telegramService: telegramTradeService,
   subscriberModel,
@@ -635,6 +641,23 @@ function readBody(req) {
   });
 }
 
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > 1_000_000) {
+        reject(new Error("Request body too large."));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.writeHead(statusCode, {
     ...buildSecurityHeaders(),
@@ -764,6 +787,179 @@ function recordFailedLogin(req, email) {
     return;
   }
   existing.count += 1;
+}
+
+function isPaymentRateLimited(req, userId, action) {
+  const key = `${action}:${userId || "anon"}:${getRequestIp(req)}`;
+  const existing = paymentAttemptBuckets.get(key);
+  if (!existing || Date.now() - existing.startedAt > PAYMENT_RATE_LIMIT_WINDOW_MS) {
+    paymentAttemptBuckets.set(key, { count: 1, startedAt: Date.now() });
+    return false;
+  }
+  existing.count += 1;
+  return existing.count > PAYMENT_RATE_LIMIT_MAX_ATTEMPTS;
+}
+
+function getFrontendUrl() {
+  return normalizeOrigin(getEnvValue("FRONTEND_URL", "FRONTEND_ORIGIN") || DEFAULT_FRONTEND_ORIGIN);
+}
+
+function getTelegramAdminChatId() {
+  return String(getEnvValue("TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID") || "").trim();
+}
+
+function formatNgnAmount(value) {
+  return `NGN ${Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function getWithdrawalUser(withdrawal) {
+  return db.users.find((user) => user.id === withdrawal.userId) || {};
+}
+
+function buildWithdrawalAdminUrl(withdrawal) {
+  return `${getFrontendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
+}
+
+async function sendWithdrawalTelegramMessage(withdrawal, title, extraLines = []) {
+  const chatId = getTelegramAdminChatId();
+  if (!chatId || !telegramTradeService?.bot) {
+    return null;
+  }
+  const user = getWithdrawalUser(withdrawal);
+  const bank = withdrawal.bank || withdrawal.destination || {};
+  const text = [
+    title,
+    "",
+    `User: ${user.name || "User"}`,
+    `Amount: ${formatNgnAmount(withdrawal.amount)}`,
+    `Bank: ${bank.bankName || "Bank"}`,
+    `Account Name: ${bank.accountName || ""}`,
+    `Account: ${bank.maskedAccountNumber || maskAccountNumber(bank.accountNumber)}`,
+    "",
+    ...extraLines,
+    `Requested: ${withdrawal.submittedAt ? new Date(withdrawal.submittedAt).toLocaleString() : ""}`,
+  ].filter((line) => line !== null && line !== undefined).join("\n");
+
+  return telegramTradeService.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [[
+        {
+          text: "Review Withdrawal",
+          url: buildWithdrawalAdminUrl(withdrawal),
+        },
+      ]],
+    },
+  }).catch((error) => {
+    console.warn("Withdrawal Telegram notification failed:", error.message || error);
+    return null;
+  });
+}
+
+async function editWithdrawalTelegramMessage(withdrawal, title, extraLines = []) {
+  const chatId = getTelegramAdminChatId();
+  const messageId = withdrawal.telegramMessageId;
+  if (!chatId || !messageId || !telegramTradeService?.bot?.editMessageText) {
+    await sendWithdrawalTelegramMessage(withdrawal, title, extraLines);
+    return;
+  }
+  const user = getWithdrawalUser(withdrawal);
+  const text = [
+    title,
+    "",
+    `${user.name || "User"}`,
+    `${formatNgnAmount(withdrawal.amount)}`,
+    "",
+    ...extraLines,
+  ].filter(Boolean).join("\n");
+  await telegramTradeService.bot.editMessageText(text, {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: {
+      inline_keyboard: [[
+        {
+          text: "Review Withdrawal",
+          url: buildWithdrawalAdminUrl(withdrawal),
+        },
+      ]],
+    },
+  }).catch((error) => {
+    console.warn("Withdrawal Telegram status edit failed:", error.message || error);
+  });
+}
+
+async function ensurePaystackRecipientForWithdrawal(withdrawal) {
+  if (withdrawal.paystackRecipientCode) {
+    return withdrawal.paystackRecipientCode;
+  }
+  const user = getWithdrawalUser(withdrawal);
+  const bank = withdrawal.bank || withdrawal.destination || {};
+  const savedBank = financialService.getVerifiedBankAccount(user, bank.id || "");
+  if (
+    savedBank.paystackRecipientCode &&
+    savedBank.accountNumber === bank.accountNumber &&
+    savedBank.bankCode === bank.bankCode
+  ) {
+    financialService.setWithdrawalRecipientCode(withdrawal.id, savedBank.paystackRecipientCode);
+    return savedBank.paystackRecipientCode;
+  }
+  const recipient = await paystackService.createTransferRecipient({
+    accountName: bank.accountName,
+    accountNumber: bank.accountNumber,
+    bankCode: bank.bankCode,
+  });
+  const recipientCode = String(recipient.recipient_code || "").trim();
+  if (!recipientCode) {
+    throw new Error("Paystack did not return a recipient code.");
+  }
+  financialService.setWithdrawalRecipientCode(withdrawal.id, recipientCode);
+  return recipientCode;
+}
+
+async function verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta) {
+  const verification = await paystackService.verifyTransfer(withdrawal.paystackReference);
+  const data = verification.data || {};
+  if (data.transfer_code || data.status) {
+    return financialService.markPaystackTransferProcessing(admin, withdrawal.id, verification, requestMeta);
+  }
+  throw new Error("Paystack transfer status is unclear. Please verify from Paystack dashboard before retrying.");
+}
+
+async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
+  let withdrawal = financialService.getWithdrawal(withdrawalId);
+  if (withdrawal.currency !== "NGN") {
+    throw new Error("Only NGN withdrawals can be approved through Paystack.");
+  }
+  if (withdrawal.status === "APPROVED" && withdrawal.metadata?.paystackTransferAttemptedAt) {
+    return verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta);
+  }
+  withdrawal = financialService.approvePaystackWithdrawal(admin, withdrawalId, requestMeta);
+  await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+  const recipientCode = await ensurePaystackRecipientForWithdrawal(withdrawal);
+  withdrawal = financialService.markPaystackTransferAttempt(admin, withdrawal.id, requestMeta);
+  try {
+    const transfer = await paystackService.initiateTransfer({
+      amountKobo: withdrawal.amountKobo,
+      recipientCode,
+      reference: withdrawal.paystackReference,
+      reason: `Withdrawal ${withdrawal.paystackReference}`,
+    });
+    withdrawal = financialService.markPaystackTransferProcessing(admin, withdrawal.id, transfer, requestMeta);
+    await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+    return withdrawal;
+  } catch (error) {
+    if (error.code === "PAYSTACK_TIMEOUT") {
+      try {
+        withdrawal = await verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta);
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+        return withdrawal;
+      } catch (verifyError) {
+        financialService.markPaystackTransferUnclear(admin, withdrawal.id, verifyError, requestMeta);
+        throw verifyError;
+      }
+    }
+    financialService.markPaystackTransferUnclear(admin, withdrawal.id, error, requestMeta);
+    throw error;
+  }
 }
 
 function clearFailedLogins(req, email) {
@@ -3726,6 +3922,44 @@ function clearSessionCookie(req, res) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "POST" && url.pathname === "/api/webhooks/paystack") {
+    try {
+      const rawBody = await readRawBody(req);
+      const signature = String(req.headers["x-paystack-signature"] || "").trim();
+      if (!paystackService.verifyWebhookSignature(rawBody, signature)) {
+        sendJson(res, 401, { error: "Invalid Paystack signature." });
+        return true;
+      }
+      const payloadHash = crypto.createHash("sha256").update(rawBody).digest("hex");
+      const payload = JSON.parse(rawBody.toString("utf8") || "{}");
+      const eventType = String(payload.event || "").trim();
+      const data = payload.data || {};
+      const reference = String(data.reference || "").trim();
+      const webhookEvent = financialService.recordPaystackWebhookEvent({ eventType, reference, payloadHash });
+      if (webhookEvent.duplicate) {
+        sendJson(res, 200, { received: true, duplicate: true });
+        return true;
+      }
+
+      let withdrawal = null;
+      if (eventType === "transfer.success") {
+        withdrawal = financialService.applyPaystackTransferSuccess(reference, data, getRequestMeta(req));
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+      } else if (eventType === "transfer.failed") {
+        withdrawal = financialService.applyPaystackTransferFailed(reference, data, getRequestMeta(req));
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
+      } else if (eventType === "transfer.reversed") {
+        withdrawal = financialService.applyPaystackTransferReversed(reference, data, getRequestMeta(req));
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL REVERSED", ["Funds returned to wallet."]);
+      }
+      financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
+      sendJson(res, 200, { received: true, processed: !!withdrawal });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, {
       ok: true,
@@ -3894,6 +4128,61 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/payments/banks") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "banks")) {
+      sendJson(res, 429, { error: "Too many payment requests. Please try again shortly." });
+      return true;
+    }
+    try {
+      const banks = await paystackService.getBanks();
+      sendJson(res, 200, { banks });
+    } catch (error) {
+      sendJson(res, 503, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/payments/resolve-account") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "resolve-account")) {
+      sendJson(res, 429, { error: "Too many account checks. Please try again shortly." });
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const resolved = await paystackService.resolveAccount(body);
+      const banks = await paystackService.getBanks().catch(() => []);
+      const bank = banks.find((item) => item.code === resolved.bankCode);
+      const bankAccount = financialService.updateVerifiedBankAccount(
+        user,
+        {
+          bankName: body.bankName || bank?.name || resolved.bankCode,
+          bankCode: resolved.bankCode,
+          accountNumber: resolved.accountNumber,
+          accountName: resolved.accountName,
+        },
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, {
+        success: true,
+        accountNumber: resolved.accountNumber,
+        accountName: resolved.accountName,
+        bankCode: resolved.bankCode,
+        bankAccount,
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/deposits") {
     const user = requireAuth(req, res, "user");
     if (!user) {
@@ -3941,8 +4230,20 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
+    if (isPaymentRateLimited(req, user.id, "withdrawal-create")) {
+      sendJson(res, 429, { error: "Too many withdrawal requests. Please try again shortly." });
+      return true;
+    }
     try {
       const withdrawal = financialService.createWithdrawal(user, await readBody(req), getRequestMeta(req));
+      if (withdrawal.currency === "NGN") {
+        const sent = await sendWithdrawalTelegramMessage(withdrawal, "NEW WITHDRAWAL REQUEST", [
+          "Status: Pending Admin Approval",
+        ]);
+        if (sent?.message_id) {
+          financialService.setWithdrawalTelegramMessage(withdrawal.id, sent.message_id);
+        }
+      }
       sendJson(res, 201, { withdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -3956,7 +4257,20 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const bankAccount = financialService.updateUserBankAccount(user, await readBody(req), getRequestMeta(req));
+      const body = await readBody(req);
+      const resolved = await paystackService.resolveAccount(body);
+      const banks = await paystackService.getBanks().catch(() => []);
+      const bank = banks.find((item) => item.code === resolved.bankCode);
+      const bankAccount = financialService.updateVerifiedBankAccount(
+        user,
+        {
+          bankName: body.bankName || bank?.name || resolved.bankCode,
+          bankCode: resolved.bankCode,
+          accountNumber: resolved.accountNumber,
+          accountName: resolved.accountName,
+        },
+        getRequestMeta(req)
+      );
       sendJson(res, 200, { bankAccount });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -3966,6 +4280,15 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/withdrawals") {
     const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    sendJson(res, 200, { withdrawals: financialService.listWithdrawals(user, { status: url.searchParams.get("status") }) });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/withdrawals/me") {
+    const user = requireAuth(req, res, "user");
     if (!user) {
       return true;
     }
@@ -4055,6 +4378,67 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const adminWithdrawalDetailMatch = url.pathname.match(/^\/api\/admin\/withdrawals\/([^/]+)$/);
+  if (req.method === "GET" && adminWithdrawalDetailMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const withdrawal = financialService.listWithdrawals(admin).find((item) => item.id === decodeURIComponent(adminWithdrawalDetailMatch[1]));
+      if (!withdrawal) {
+        sendJson(res, 404, { error: "Withdrawal request not found." });
+        return true;
+      }
+      const profile = financialService.getUserFinanceProfile(withdrawal.userId);
+      sendJson(res, 200, { withdrawal, profile });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminWithdrawalApproveMatch = url.pathname.match(/^\/api\/admin\/withdrawals\/([^/]+)\/approve$/);
+  if (req.method === "POST" && adminWithdrawalApproveMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const withdrawal = await approvePaystackWithdrawalFlow(
+        admin,
+        decodeURIComponent(adminWithdrawalApproveMatch[1]),
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, { withdrawal });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminWithdrawalFinalizeMatch = url.pathname.match(/^\/api\/admin\/withdrawals\/([^/]+)\/finalize$/);
+  if (req.method === "POST" && adminWithdrawalFinalizeMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const withdrawalId = decodeURIComponent(adminWithdrawalFinalizeMatch[1]);
+      const withdrawal = financialService.getWithdrawal(withdrawalId);
+      const body = await readBody(req);
+      const result = await paystackService.finalizeTransfer({
+        transferCode: withdrawal.paystackTransferCode,
+        otp: body.otp,
+      });
+      const processing = financialService.markPaystackTransferProcessing(admin, withdrawalId, result, getRequestMeta(req));
+      sendJson(res, 200, { withdrawal: processing });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/admin/transactions") {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {
@@ -4131,6 +4515,11 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      if (withdrawal.currency === "NGN") {
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL REJECTED", [
+          `Reason: ${withdrawal.rejectionReason || withdrawal.adminNote || "Rejected"}`,
+        ]);
+      }
       sendJson(res, 200, { withdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -5764,6 +6153,7 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 async function startServer() {
+  paystackService.validateProductionEnvironment();
   db = await loadDb();
   ensureAdminUser(db);
   financialService = new FinancialService({ db, persist });

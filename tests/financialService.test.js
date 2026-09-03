@@ -1,7 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 
 const { FinancialService } = require("../services/financialService");
+const { PaystackService, toKobo } = require("../services/paystackService");
 
 function createHarness() {
   let id = 0;
@@ -41,6 +43,15 @@ function setWallet(service, userId, currency, availableBalance, lockedBalance = 
   wallet.availableBalance = String(availableBalance);
   wallet.lockedBalance = String(lockedBalance);
   return wallet;
+}
+
+function setVerifiedBank(service, user) {
+  return service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "ADA USER",
+  });
 }
 
 test("deposit approval credits once and submission does not change balance", () => {
@@ -196,20 +207,20 @@ test("USDT withdrawal accepts wallet aliases and configured network", () => {
 test("NGN withdrawal accepts account aliases and formatted account number", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "NGN", "25000");
+  const bankAccount = setVerifiedBank(service, user);
 
   const withdrawal = service.createWithdrawal(user, {
     amount: "12000",
     currency: "NGN",
-    destination: {
-      bank: "Test Bank",
-      accountHolderName: "Ada User",
-      accountNo: "123-456 7890",
-    },
+    bankAccountId: bankAccount.id,
   });
 
   assert.equal(withdrawal.destination.bankName, "Test Bank");
-  assert.equal(withdrawal.destination.accountName, "Ada User");
+  assert.equal(withdrawal.destination.accountName, "ADA USER");
   assert.equal(withdrawal.destination.accountNumber, "1234567890");
+  assert.equal(withdrawal.amountKobo, 1200000);
+  assert.equal(withdrawal.status, "PENDING");
+  assert.equal(withdrawal.balanceReserved, true);
 });
 
 test("daily performance compounds from current eligible balance and does not double apply", () => {
@@ -414,6 +425,133 @@ test("legacy wallet balance fields are available for one click trade join", () =
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "32000");
 });
 
+test("Paystack kobo conversion and webhook signature verification", () => {
+  const secretKey = "sk_test_example";
+  const rawBody = Buffer.from(JSON.stringify({ event: "transfer.success", data: { reference: "wd_test" } }));
+  const signature = crypto.createHmac("sha512", secretKey).update(rawBody).digest("hex");
+  const service = new PaystackService({ secretKey, fetchImpl: async () => ({ ok: true, json: async () => ({ status: true }) }) });
+
+  assert.equal(toKobo("50000"), 5000000);
+  assert.equal(toKobo("50000.75"), 5000075);
+  assert.equal(service.verifyWebhookSignature(rawBody, signature), true);
+  assert.equal(service.verifyWebhookSignature(rawBody, "bad-signature"), false);
+});
+
+test("NGN withdrawal requires a verified bank account", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+
+  assert.throws(() => service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  }), /verify a Nigerian bank account/i);
+});
+
+test("NGN Paystack withdrawal success consumes reserved balance once", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "30000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "20000");
+  const approved = service.approvePaystackWithdrawal(admin, withdrawal.id);
+  const processing = service.markPaystackTransferProcessing(admin, approved.id, {
+    data: {
+      transfer_code: "TRF_test",
+      reference: approved.paystackReference,
+      status: "pending",
+    },
+  });
+  const success = service.applyPaystackTransferSuccess(processing.paystackReference, {
+    reference: processing.paystackReference,
+    amount: processing.amountKobo,
+    transfer_code: "TRF_test",
+    recipient: { recipient_code: processing.paystackRecipientCode },
+  });
+  const duplicate = service.applyPaystackTransferSuccess(processing.paystackReference, {
+    reference: processing.paystackReference,
+    amount: processing.amountKobo,
+  });
+
+  assert.equal(success.status, "SUCCESS");
+  assert.equal(duplicate.status, "SUCCESS");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "30000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
+test("Paystack failed withdrawal releases reserved balance", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const approved = service.approvePaystackWithdrawal(admin, withdrawal.id);
+  service.markPaystackTransferProcessing(admin, approved.id, {
+    data: { transfer_code: "TRF_failed", reference: approved.paystackReference },
+  });
+  const failed = service.applyPaystackTransferFailed(approved.paystackReference, {
+    reference: approved.paystackReference,
+    amount: approved.amountKobo,
+    reason: "failed",
+  });
+
+  assert.equal(failed.status, "FAILED");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "50000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
+test("rejected Paystack withdrawal releases reserved balance", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const rejected = service.rejectWithdrawal(admin, withdrawal.id, { reason: "Incorrect request" });
+
+  assert.equal(rejected.status, "REJECTED");
+  assert.equal(rejected.balanceReserved, false);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "50000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
+test("reversed successful Paystack withdrawal credits user once", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const approved = service.approvePaystackWithdrawal(admin, withdrawal.id);
+  service.markPaystackTransferProcessing(admin, approved.id, {
+    data: { transfer_code: "TRF_reversed", reference: approved.paystackReference },
+  });
+  service.applyPaystackTransferSuccess(approved.paystackReference, {
+    reference: approved.paystackReference,
+    amount: approved.amountKobo,
+  });
+  service.applyPaystackTransferReversed(approved.paystackReference, {
+    reference: approved.paystackReference,
+    amount: approved.amountKobo,
+  });
+  const duplicate = service.applyPaystackTransferReversed(approved.paystackReference, {
+    reference: approved.paystackReference,
+    amount: approved.amountKobo,
+  });
+
+  assert.equal(duplicate.status, "REVERSED");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "50000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
 test("USDT withdrawal can reserve NGN equivalent when USDT wallet is short", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "USDT", "5");
@@ -442,15 +580,11 @@ test("NGN withdrawal can reserve USDT equivalent when naira wallet is short", ()
   const { service, user } = createHarness();
   setWallet(service, user.id, "NGN", "8000");
   setWallet(service, user.id, "USDT", "10");
+  setVerifiedBank(service, user);
 
   const withdrawal = service.createWithdrawal(user, {
     amount: "16000",
     currency: "NGN",
-    destination: {
-      bankName: "Test Bank",
-      accountName: "Ada User",
-      accountNumber: "1234567890",
-    },
   });
 
   assert.deepEqual(withdrawal.fundingSources, [

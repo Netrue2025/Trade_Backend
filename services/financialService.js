@@ -9,10 +9,12 @@ const {
 } = require("../lib/money");
 const { getEnvValue } = require("../lib/env");
 const { randomId } = require("../lib/security");
+const { maskAccountNumber, toKobo } = require("./paystackService");
 
 const SUPPORTED_CURRENCIES = ["USDT", "NGN"];
-const WITHDRAWAL_STATUSES = ["PENDING", "PROCESSING", "COMPLETED", "REJECTED", "CANCELLED"];
+const WITHDRAWAL_STATUSES = ["PENDING", "APPROVED", "PROCESSING", "SUCCESS", "FAILED", "REJECTED", "REVERSED", "COMPLETED", "CANCELLED"];
 const DEPOSIT_STATUSES = ["PENDING", "APPROVED", "REJECTED"];
+const ACTIVE_WITHDRAWAL_STATUSES = ["PENDING", "APPROVED", "PROCESSING"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -117,6 +119,7 @@ class FinancialService {
     this.db.dailyPerformances = Array.isArray(this.db.dailyPerformances) ? this.db.dailyPerformances : [];
     this.db.auditLogs = Array.isArray(this.db.auditLogs) ? this.db.auditLogs : [];
     this.db.idempotencyKeys = Array.isArray(this.db.idempotencyKeys) ? this.db.idempotencyKeys : [];
+    this.db.webhookEvents = Array.isArray(this.db.webhookEvents) ? this.db.webhookEvents : [];
     this.db.systemSettings = {
       ...defaultSettings(),
       ...(this.db.systemSettings || {}),
@@ -145,9 +148,24 @@ class FinancialService {
     for (const user of this.db.users || []) {
       if (user.role === "user") {
         user.pnlLots = Array.isArray(user.pnlLots) ? user.pnlLots : [];
+        user.bankAccounts = Array.isArray(user.bankAccounts) ? user.bankAccounts : [];
+        if (user.bankAccount && !user.bankAccount.id) {
+          user.bankAccount.id = this.idGenerator(12);
+        }
         for (const currency of SUPPORTED_CURRENCIES) {
           this.ensureWallet(user.id, currency);
         }
+      }
+    }
+
+    for (const withdrawal of this.db.withdrawals) {
+      withdrawal.status = String(withdrawal.status || "PENDING").trim().toUpperCase();
+      withdrawal.currency = normalizeCurrency(withdrawal.currency || "NGN");
+      withdrawal.balanceReserved = withdrawal.balanceReserved !== false && ACTIVE_WITHDRAWAL_STATUSES.includes(withdrawal.status);
+      if (withdrawal.currency === "NGN") {
+        withdrawal.amountKobo = Number(withdrawal.amountKobo || toKobo(withdrawal.amount || "0"));
+        withdrawal.paystackReference = withdrawal.paystackReference || withdrawal.externalTransactionReference || this.createPaystackReference();
+        withdrawal.bank = withdrawal.bank || withdrawal.destination || {};
       }
     }
   }
@@ -216,6 +234,68 @@ class FinancialService {
       NGN: normalizedCurrency === "NGN" ? String(amount) : this.convertAmount(amount, "USDT", "NGN", rate),
       rate: String(rate),
     };
+  }
+
+  createPaystackReference() {
+    return `wd_${this.idGenerator(24).toLowerCase().replace(/[^a-z0-9]/g, "_")}`;
+  }
+
+  normalizeBankAccount(input = {}) {
+    const bankName = String(input.bankName || input.bank || input.bank_name || "").trim();
+    const bankCode = String(input.bankCode || input.bank_code || "").trim();
+    const accountName = String(input.accountName || input.account_name || "").trim();
+    const accountNumber = String(input.accountNumber || input.account_number || "").replace(/\D/g, "").trim();
+    if (!bankName || !bankCode || !accountName || !/^\d{10}$/.test(accountNumber)) {
+      throw new Error("A verified Nigerian bank account is required.");
+    }
+    return {
+      id: String(input.id || this.idGenerator(12)).trim(),
+      type: "NGN_BANK",
+      bankName,
+      bankCode,
+      accountNumber,
+      maskedAccountNumber: maskAccountNumber(accountNumber),
+      accountName,
+      paystackRecipientCode: String(input.paystackRecipientCode || input.recipientCode || "").trim(),
+      verified: input.verified !== false,
+      verifiedAt: input.verifiedAt || this.clock(),
+      updatedAt: this.clock(),
+    };
+  }
+
+  getVerifiedBankAccount(user, bankAccountId = "") {
+    const candidates = [
+      ...(Array.isArray(user.bankAccounts) ? user.bankAccounts : []),
+      user.bankAccount,
+    ].filter(Boolean);
+    const targetId = String(bankAccountId || "").trim();
+    const account = targetId
+      ? candidates.find((item) => item.id === targetId)
+      : candidates.find((item) => item.verified);
+    if (!account || !account.verified) {
+      throw new Error("Add and verify a Nigerian bank account before withdrawal.");
+    }
+    return this.normalizeBankAccount(account);
+  }
+
+  updateVerifiedBankAccount(user, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const bankAccount = this.normalizeBankAccount({ ...input, verified: true });
+    user.bankAccount = bankAccount;
+    user.bankAccounts = Array.isArray(user.bankAccounts) ? user.bankAccounts : [];
+    user.bankAccounts = [
+      bankAccount,
+      ...user.bankAccounts.filter(
+        (item) => item.accountNumber !== bankAccount.accountNumber || item.bankCode !== bankAccount.bankCode
+      ),
+    ];
+    this.audit(user, "BANK_ACCOUNT_VERIFIED", "User", user.id, {
+      bankName: bankAccount.bankName,
+      bankCode: bankAccount.bankCode,
+      maskedAccountNumber: bankAccount.maskedAccountNumber,
+    }, requestMeta);
+    this.persist();
+    return clone(bankAccount);
   }
 
   ensureWallet(userId, currency) {
@@ -401,6 +481,7 @@ class FinancialService {
         email: user.email,
       },
       bankAccount: clone(user.bankAccount || null),
+      bankAccounts: clone(user.bankAccounts || []),
       wallets,
       totalBalance: {
         usdt: availableUsdtEquivalent,
@@ -818,14 +899,10 @@ class FinancialService {
 
   updateUserBankAccount(user, input = {}, requestMeta = {}) {
     this.ensureState();
-    const bankAccount = this.normalizeWithdrawalDestination("NGN", input.destination || input);
-    user.bankAccount = {
-      ...bankAccount,
-      updatedAt: this.clock(),
-    };
-    this.audit(user, "BANK_ACCOUNT_UPDATED", "User", user.id, {}, requestMeta);
-    this.persist();
-    return clone(user.bankAccount);
+    if (input.verified === true || input.accountName || input.account_name) {
+      return this.updateVerifiedBankAccount(user, input.destination || input, requestMeta);
+    }
+    throw new Error("Verify the bank account before saving it.");
   }
 
   addBonus(admin, userId, input = {}, requestMeta = {}) {
@@ -981,6 +1058,9 @@ class FinancialService {
     if (idempotent) {
       return idempotent;
     }
+    if (["SUSPENDED", "BLOCKED"].includes(String(user.status || "").trim().toUpperCase())) {
+      throw new Error("This account cannot request withdrawals right now.");
+    }
 
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Withdrawal amount");
@@ -990,40 +1070,69 @@ class FinancialService {
     if (activeInvestments.length) {
       throw new Error("Stop active trades before requesting a withdrawal.");
     }
-    const fundingSources = this.resolveWithdrawalFunding(user.id, currency, amount);
-    const destinationInput = currency === "NGN"
-      ? this.mergeBankDestination(user.bankAccount, input.destination || input)
-      : input.destination || input;
-    const destination = this.normalizeWithdrawalDestination(currency, destinationInput);
-    if (currency === "NGN" && input.saveBankAccount !== false) {
-      user.bankAccount = {
-        ...destination,
-        updatedAt: this.clock(),
+    let destination = null;
+    let bank = null;
+    if (currency === "NGN") {
+      bank = this.getVerifiedBankAccount(user, input.bankAccountId);
+      destination = {
+        type: "NGN_BANK",
+        bankName: bank.bankName,
+        bankCode: bank.bankCode,
+        accountName: bank.accountName,
+        accountNumber: bank.accountNumber,
+        maskedAccountNumber: bank.maskedAccountNumber,
       };
+      const duplicate = this.db.withdrawals.find((withdrawal) =>
+        withdrawal.userId === user.id &&
+        withdrawal.currency === "NGN" &&
+        withdrawal.amount === amount &&
+        ACTIVE_WITHDRAWAL_STATUSES.includes(withdrawal.status) &&
+        (withdrawal.bank?.accountNumber || withdrawal.destination?.accountNumber) === bank.accountNumber
+      );
+      if (duplicate) {
+        throw new Error("A matching withdrawal request is already in review.");
+      }
     }
+    const fundingSources = this.resolveWithdrawalFunding(user.id, currency, amount);
+    if (currency !== "NGN") {
+      destination = this.normalizeWithdrawalDestination(currency, input.destination || input);
+    }
+    const paystackReference = currency === "NGN" ? this.createPaystackReference() : "";
     const withdrawal = {
       id: this.idGenerator(12),
       userId: user.id,
       amount,
+      amountKobo: currency === "NGN" ? toKobo(amount) : 0,
       currency,
       status: "PENDING",
       exchangeRate: this.db.systemSettings.exchangeRate.usdtToNgn,
       displayAmounts: this.getDisplayAmounts(amount, currency),
+      bank,
       destination,
+      paystackRecipientCode: bank?.paystackRecipientCode || "",
+      paystackTransferCode: "",
+      paystackReference,
       fee: currency === "USDT" ? this.db.systemSettings.withdrawal.usdtFee : this.db.systemSettings.withdrawal.ngnFee,
       submittedAt: this.clock(),
+      approvedAt: null,
+      approvedBy: null,
       processingAt: null,
       processedBy: null,
       completedAt: null,
       completedBy: null,
       rejectedAt: null,
       rejectedBy: null,
+      rejectionReason: "",
+      failureReason: "",
+      telegramMessageId: "",
+      balanceReserved: true,
       fundingSources: fundingSources.map((source) => ({
         currency: source.currency,
         amount: source.amount,
       })),
-      externalTransactionReference: "",
+      externalTransactionReference: paystackReference,
       adminNote: "",
+      metadata: {},
     };
 
     for (const source of fundingSources) {
@@ -1055,13 +1164,21 @@ class FinancialService {
     }
     this.db.withdrawals.unshift(withdrawal);
     this.notifyAdmins({
-      type: "WITHDRAWAL",
-      title: "Withdrawal request",
+      type: "WITHDRAWAL_REQUEST",
+      title: "New Withdrawal Request",
       message: `${user.name || "User"} requested ${amount} ${currency}.`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
-    this.audit(user, "WITHDRAWAL_SUBMITTED", "Withdrawal", withdrawal.id, { amount, currency }, requestMeta);
+    this.createNotification({
+      userId: user.id,
+      type: "WITHDRAWAL",
+      title: "Withdrawal submitted",
+      message: `Your withdrawal request of ${amount} ${currency} is awaiting approval.`,
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit(user, "WITHDRAWAL_CREATED", "Withdrawal", withdrawal.id, { amount, currency }, requestMeta);
     this.saveIdempotent("withdrawal:create", user.id, requestMeta.idempotencyKey, withdrawal);
     this.persist();
     return clone(withdrawal);
@@ -1081,6 +1198,10 @@ class FinancialService {
   }
 
   processWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
+    const current = this.getWithdrawal(withdrawalId);
+    if (current.currency === "NGN" && current.paystackReference) {
+      throw new Error("Use Paystack approval for NGN bank withdrawals.");
+    }
     const withdrawal = this.changeWithdrawalStatus(admin, withdrawalId, "PROCESSING", input, requestMeta);
     withdrawal.processingAt = this.clock();
     withdrawal.processedBy = admin.id;
@@ -1088,9 +1209,138 @@ class FinancialService {
     return clone(withdrawal);
   }
 
+  setWithdrawalTelegramMessage(withdrawalId, telegramMessageId) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    withdrawal.telegramMessageId = String(telegramMessageId || "").trim();
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  setWithdrawalRecipientCode(withdrawalId, recipientCode) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    const code = String(recipientCode || "").trim();
+    withdrawal.paystackRecipientCode = code;
+    const user = this.db.users.find((item) => item.id === withdrawal.userId);
+    if (user?.bankAccount && withdrawal.bank && user.bankAccount.accountNumber === withdrawal.bank.accountNumber && user.bankAccount.bankCode === withdrawal.bank.bankCode) {
+      user.bankAccount.paystackRecipientCode = code;
+      user.bankAccounts = Array.isArray(user.bankAccounts) ? user.bankAccounts : [];
+      user.bankAccounts = user.bankAccounts.map((account) =>
+        account.accountNumber === withdrawal.bank.accountNumber && account.bankCode === withdrawal.bank.bankCode
+          ? { ...account, paystackRecipientCode: code }
+          : account
+      );
+    }
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  approvePaystackWithdrawal(admin, withdrawalId, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    if (withdrawal.currency !== "NGN") {
+      throw new Error("Only NGN bank withdrawals can be approved through Paystack.");
+    }
+    if (withdrawal.status !== "PENDING") {
+      const error = new Error("Withdrawal has already been processed.");
+      error.statusCode = 409;
+      throw error;
+    }
+    if (withdrawal.balanceReserved !== true) {
+      throw new Error("Withdrawal balance was not reserved.");
+    }
+    withdrawal.status = "APPROVED";
+    withdrawal.approvedBy = admin.id;
+    withdrawal.approvedAt = this.clock();
+    withdrawal.paystackReference = withdrawal.paystackReference || this.createPaystackReference();
+    withdrawal.externalTransactionReference = withdrawal.paystackReference;
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      approvalIpAddress: requestMeta.ipAddress || "",
+    };
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal approved",
+      message: "Your withdrawal has been approved and payment is being processed.",
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit(admin, "WITHDRAWAL_APPROVED", "Withdrawal", withdrawal.id, {
+      amount: withdrawal.amount,
+      currency: withdrawal.currency,
+      maskedAccountNumber: withdrawal.bank?.maskedAccountNumber || maskAccountNumber(withdrawal.bank?.accountNumber),
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  markPaystackTransferAttempt(admin, withdrawalId, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      paystackTransferAttemptedAt: withdrawal.metadata?.paystackTransferAttemptedAt || this.clock(),
+      paystackTransferAttemptedBy: admin.id,
+    };
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  markPaystackTransferProcessing(admin, withdrawalId, paystackPayload = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    if (!["APPROVED", "PROCESSING"].includes(withdrawal.status)) {
+      throw new Error("Only approved withdrawals can move to processing.");
+    }
+    const data = paystackPayload.data || paystackPayload || {};
+    withdrawal.status = "PROCESSING";
+    withdrawal.processingAt = withdrawal.processingAt || this.clock();
+    withdrawal.processedBy = withdrawal.processedBy || admin.id;
+    withdrawal.paystackTransferCode = String(data.transfer_code || withdrawal.paystackTransferCode || "").trim();
+    withdrawal.paystackReference = String(data.reference || withdrawal.paystackReference || "").trim();
+    withdrawal.externalTransactionReference = withdrawal.paystackReference;
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      paystackStatus: String(data.status || "").trim(),
+      requiresOtp: /otp/i.test(String(paystackPayload.message || data.status || "")),
+      paystackTransferResponse: {
+        id: data.id || data.transfer_code || "",
+        status: data.status || "",
+      },
+    };
+    this.audit(admin, "PAYSTACK_TRANSFER_INITIATED", "Withdrawal", withdrawal.id, {
+      amountKobo: withdrawal.amountKobo,
+      reference: withdrawal.paystackReference,
+      transferCode: withdrawal.paystackTransferCode,
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  markPaystackTransferUnclear(admin, withdrawalId, error, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      paystackTransferUnclear: true,
+      paystackTransferUnclearAt: this.clock(),
+      paystackTransferUnclearReason: String(error?.message || error || "").slice(0, 180),
+    };
+    this.audit(admin, "PAYSTACK_TRANSFER_UNCLEAR", "Withdrawal", withdrawal.id, {
+      reference: withdrawal.paystackReference,
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
   completeWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
     this.ensureState();
     const withdrawal = this.getWithdrawal(withdrawalId);
+    if (withdrawal.currency === "NGN" && withdrawal.paystackReference) {
+      throw new Error("Paystack webhook must confirm NGN withdrawal success.");
+    }
     if (!["PENDING", "PROCESSING"].includes(withdrawal.status)) {
       throw new Error("Only pending or processing withdrawals can be completed.");
     }
@@ -1129,6 +1379,7 @@ class FinancialService {
     withdrawal.status = "COMPLETED";
     withdrawal.completedAt = this.clock();
     withdrawal.completedBy = admin.id;
+    withdrawal.balanceReserved = false;
     withdrawal.externalTransactionReference = String(input.externalTransactionReference || input.transactionHash || "").trim();
     withdrawal.adminNote = String(input.adminNote || "").trim();
     this.createNotification({
@@ -1147,8 +1398,32 @@ class FinancialService {
   rejectWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
     this.ensureState();
     const withdrawal = this.getWithdrawal(withdrawalId);
-    if (!["PENDING", "PROCESSING"].includes(withdrawal.status)) {
-      throw new Error("Only pending or processing withdrawals can be rejected.");
+    if (withdrawal.status !== "PENDING") {
+      throw new Error("Only pending withdrawals can be rejected.");
+    }
+    this.releaseWithdrawalReservation(withdrawal, admin, "REJECTED", "Withdrawal rejected.");
+    withdrawal.status = "REJECTED";
+    withdrawal.rejectedAt = this.clock();
+    withdrawal.rejectedBy = admin.id;
+    withdrawal.rejectionReason = String(input.reason || input.adminNote || "").trim();
+    withdrawal.adminNote = withdrawal.rejectionReason;
+    withdrawal.balanceReserved = false;
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal rejected",
+      message: "Your withdrawal request was rejected.",
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit(admin, "WITHDRAWAL_REJECTED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  consumeWithdrawalReservation(withdrawal, actor, status, description) {
+    if (withdrawal.balanceReserved === false) {
+      return;
     }
     const fundingSources = this.getWithdrawalFundingSources(withdrawal);
     for (const source of fundingSources) {
@@ -1157,7 +1432,45 @@ class FinancialService {
         throw new Error("Locked balance is lower than the withdrawal amount.");
       }
     }
+    for (const source of fundingSources) {
+      const wallet = this.ensureWallet(withdrawal.userId, source.currency);
+      const lockedBefore = wallet.lockedBalance;
+      wallet.lockedBalance = subtract(wallet.lockedBalance, source.amount);
+      wallet.updatedAt = this.clock();
+      this.db.transactions.unshift({
+        id: this.idGenerator(12),
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL_COMPLETED",
+        currency: source.currency,
+        amount: `-${source.amount}`,
+        balanceBefore: lockedBefore,
+        balanceAfter: wallet.lockedBalance,
+        reference: withdrawal.id,
+        status,
+        description,
+        createdBy: actor?.id || "system",
+        createdAt: this.clock(),
+        metadata: {
+          requestedCurrency: withdrawal.currency,
+          requestedAmount: withdrawal.amount,
+          paystackReference: withdrawal.paystackReference || "",
+        },
+      });
+    }
+    withdrawal.balanceReserved = false;
+  }
 
+  releaseWithdrawalReservation(withdrawal, actor, status, description) {
+    if (withdrawal.balanceReserved === false) {
+      return;
+    }
+    const fundingSources = this.getWithdrawalFundingSources(withdrawal);
+    for (const source of fundingSources) {
+      const wallet = this.ensureWallet(withdrawal.userId, source.currency);
+      if (compare(wallet.lockedBalance, source.amount) < 0) {
+        throw new Error("Locked balance is lower than the withdrawal amount.");
+      }
+    }
     for (const source of fundingSources) {
       const wallet = this.ensureWallet(withdrawal.userId, source.currency);
       const availableBefore = wallet.availableBalance;
@@ -1174,31 +1487,150 @@ class FinancialService {
         balanceBefore: availableBefore,
         balanceAfter: wallet.availableBalance,
         reference: withdrawal.id,
-        status: "APPROVED",
-        description: "Withdrawal rejected.",
-        createdBy: admin.id,
+        status,
+        description,
+        createdBy: actor?.id || "system",
         createdAt: this.clock(),
         metadata: {
           requestedCurrency: withdrawal.currency,
           requestedAmount: withdrawal.amount,
           lockedBalanceBefore: lockedBefore,
           lockedBalanceAfter: wallet.lockedBalance,
+          paystackReference: withdrawal.paystackReference || "",
         },
       });
     }
-    withdrawal.status = "REJECTED";
-    withdrawal.rejectedAt = this.clock();
-    withdrawal.rejectedBy = admin.id;
-    withdrawal.adminNote = String(input.adminNote || "").trim();
+    withdrawal.balanceReserved = false;
+  }
+
+  creditWithdrawalReversal(withdrawal, actor, description) {
+    if (withdrawal.metadata?.reversalCreditedAt) {
+      return;
+    }
+    const fundingSources = this.getWithdrawalFundingSources(withdrawal);
+    for (const source of fundingSources) {
+      const wallet = this.ensureWallet(withdrawal.userId, source.currency);
+      const availableBefore = wallet.availableBalance;
+      wallet.availableBalance = add(wallet.availableBalance, source.amount);
+      wallet.updatedAt = this.clock();
+      this.db.transactions.unshift({
+        id: this.idGenerator(12),
+        userId: withdrawal.userId,
+        type: "REVERSAL",
+        currency: source.currency,
+        amount: source.amount,
+        balanceBefore: availableBefore,
+        balanceAfter: wallet.availableBalance,
+        reference: withdrawal.id,
+        status: "REVERSED",
+        description,
+        createdBy: actor?.id || "system",
+        createdAt: this.clock(),
+        metadata: {
+          requestedCurrency: withdrawal.currency,
+          requestedAmount: withdrawal.amount,
+          paystackReference: withdrawal.paystackReference || "",
+        },
+      });
+    }
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      reversalCreditedAt: this.clock(),
+    };
+  }
+
+  applyPaystackTransferSuccess(reference, eventData = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawalByPaystackReference(reference);
+    if (withdrawal.status === "SUCCESS") {
+      return clone(withdrawal);
+    }
+    if (!["APPROVED", "PROCESSING"].includes(withdrawal.status)) {
+      throw new Error("Withdrawal is not ready for Paystack success.");
+    }
+    this.assertPaystackEventMatchesWithdrawal(withdrawal, eventData);
+    this.consumeWithdrawalReservation(withdrawal, { id: "paystack", role: "system" }, "SUCCESS", "Withdrawal paid by Paystack.");
+    withdrawal.status = "SUCCESS";
+    withdrawal.completedAt = this.clock();
+    withdrawal.paystackTransferCode = String(eventData.transfer_code || withdrawal.paystackTransferCode || "").trim();
+    withdrawal.failureReason = "";
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      paystackStatus: String(eventData.status || "success"),
+    };
     this.createNotification({
       userId: withdrawal.userId,
       type: "WITHDRAWAL",
-      title: "Withdrawal rejected",
-      message: withdrawal.adminNote || "Your reserved funds were returned.",
+      title: "Withdrawal paid",
+      message: `Your withdrawal of ${withdrawal.amount} NGN has been successfully paid to your bank account.`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
-    this.audit(admin, "WITHDRAWAL_REJECTED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
+    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_SUCCESS", "Withdrawal", withdrawal.id, {
+      reference: withdrawal.paystackReference,
+      amountKobo: withdrawal.amountKobo,
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  applyPaystackTransferFailed(reference, eventData = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawalByPaystackReference(reference);
+    if (withdrawal.status === "FAILED") {
+      return clone(withdrawal);
+    }
+    if (!["APPROVED", "PROCESSING"].includes(withdrawal.status)) {
+      throw new Error("Withdrawal is not ready for Paystack failure.");
+    }
+    this.assertPaystackEventMatchesWithdrawal(withdrawal, eventData);
+    this.releaseWithdrawalReservation(withdrawal, { id: "paystack", role: "system" }, "FAILED", "Paystack transfer failed.");
+    withdrawal.status = "FAILED";
+    withdrawal.failureReason = String(eventData.reason || eventData.gateway_response || "Paystack transfer failed.").slice(0, 180);
+    withdrawal.balanceReserved = false;
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal failed",
+      message: "We could not complete your withdrawal. The amount has been returned to your available balance.",
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_FAILED", "Withdrawal", withdrawal.id, {
+      reference: withdrawal.paystackReference,
+      amountKobo: withdrawal.amountKobo,
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  applyPaystackTransferReversed(reference, eventData = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawalByPaystackReference(reference);
+    if (withdrawal.status === "REVERSED") {
+      return clone(withdrawal);
+    }
+    this.assertPaystackEventMatchesWithdrawal(withdrawal, eventData);
+    if (withdrawal.balanceReserved !== false) {
+      this.releaseWithdrawalReservation(withdrawal, { id: "paystack", role: "system" }, "REVERSED", "Paystack transfer reversed.");
+    } else if (withdrawal.status === "SUCCESS") {
+      this.creditWithdrawalReversal(withdrawal, { id: "paystack", role: "system" }, "Paystack transfer reversed.");
+    }
+    withdrawal.status = "REVERSED";
+    withdrawal.failureReason = String(eventData.reason || eventData.gateway_response || "Paystack transfer reversed.").slice(0, 180);
+    withdrawal.balanceReserved = false;
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal reversed",
+      message: "Your withdrawal was reversed. The amount has been returned to your available balance.",
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_REVERSED", "Withdrawal", withdrawal.id, {
+      reference: withdrawal.paystackReference,
+      amountKobo: withdrawal.amountKobo,
+    }, requestMeta);
     this.persist();
     return clone(withdrawal);
   }
@@ -1392,6 +1824,61 @@ class FinancialService {
       throw new Error("Withdrawal request not found.");
     }
     return withdrawal;
+  }
+
+  getWithdrawalByPaystackReference(reference) {
+    const normalized = String(reference || "").trim();
+    const withdrawal = this.db.withdrawals.find((item) => item.paystackReference === normalized);
+    if (!withdrawal) {
+      throw new Error("Withdrawal request not found for Paystack reference.");
+    }
+    return withdrawal;
+  }
+
+  assertPaystackEventMatchesWithdrawal(withdrawal, eventData = {}) {
+    const eventAmount = Number(eventData.amount || 0);
+    if (eventAmount && eventAmount !== Number(withdrawal.amountKobo || 0)) {
+      throw new Error("Paystack webhook amount does not match withdrawal.");
+    }
+    const eventReference = String(eventData.reference || "").trim();
+    if (eventReference && eventReference !== withdrawal.paystackReference) {
+      throw new Error("Paystack webhook reference does not match withdrawal.");
+    }
+    const recipientCode = String(eventData.recipient?.recipient_code || eventData.recipient || "").trim();
+    if (recipientCode && withdrawal.paystackRecipientCode && recipientCode !== withdrawal.paystackRecipientCode) {
+      throw new Error("Paystack webhook recipient does not match withdrawal.");
+    }
+  }
+
+  recordPaystackWebhookEvent({ eventType, reference, payloadHash } = {}) {
+    this.ensureState();
+    const normalizedHash = String(payloadHash || "").trim();
+    const existing = this.db.webhookEvents.find((item) => item.provider === "paystack" && item.payloadHash === normalizedHash);
+    if (existing) {
+      return { duplicate: !!existing.processed, event: clone(existing) };
+    }
+    const event = {
+      id: this.idGenerator(12),
+      provider: "paystack",
+      eventType: String(eventType || "").trim(),
+      reference: String(reference || "").trim(),
+      payloadHash: normalizedHash,
+      processed: false,
+      createdAt: this.clock(),
+      processedAt: null,
+    };
+    this.db.webhookEvents.unshift(event);
+    this.persist();
+    return { duplicate: false, event };
+  }
+
+  markPaystackWebhookEventProcessed(eventId) {
+    const event = this.db.webhookEvents.find((item) => item.id === eventId);
+    if (event) {
+      event.processed = true;
+      event.processedAt = this.clock();
+      this.persist();
+    }
   }
 
   getWithdrawalFundingSources(withdrawal) {
