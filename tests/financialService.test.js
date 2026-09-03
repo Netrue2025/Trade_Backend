@@ -398,6 +398,22 @@ test("admin can set a user balance", () => {
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
 });
 
+test("legacy wallet balance fields are available for one click trade join", () => {
+  const { service, user } = createHarness();
+  const usdtWallet = service.ensureWallet(user.id, "USDT");
+  const ngnWallet = service.ensureWallet(user.id, "NGN");
+  delete usdtWallet.availableBalance;
+  usdtWallet.balance = "125";
+  delete ngnWallet.availableBalance;
+  ngnWallet.amount = "32000";
+  delete ngnWallet.lockedBalance;
+  ngnWallet.locked = "0";
+
+  assert.equal(service.getAvailableUsdtEquivalent(user.id), "145");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "125");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "32000");
+});
+
 test("USDT withdrawal can reserve NGN equivalent when USDT wallet is short", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "USDT", "5");

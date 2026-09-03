@@ -2580,6 +2580,28 @@ function getReservedInvestmentUsdt(investment, rate) {
   );
 }
 
+function getFreeTradeJoinBalanceUsdt(userId) {
+  const rate = db.systemSettings.exchangeRate.usdtToNgn;
+  const usdtWallet = financialService.ensureWallet(userId, "USDT");
+  const ngnWallet = financialService.ensureWallet(userId, "NGN");
+  const walletAvailableUsdt = add(
+    usdtWallet.availableBalance,
+    financialService.convertAmount(ngnWallet.availableBalance, "NGN", "USDT", rate)
+  );
+  const legacyActiveAmountUsdt = getActiveUserTradeInvestments(userId)
+    .filter((item) => !getInvestmentFundingSources(item).length)
+    .reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
+  const freeUsdt = subtract(walletAvailableUsdt, legacyActiveAmountUsdt);
+  return compare(freeUsdt, "0") > 0 ? freeUsdt : "0";
+}
+
+function resolveTradeInvestmentAmount(userId, body = {}) {
+  const freeUsdt = getFreeTradeJoinBalanceUsdt(userId);
+  const rawAmount = String(body.amountUsdt ?? body.amount ?? "").replace(/,/g, "").trim();
+  const amountUsdt = rawAmount || freeUsdt;
+  return { amountUsdt, freeUsdt };
+}
+
 function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user.id) {
   const fundingSources = financialService.resolveWithdrawalFunding(user.id, "USDT", amountUsdt);
 
@@ -5056,12 +5078,7 @@ async function handleApi(req, res, url) {
       }
 
       const body = await readBody(req);
-      const availableUsdt = financialService.getAvailableUsdtEquivalent(targetUser.id);
-      const legacyActiveAmountUsdt = getActiveUserTradeInvestments(targetUser.id)
-        .filter((item) => !getInvestmentFundingSources(item).length)
-        .reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
-      const freeUsdt = subtract(availableUsdt, legacyActiveAmountUsdt);
-      const amountUsdt = String(body.amountUsdt || body.amount || freeUsdt || "").replace(/,/g, "").trim();
+      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id, body);
       if (compare(amountUsdt, "0") <= 0) {
         sendJson(res, 400, { error: "Enter an investment amount." });
         return true;
@@ -5281,12 +5298,7 @@ async function handleApi(req, res, url) {
       }
 
       const body = await readBody(req);
-      const availableUsdt = financialService.getAvailableUsdtEquivalent(user.id);
-      const legacyActiveAmountUsdt = getActiveUserTradeInvestments(user.id)
-        .filter((item) => !getInvestmentFundingSources(item).length)
-        .reduce((sum, item) => add(sum, item.amountUsdt || "0"), "0");
-      const freeUsdt = subtract(availableUsdt, legacyActiveAmountUsdt);
-      const amountUsdt = String(body.amountUsdt || body.amount || freeUsdt || "").replace(/,/g, "").trim();
+      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id, body);
       if (compare(amountUsdt, "0") <= 0) {
         sendJson(res, 400, { error: "Enter an investment amount." });
         return true;

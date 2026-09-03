@@ -232,6 +232,11 @@ class FinancialService {
         updatedAt: this.clock(),
       };
       this.db.wallets.push(wallet);
+    } else {
+      const availableFallback = wallet.availableBalance ?? wallet.balance ?? wallet.amount ?? "0";
+      const lockedFallback = wallet.lockedBalance ?? wallet.locked ?? "0";
+      wallet.availableBalance = normalizeNonNegativeAmount(availableFallback, "Available balance");
+      wallet.lockedBalance = normalizeNonNegativeAmount(lockedFallback, "Locked balance");
     }
     return wallet;
   }
