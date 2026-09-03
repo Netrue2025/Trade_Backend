@@ -13,6 +13,7 @@ const frontendDir = fs.existsSync(path.join(workspaceRootDir, "frontend", "publi
   ? path.join(workspaceRootDir, "frontend", "public")
   : path.join(rootDir, "public");
 const DEFAULT_FRONTEND_ORIGIN = "https://trade-frontend-rg2z.onrender.com";
+const DEFAULT_BACKEND_ORIGIN = "https://trade-backend-0bdr.onrender.com";
 const RENDER_FRONTEND_ORIGIN_PATTERN = /^https:\/\/trade-frontend-[a-z0-9-]+\.onrender\.com$/i;
 
 function loadEnvFile() {
@@ -674,6 +675,15 @@ function sendText(res, statusCode, payload, contentType = "text/plain; charset=u
   res.end(payload);
 }
 
+function sendRedirect(res, location, statusCode = 302) {
+  res.writeHead(statusCode, {
+    ...buildSecurityHeaders(),
+    Location: location,
+    "Cache-Control": "no-store",
+  });
+  res.end();
+}
+
 function buildSecurityHeaders() {
   return {
     "X-Content-Type-Options": "nosniff",
@@ -805,6 +815,10 @@ function getFrontendUrl() {
   return normalizeOrigin(getEnvValue("FRONTEND_URL", "FRONTEND_ORIGIN") || DEFAULT_FRONTEND_ORIGIN);
 }
 
+function getBackendUrl() {
+  return normalizeOrigin(getEnvValue("BACKEND_URL", "RENDER_EXTERNAL_URL") || DEFAULT_BACKEND_ORIGIN);
+}
+
 function getTelegramAdminChatId() {
   return String(getEnvValue("TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID") || "").trim();
 }
@@ -818,7 +832,7 @@ function getWithdrawalUser(withdrawal) {
 }
 
 function buildWithdrawalAdminUrl(withdrawal) {
-  return `${getFrontendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
+  return `${getBackendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
 }
 
 async function sendWithdrawalTelegramMessage(withdrawal, title, extraLines = []) {
@@ -919,10 +933,86 @@ async function ensurePaystackRecipientForWithdrawal(withdrawal) {
 async function verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta) {
   const verification = await paystackService.verifyTransfer(withdrawal.paystackReference);
   const data = verification.data || {};
+  const settled = applyPaystackTransferStatus(withdrawal.paystackReference, data, requestMeta);
+  if (settled) {
+    return settled;
+  }
   if (data.transfer_code || data.status) {
     return financialService.markPaystackTransferProcessing(admin, withdrawal.id, verification, requestMeta);
   }
   throw new Error("Paystack transfer status is unclear. Please verify from Paystack dashboard before retrying.");
+}
+
+function normalizePaystackTransferStatus(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s_-]+/g, ".");
+}
+
+function isPaystackSuccessfulStatus(value) {
+  return ["success", "successful", "completed", "complete"].includes(normalizePaystackTransferStatus(value));
+}
+
+function isPaystackFailedStatus(value) {
+  return ["failed", "failure", "declined"].includes(normalizePaystackTransferStatus(value));
+}
+
+function isPaystackReversedStatus(value) {
+  return ["reversed", "reverse"].includes(normalizePaystackTransferStatus(value));
+}
+
+function applyPaystackTransferStatus(reference, data, requestMeta = {}) {
+  const status = data.status || data.transfer_status || "";
+  if (isPaystackSuccessfulStatus(status)) {
+    return financialService.applyPaystackTransferSuccess(reference, data, requestMeta);
+  }
+  if (isPaystackFailedStatus(status)) {
+    return financialService.applyPaystackTransferFailed(reference, data, requestMeta);
+  }
+  if (isPaystackReversedStatus(status)) {
+    return financialService.applyPaystackTransferReversed(reference, data, requestMeta);
+  }
+  return null;
+}
+
+async function syncProcessingPaystackWithdrawals(requestMeta = {}) {
+  const systemActor = { id: "paystack-sync", role: "system" };
+  const candidates = (db.withdrawals || []).filter((withdrawal) =>
+    withdrawal.currency === "NGN" &&
+    withdrawal.paystackReference &&
+    ["APPROVED", "PROCESSING"].includes(withdrawal.status)
+  );
+
+  for (const withdrawal of candidates) {
+    const lastCheckedAt = Date.parse(withdrawal.metadata?.paystackLastCheckedAt || "");
+    if (Number.isFinite(lastCheckedAt) && Date.now() - lastCheckedAt < 30_000) {
+      continue;
+    }
+
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      paystackLastCheckedAt: nowIso(),
+    };
+
+    try {
+      const verification = await paystackService.verifyTransfer(withdrawal.paystackReference);
+      const data = verification.data || {};
+      const updated = applyPaystackTransferStatus(withdrawal.paystackReference, data, requestMeta);
+      if (updated?.status === "SUCCESS") {
+        await editWithdrawalTelegramMessage(updated, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+      } else if (updated?.status === "FAILED") {
+        await editWithdrawalTelegramMessage(updated, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
+      } else if (updated?.status === "REVERSED") {
+        await editWithdrawalTelegramMessage(updated, "WITHDRAWAL REVERSED", ["Funds returned to wallet."]);
+      } else if (data.transfer_code || data.status) {
+        financialService.markPaystackTransferProcessing(systemActor, withdrawal.id, verification, requestMeta);
+      }
+    } catch (error) {
+      withdrawal.metadata = {
+        ...(withdrawal.metadata || {}),
+        paystackLastSyncError: String(error.message || error).slice(0, 180),
+      };
+      persist();
+    }
+  }
 }
 
 async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
@@ -944,8 +1034,13 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
       reference: withdrawal.paystackReference,
       reason: `Withdrawal ${withdrawal.paystackReference}`,
     });
-    withdrawal = financialService.markPaystackTransferProcessing(admin, withdrawal.id, transfer, requestMeta);
-    await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+    withdrawal = applyPaystackTransferStatus(withdrawal.paystackReference, transfer.data || transfer, requestMeta)
+      || financialService.markPaystackTransferProcessing(admin, withdrawal.id, transfer, requestMeta);
+    if (withdrawal.status === "SUCCESS") {
+      await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+    } else {
+      await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+    }
     return withdrawal;
   } catch (error) {
     if (error.code === "PAYSTACK_TIMEOUT") {
@@ -1521,6 +1616,8 @@ async function getAccountSnapshot(account, exchange) {
     exchangeInfo
   );
   const pnl = calculatePortfolioPnl(balances);
+  const exactTotalUsdt = Number(accountInfo.totalEquity || accountInfo.totalWalletBalance || 0);
+  const totalUsdt = Number.isFinite(exactTotalUsdt) && exactTotalUsdt > 0 ? exactTotalUsdt : pnl.totalUsdt;
   const previousSnapshotDay = previousSnapshot?.updatedAt || previousSnapshot?.cachedAt
     ? getPerformanceDateKey(previousSnapshot.updatedAt || previousSnapshot.cachedAt)
     : "";
@@ -1535,7 +1632,7 @@ async function getAccountSnapshot(account, exchange) {
   const netExternalFlowUsdt = [...assetExternalFlows.values()].reduce((sum, value) => sum + Number(value || 0), 0);
   const performance = updateAccountPerformance(
     account,
-    pnl.totalUsdt,
+    totalUsdt,
     netExternalFlowUsdt,
     balances,
     assetExternalFlows,
@@ -1544,10 +1641,14 @@ async function getAccountSnapshot(account, exchange) {
   const snapshot = {
     exchange,
     balances,
-    totalUsdt: pnl.totalUsdt,
+    totalUsdt,
     previousTotalUsdt: pnl.previousTotalUsdt,
-    totalNgn: Number(usdtNgnRate || 0) > 0 ? pnl.totalUsdt * Number(usdtNgnRate) : 0,
+    totalNgn: Number(usdtNgnRate || 0) > 0 ? totalUsdt * Number(usdtNgnRate) : 0,
     usdtNgnRate: Number(usdtNgnRate || 0),
+    accountTotalEquity: String(accountInfo.totalEquity || ""),
+    accountTotalWalletBalance: String(accountInfo.totalWalletBalance || ""),
+    accountTotalAvailableBalance: String(accountInfo.totalAvailableBalance || ""),
+    accountTotalPerpUPL: String(accountInfo.totalPerpUPL || ""),
     estimatedPnlValue: pnl.estimatedPnlValue,
     estimatedPnlPercent: pnl.estimatedPnlPercent,
     todayPnlValue: performance.todayPnlValue,
@@ -4002,6 +4103,13 @@ function clearSessionCookie(req, res) {
 }
 
 async function handleApi(req, res, url) {
+  const withdrawalAdminPageMatch = url.pathname.match(/^\/admin\/withdrawals\/([^/]+)\/?$/);
+  if (req.method === "GET" && withdrawalAdminPageMatch) {
+    const withdrawalId = encodeURIComponent(decodeURIComponent(withdrawalAdminPageMatch[1] || ""));
+    sendRedirect(res, `${getFrontendUrl()}/admin/withdrawals/${withdrawalId}`);
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/webhooks/paystack") {
     try {
       const rawBody = await readRawBody(req);
@@ -4022,7 +4130,19 @@ async function handleApi(req, res, url) {
       }
 
       let withdrawal = null;
-      if (eventType === "transfer.success") {
+      const statusSettled = eventType.startsWith("transfer.")
+        ? applyPaystackTransferStatus(reference, data, getRequestMeta(req))
+        : null;
+      if (statusSettled?.status === "SUCCESS") {
+        withdrawal = statusSettled;
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+      } else if (statusSettled?.status === "FAILED") {
+        withdrawal = statusSettled;
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
+      } else if (statusSettled?.status === "REVERSED") {
+        withdrawal = statusSettled;
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL REVERSED", ["Funds returned to wallet."]);
+      } else if (eventType === "transfer.success") {
         withdrawal = financialService.applyPaystackTransferSuccess(reference, data, getRequestMeta(req));
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
       } else if (eventType === "transfer.failed") {
@@ -4422,6 +4542,7 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    await syncProcessingPaystackWithdrawals(getRequestMeta(req));
     const dashboard = financialService.getAdminDashboard();
     const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(admin));
     const account = getExchangeAccount(admin, exchange);
@@ -4497,6 +4618,7 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    await syncProcessingPaystackWithdrawals(getRequestMeta(req));
     sendJson(res, 200, { withdrawals: financialService.listWithdrawals(admin, { status: url.searchParams.get("status") }) });
     return true;
   }
@@ -4508,6 +4630,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      await syncProcessingPaystackWithdrawals(getRequestMeta(req));
       const withdrawal = financialService.listWithdrawals(admin).find((item) => item.id === decodeURIComponent(adminWithdrawalDetailMatch[1]));
       if (!withdrawal) {
         sendJson(res, 404, { error: "Withdrawal request not found." });
@@ -4554,8 +4677,13 @@ async function handleApi(req, res, url) {
         transferCode: withdrawal.paystackTransferCode,
         otp: body.otp,
       });
-      const processing = financialService.markPaystackTransferProcessing(admin, withdrawalId, result, getRequestMeta(req));
-      sendJson(res, 200, { withdrawal: processing });
+      const settled = applyPaystackTransferStatus(withdrawal.paystackReference, result.data || result, getRequestMeta(req));
+      const nextWithdrawal = settled
+        || financialService.markPaystackTransferProcessing(admin, withdrawalId, result, getRequestMeta(req));
+      if (nextWithdrawal.status === "SUCCESS") {
+        await editWithdrawalTelegramMessage(nextWithdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+      }
+      sendJson(res, 200, { withdrawal: nextWithdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
