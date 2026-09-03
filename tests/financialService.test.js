@@ -223,6 +223,28 @@ test("NGN withdrawal accepts account aliases and formatted account number", () =
   assert.equal(withdrawal.balanceReserved, true);
 });
 
+test("NGN withdrawal accepts a verified one-time bank account", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "25000");
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "12000",
+    currency: "NGN",
+    bankAccount: {
+      bankName: "One Time Bank",
+      bankCode: "011",
+      accountNumber: "1234567890",
+      accountName: "ADA USER",
+      verified: true,
+    },
+  });
+
+  assert.equal(withdrawal.destination.bankName, "One Time Bank");
+  assert.equal(withdrawal.destination.accountNumber, "1234567890");
+  assert.equal(user.bankAccount, undefined);
+  assert.deepEqual(user.bankAccounts, []);
+});
+
 test("daily performance compounds from current eligible balance and does not double apply", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

@@ -1073,7 +1073,12 @@ class FinancialService {
     let destination = null;
     let bank = null;
     if (currency === "NGN") {
-      bank = this.getVerifiedBankAccount(user, input.bankAccountId);
+      const transientBankAccount = input.bankAccount && typeof input.bankAccount === "object"
+        ? input.bankAccount
+        : null;
+      bank = transientBankAccount
+        ? this.normalizeBankAccount({ ...transientBankAccount, verified: true })
+        : this.getVerifiedBankAccount(user, input.bankAccountId);
       destination = {
         type: "NGN_BANK",
         bankName: bank.bankName,

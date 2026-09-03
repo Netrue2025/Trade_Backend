@@ -2984,6 +2984,85 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
   };
 }
 
+function getWithdrawalBlockingTradeInvestments(userId) {
+  return getActiveUserTradeInvestments(userId).filter((investment) => {
+    const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    return !!trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
+  });
+}
+
+async function settleStaleTradeInvestmentsForWithdrawal(user) {
+  const activeInvestments = getActiveUserTradeInvestments(user.id);
+  const marketCache = new Map();
+  const settled = [];
+  let changed = false;
+
+  for (const investment of activeInvestments) {
+    const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+      continue;
+    }
+
+    const pnlPercent = trade
+      ? await getTradePnlPercentSnapshot(trade, marketCache).catch(() => Number(investment.baselinePnlPercent || 0))
+      : Number(investment.baselinePnlPercent || 0);
+    const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
+    const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
+    let settlement;
+    let releaseError = "";
+    try {
+      settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
+    } catch (error) {
+      releaseError = error.message || String(error);
+      settlement = {
+        releasedPrincipalUsdt: "0",
+        netSettlementUsdt: "0",
+        releasedSources: [],
+      };
+    }
+    investment.status = "STOPPED";
+    investment.stoppedAt = nowIso();
+    investment.settledPnlUsdt = settledPnlUsdt;
+    investment.netSettlementUsdt = settlement.netSettlementUsdt;
+    investment.stopReason = trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND";
+    changed = true;
+
+    db.transactions.unshift({
+      id: randomId(12),
+      userId: user.id,
+      type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
+      currency: "USDT",
+      amount: settledPnlUsdt,
+      balanceBefore: "",
+      balanceAfter: "",
+      reference: investment.id,
+      status: "APPROVED",
+      description: "Inactive trade investment settled.",
+      createdBy: "system",
+      createdAt: nowIso(),
+      metadata: {
+        tradeId: investment.tradeId,
+        pnlPercent: toMoneyDecimal(pnlDeltaPercent),
+        lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING",
+        releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
+        netSettlementUsdt: settlement.netSettlementUsdt,
+        releasedSources: settlement.releasedSources,
+        releaseError,
+      },
+    });
+    settled.push(investment);
+  }
+
+  if (changed) {
+    persist();
+  }
+
+  return {
+    blocking: getWithdrawalBlockingTradeInvestments(user.id),
+    settled,
+  };
+}
+
 function normalizeOrderInput(body) {
   const symbol = String(body.symbol || "").trim().toUpperCase();
   const side = String(body.side || "").trim().toUpperCase();
@@ -4161,22 +4240,24 @@ async function handleApi(req, res, url) {
       const resolved = await paystackService.resolveAccount(body);
       const banks = await paystackService.getBanks().catch(() => []);
       const bank = banks.find((item) => item.code === resolved.bankCode);
-      const bankAccount = financialService.updateVerifiedBankAccount(
-        user,
-        {
-          bankName: body.bankName || bank?.name || resolved.bankCode,
-          bankCode: resolved.bankCode,
-          accountNumber: resolved.accountNumber,
-          accountName: resolved.accountName,
-        },
-        getRequestMeta(req)
-      );
+      const bankInput = {
+        bankName: body.bankName || bank?.name || resolved.bankCode,
+        bankCode: resolved.bankCode,
+        accountNumber: resolved.accountNumber,
+        accountName: resolved.accountName,
+        verified: true,
+      };
+      const shouldSave = body.saveBankAccount !== false;
+      const bankAccount = shouldSave
+        ? financialService.updateVerifiedBankAccount(user, bankInput, getRequestMeta(req))
+        : financialService.normalizeBankAccount(bankInput);
       sendJson(res, 200, {
         success: true,
         accountNumber: resolved.accountNumber,
         accountName: resolved.accountName,
         bankCode: resolved.bankCode,
         bankAccount,
+        saved: shouldSave,
       });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -4236,7 +4317,31 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const withdrawal = financialService.createWithdrawal(user, await readBody(req), getRequestMeta(req));
+      const body = await readBody(req);
+      const investmentStatus = await settleStaleTradeInvestmentsForWithdrawal(user);
+      if (investmentStatus.blocking.length) {
+        throw new Error("Stop active trades before requesting a withdrawal.");
+      }
+      const currency = String(body.currency || "USDT").trim().toUpperCase();
+      if (currency === "NGN" && !body.bankAccountId && !body.bankAccount && body.bankCode && body.accountNumber) {
+        const resolved = await paystackService.resolveAccount(body);
+        const banks = await paystackService.getBanks().catch(() => []);
+        const bank = banks.find((item) => item.code === resolved.bankCode);
+        const bankInput = {
+          bankName: body.bankName || bank?.name || resolved.bankCode,
+          bankCode: resolved.bankCode,
+          accountNumber: resolved.accountNumber,
+          accountName: resolved.accountName,
+          verified: true,
+        };
+        if (body.saveBankAccount !== false) {
+          const savedBank = financialService.updateVerifiedBankAccount(user, bankInput, getRequestMeta(req));
+          body.bankAccountId = savedBank.id;
+        } else {
+          body.bankAccount = bankInput;
+        }
+      }
+      const withdrawal = financialService.createWithdrawal(user, body, getRequestMeta(req));
       if (withdrawal.currency === "NGN") {
         const sent = await sendWithdrawalTelegramMessage(withdrawal, "NEW WITHDRAWAL REQUEST", [
           "Status: Pending Admin Approval",
@@ -4317,7 +4422,24 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
-    sendJson(res, 200, financialService.getAdminDashboard());
+    const dashboard = financialService.getAdminDashboard();
+    const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(admin));
+    const account = getExchangeAccount(admin, exchange);
+    if (account) {
+      const cachedSnapshot = getCachedAccountSnapshot(account, exchange);
+      const forceRefresh = String(url.searchParams.get("refresh") || "").trim() === "1";
+      dashboard.accountSnapshot = cachedSnapshot || null;
+      if (forceRefresh || !cachedSnapshot || !isCachedAccountSnapshotFresh(cachedSnapshot, 15_000)) {
+        dashboard.accountSnapshot = await getAccountSnapshot(account, exchange)
+          .then((snapshot) => {
+            account.lastValidatedAt = nowIso();
+            persist();
+            return snapshot;
+          })
+          .catch(() => cachedSnapshot ? { ...cachedSnapshot, stale: true } : null);
+      }
+    }
+    sendJson(res, 200, dashboard);
     return true;
   }
 
