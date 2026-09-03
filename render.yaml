@@ -23,11 +23,11 @@ services:
       - key: MONGODB_COLLECTION
         value: app_state
       - key: FRONTEND_ORIGIN
-        sync: false
+        value: https://trade-frontend-rg2z.onrender.com
       - key: FRONTEND_URL
-        sync: false
+        value: https://trade-frontend-rg2z.onrender.com
       - key: BACKEND_URL
-        sync: false
+        value: https://trade-backend-0bdr.onrender.com
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_PUBLIC_KEY
