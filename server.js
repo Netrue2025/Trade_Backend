@@ -2207,6 +2207,7 @@ function sanitizeExecution(order, error) {
 const ACTIVE_ORDER_STATUSES = new Set(["NEW", "PARTIALLY_FILLED", "PENDING_NEW"]);
 const FILLED_OR_PARTIAL_ORDER_STATUSES = new Set(["FILLED", "PARTIALLY_FILLED"]);
 const KNOWN_QUOTE_ASSETS = ["USDT", "USDC", "FDUSD", "BUSD", "BTC", "ETH", "EUR", "BRL", "TRY"];
+const STABLE_QUOTE_ASSETS = new Set(["USDT", "USDC", "FDUSD", "BUSD"]);
 const TRADE_RECONCILE_COOLDOWN_MS = 5000;
 const TRADE_RECONCILE_WAIT_MS = 1200;
 
@@ -3479,6 +3480,21 @@ function countDecimals(value) {
   return text.split(".")[1].replace(/0+$/, "").length;
 }
 
+function getPrecisionDigits(value, fallback = 8) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return fallback;
+  }
+  if (text.includes(".")) {
+    return countDecimals(text);
+  }
+  const numeric = Number(text);
+  if (Number.isInteger(numeric) && numeric >= 0 && numeric <= 12) {
+    return numeric;
+  }
+  return fallback;
+}
+
 function formatStepNumber(value, stepSize) {
   const decimals = countDecimals(stepSize);
   if (!Number.isFinite(value)) {
@@ -3501,6 +3517,79 @@ function normalizeQuantityToStep(quantity, stepSize) {
   const qtyUnits = Math.floor((qty + Number.EPSILON) * scale);
   const normalizedUnits = Math.floor(qtyUnits / stepUnits) * stepUnits;
   return formatStepNumber(normalizedUnits / scale, stepSize);
+}
+
+function floorToDecimalPlaces(value, decimals = 8) {
+  const numeric = Number(value || 0);
+  const digits = Math.max(0, Math.min(12, Number(decimals || 0)));
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return "0";
+  }
+  const scale = 10 ** digits;
+  const floored = Math.floor((numeric + Number.EPSILON) * scale) / scale;
+  return floored.toFixed(digits).replace(/\.?0+$/, "") || "0";
+}
+
+function getMarketQuoteAmountDecimals(exchange, details, quoteAsset) {
+  const normalizedQuote = String(quoteAsset || details?.quoteAsset || "USDT").toUpperCase();
+  if (STABLE_QUOTE_ASSETS.has(normalizedQuote)) {
+    return 2;
+  }
+  return getPrecisionDigits(details?.quotePrecision, exchange === "binance" ? 8 : 6);
+}
+
+function getNotionalBounds(exchangeInfo, symbol) {
+  const { filters } = getSymbolFilters(exchangeInfo, symbol);
+  const notionalFilter = getFilter(filters, "NOTIONAL") || getFilter(filters, "MIN_NOTIONAL");
+  return {
+    minNotional: Number(notionalFilter?.minNotional || 0),
+    maxNotional: Number(notionalFilter?.maxNotional || 0),
+  };
+}
+
+function normalizeMarketQuoteSpend(spendAmount, spendableBalance, exchangeInfo, symbol, exchange) {
+  const { details } = getSymbolFilters(exchangeInfo, symbol);
+  const quoteAsset = getQuoteAssetForSymbol(exchangeInfo, symbol);
+  const decimals = getMarketQuoteAmountDecimals(exchange, details, quoteAsset);
+  const requested = Number(spendAmount || 0);
+  const available = Number(spendableBalance || 0);
+  if (!requested || !available) {
+    return "0";
+  }
+
+  const { minNotional, maxNotional } = getNotionalBounds(exchangeInfo, symbol);
+  const unit = 10 ** -decimals;
+  const isFullBalanceSpend = requested >= available || Math.abs(requested - available) <= unit;
+  let target = Math.min(requested, available);
+
+  if (isFullBalanceSpend) {
+    const buffer = STABLE_QUOTE_ASSETS.has(quoteAsset)
+      ? Math.max(unit, Math.min(1, available * 0.001))
+      : Math.max(unit, available * 0.0005);
+    if (!minNotional || target - buffer >= minNotional) {
+      target -= buffer;
+    }
+  }
+
+  if (maxNotional && target > maxNotional) {
+    target = maxNotional;
+  }
+
+  const normalized = floorToDecimalPlaces(target, decimals);
+  if (minNotional && Number(normalized) < minNotional) {
+    return floorToDecimalPlaces(target, decimals);
+  }
+  return normalized;
+}
+
+function getSpendableQuoteBalanceFromAccountInfo(accountInfo, quoteAsset) {
+  const normalizedQuote = String(quoteAsset || "USDT").toUpperCase();
+  const quoteBalance = Number(
+    (accountInfo.balances || []).find((item) => String(item.asset || "").toUpperCase() === normalizedQuote)?.free || 0
+  );
+  const accountAvailableBalance = normalizedQuote === "USDT" ? Number(accountInfo.totalAvailableBalance || 0) : 0;
+  const availableCandidates = [quoteBalance, accountAvailableBalance].filter((value) => Number(value) > 0);
+  return availableCandidates.length ? Math.min(...availableCandidates) : 0;
 }
 
 function normalizePriceToTick(price, tickSize) {
@@ -3637,6 +3726,65 @@ async function validateNotionalRule(account, orderInput, exchangeInfoOverride = 
   }
 }
 
+async function constrainBuyQuantityToAvailableBalance(account, orderInput, exchangeInfoOverride = null) {
+  if (orderInput.side !== "BUY" || !orderInput.quantity || orderInput.quoteOrderQty) {
+    return orderInput;
+  }
+
+  const exchange = getAccountExchange(account);
+  const exchangeLabel = getExchangeLabel(exchange);
+  const exchangeInfo = exchangeInfoOverride || (await getExchangeInfo(orderInput.symbol, account.testnet, exchange));
+  const { filters } = getSymbolFilters(exchangeInfo, orderInput.symbol);
+  const quoteAsset = getQuoteAssetForSymbol(exchangeInfo, orderInput.symbol);
+  const accountInfo = await getAccountInfo(account, exchange);
+  const spendableBalance = getSpendableQuoteBalanceFromAccountInfo(accountInfo, quoteAsset);
+  if (!spendableBalance) {
+    throw new Error(`No free ${quoteAsset} balance is available to buy ${orderInput.symbol}.`);
+  }
+
+  let price = Number(orderInput.price || 0);
+  if (!price) {
+    const ticker = await getTickerPrice(orderInput.symbol, account.testnet, exchange);
+    price = Number(ticker.price || 0);
+  }
+  if (!price) {
+    throw new Error(`Unable to determine a live price for ${orderInput.symbol}.`);
+  }
+
+  const requestedNotional = Number(orderInput.quantity || 0) * price;
+  const { details } = getSymbolFilters(exchangeInfo, orderInput.symbol);
+  const quoteDecimals = getMarketQuoteAmountDecimals(exchange, details, quoteAsset);
+  const quoteUnit = 10 ** -quoteDecimals;
+  const isNearFullBalanceSpend =
+    requestedNotional >= spendableBalance || Math.abs(spendableBalance - requestedNotional) <= quoteUnit;
+  if (requestedNotional <= spendableBalance && !isNearFullBalanceSpend) {
+    return orderInput;
+  }
+
+  const safeSpend = normalizeMarketQuoteSpend(
+    Math.min(requestedNotional || spendableBalance, spendableBalance),
+    spendableBalance,
+    exchangeInfo,
+    orderInput.symbol,
+    exchange
+  );
+  const quantityFilter = getEffectiveQuantityFilter(filters, orderInput.type);
+  const adjustedQuantity = quantityFilter?.stepSize
+    ? normalizeQuantityToStep(Number(safeSpend) / price, quantityFilter.stepSize)
+    : toMoneyDecimal(Number(safeSpend) / price);
+
+  if (!Number(adjustedQuantity)) {
+    throw new Error(
+      `Your free ${quoteAsset} balance is ${spendableBalance}, but ${exchangeLabel} requires a larger balance for ${orderInput.symbol}.`
+    );
+  }
+
+  return {
+    ...orderInput,
+    quantity: adjustedQuantity,
+  };
+}
+
 async function getMaxSellQuantityForAccount(
   account,
   symbol,
@@ -3735,15 +3883,11 @@ async function resolveBuyOrderInputForExchange(account, orderInput, exchangeInfo
   }
 
   const exchange = getAccountExchange(account);
+  const exchangeLabel = getExchangeLabel(exchange);
   const exchangeInfo = exchangeInfoOverride || (await getExchangeInfo(orderInput.symbol, account.testnet, exchange));
   const quoteAsset = getQuoteAssetForSymbol(exchangeInfo, orderInput.symbol);
   const accountInfo = await getAccountInfo(account, exchange);
-  const quoteBalance = Number(
-    (accountInfo.balances || []).find((item) => String(item.asset || "").toUpperCase() === quoteAsset)?.free || 0
-  );
-  const accountAvailableBalance = quoteAsset === "USDT" ? Number(accountInfo.totalAvailableBalance || 0) : 0;
-  const availableCandidates = [quoteBalance, accountAvailableBalance].filter((value) => Number(value) > 0);
-  const spendableBalance = availableCandidates.length ? Math.min(...availableCandidates) : 0;
+  const spendableBalance = getSpendableQuoteBalanceFromAccountInfo(accountInfo, quoteAsset);
 
   if (!spendableBalance) {
     throw new Error(`No free ${quoteAsset} balance is available to buy ${orderInput.symbol}.`);
@@ -3755,11 +3899,15 @@ async function resolveBuyOrderInputForExchange(account, orderInput, exchangeInfo
 
   const requestedSpend = Number(orderInput.quoteOrderQty || 0);
   const spendAmount = requestedSpend > 0 ? Math.min(requestedSpend, spendableBalance) : spendableBalance;
+  const normalizedSpend = normalizeMarketQuoteSpend(spendAmount, spendableBalance, exchangeInfo, orderInput.symbol, exchange);
+  if (!Number(normalizedSpend)) {
+    throw new Error(`No spendable ${quoteAsset} balance is available after ${exchangeLabel} precision rules.`);
+  }
 
   return {
     ...orderInput,
     quantity: undefined,
-    quoteOrderQty: toMoneyDecimal(spendAmount),
+    quoteOrderQty: normalizedSpend,
   };
 }
 
@@ -3795,8 +3943,13 @@ async function executeOrderForUser(user, orderInput, purpose, exchange) {
       resolvedOrderInput,
       exchangeInfo
     );
-    await validateNotionalRule({ ...account, exchange: normalizedExchange }, normalizedOrderInput, exchangeInfo);
-    const order = await placeSpotOrder({ ...account, exchange: normalizedExchange }, normalizedOrderInput, normalizedExchange);
+    const balanceSafeOrderInput = await constrainBuyQuantityToAvailableBalance(
+      { ...account, exchange: normalizedExchange },
+      normalizedOrderInput,
+      exchangeInfo
+    );
+    await validateNotionalRule({ ...account, exchange: normalizedExchange }, balanceSafeOrderInput, exchangeInfo);
+    const order = await placeSpotOrder({ ...account, exchange: normalizedExchange }, balanceSafeOrderInput, normalizedExchange);
     account.lastValidatedAt = nowIso();
     persist();
     return {
@@ -3850,8 +4003,8 @@ async function buildMirroredEntryOrderForUser(user, orderInput, exchange) {
     };
   }
 
-  const quoteBalance = Number((accountInfo.balances || []).find((item) => item.asset === quoteAsset)?.free || 0);
-  if (!quoteBalance) {
+  const spendableQuoteBalance = getSpendableQuoteBalanceFromAccountInfo(accountInfo, quoteAsset);
+  if (!spendableQuoteBalance) {
     throw new Error(`No free ${quoteAsset} balance is available for mirrored buy orders.`);
   }
   if (!priceReference) {
@@ -3861,17 +4014,21 @@ async function buildMirroredEntryOrderForUser(user, orderInput, exchange) {
   const requestedSpend = orderInput.quoteOrderQty
     ? Number(orderInput.quoteOrderQty || 0)
     : Number(orderInput.quantity || 0) * priceReference;
-  const spendAmount = requestedSpend > 0 ? Math.min(requestedSpend, quoteBalance) : quoteBalance;
+  const spendAmount = requestedSpend > 0 ? Math.min(requestedSpend, spendableQuoteBalance) : spendableQuoteBalance;
 
   if (!spendAmount) {
     throw new Error(`No spendable ${quoteAsset} balance is available for mirrored buy orders.`);
   }
 
   if (orderInput.type === "MARKET" && orderInput.quoteOrderQty) {
+    const normalizedSpend = normalizeMarketQuoteSpend(spendAmount, spendableQuoteBalance, exchangeInfo, orderInput.symbol, normalizedExchange);
+    if (!Number(normalizedSpend)) {
+      throw new Error(`No spendable ${quoteAsset} balance is available after ${getExchangeLabel(normalizedExchange)} precision rules.`);
+    }
     return {
       ...orderInput,
       quantity: undefined,
-      quoteOrderQty: String(spendAmount),
+      quoteOrderQty: normalizedSpend,
     };
   }
 
@@ -3909,22 +4066,23 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   const sellResolvedOrderInput = await resolveSellOrderInputForExchange({ ...adminAccount, exchange }, orderInput, exchangeInfo);
   const resolvedOrderInput = await resolveBuyOrderInputForExchange({ ...adminAccount, exchange }, sellResolvedOrderInput, exchangeInfo);
   const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, resolvedOrderInput, exchangeInfo);
-  await validateNotionalRule({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
-  const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, normalizedOrderInput, exchange);
+  const balanceSafeOrderInput = await constrainBuyQuantityToAvailableBalance({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
+  await validateNotionalRule({ ...adminAccount, exchange }, balanceSafeOrderInput, exchangeInfo);
+  const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, balanceSafeOrderInput, exchange);
   const trade = {
     id: randomId(12),
     createdAt: nowIso(),
     createdByUserId: admin.id,
     createdByName: admin.name,
     exchange,
-    symbol: normalizedOrderInput.symbol,
-    side: normalizedOrderInput.side,
-    type: normalizedOrderInput.type,
-    quantity: normalizedOrderInput.quantity || null,
-    quoteOrderQty: normalizedOrderInput.quoteOrderQty || null,
-    price: normalizedOrderInput.price || null,
-    timeInForce: normalizedOrderInput.timeInForce || null,
-    takeProfitTargetPrice: options.takeProfitTargetPrice || normalizedOrderInput.takeProfitPrice || null,
+    symbol: balanceSafeOrderInput.symbol,
+    side: balanceSafeOrderInput.side,
+    type: balanceSafeOrderInput.type,
+    quantity: balanceSafeOrderInput.quantity || null,
+    quoteOrderQty: balanceSafeOrderInput.quoteOrderQty || null,
+    price: balanceSafeOrderInput.price || null,
+    timeInForce: balanceSafeOrderInput.timeInForce || null,
+    takeProfitTargetPrice: options.takeProfitTargetPrice || balanceSafeOrderInput.takeProfitPrice || null,
     stopLossTargetPrice: options.stopLossTargetPrice || null,
     adminExecution: sanitizeExecution(adminOrder),
     mirroredExecutions: [],
@@ -3934,7 +4092,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
 
   if (options.autoMirrorUsers === true) {
     for (const follower of getMirroringUsers(exchange)) {
-      const mirroredOrderInput = await buildMirroredEntryOrderForUser(follower, normalizedOrderInput, exchange)
+      const mirroredOrderInput = await buildMirroredEntryOrderForUser(follower, balanceSafeOrderInput, exchange)
         .catch((error) => ({
           __mirrorError: error.message,
         }));
@@ -3984,7 +4142,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   return {
     trade,
     tpOrder,
-    normalizedOrderInput,
+    normalizedOrderInput: balanceSafeOrderInput,
   };
 }
 
