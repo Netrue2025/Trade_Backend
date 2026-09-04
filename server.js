@@ -2605,6 +2605,14 @@ async function reconcileTradeStatuses() {
         });
         if (deriveTradeLifecycle(previousTrade) !== "CLOSED" && deriveTradeLifecycle(trade) === "CLOSED") {
           await recordTradeForLearning(trade);
+          const settledInvestments = await settleClosedTradeInvestments(trade, {
+            reason: "TAKE_PROFIT_OR_CLOSE",
+            description: `${trade.symbol} investment settled after trade close.`,
+            createdBy: "system",
+          });
+          if (settledInvestments.length) {
+            changed = true;
+          }
         }
       }
     } catch (error) {
@@ -2893,11 +2901,9 @@ function getFreeTradeJoinBalanceUsdt(userId) {
   return compare(freeUsdt, "0") > 0 ? freeUsdt : "0";
 }
 
-function resolveTradeInvestmentAmount(userId, body = {}) {
+function resolveTradeInvestmentAmount(userId) {
   const freeUsdt = getFreeTradeJoinBalanceUsdt(userId);
-  const rawAmount = String(body.amountUsdt ?? body.amount ?? "").replace(/,/g, "").trim();
-  const amountUsdt = rawAmount || freeUsdt;
-  return { amountUsdt, freeUsdt };
+  return { amountUsdt: freeUsdt, freeUsdt };
 }
 
 function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user.id) {
@@ -3092,72 +3098,137 @@ function getWithdrawalBlockingTradeInvestments(userId) {
   });
 }
 
-async function settleStaleTradeInvestmentsForWithdrawal(user) {
-  const activeInvestments = getActiveUserTradeInvestments(user.id);
+async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
+  const pnlPercent = trade
+    ? await getTradePnlPercentSnapshot(trade, marketCache).catch(() => Number(investment.baselinePnlPercent || 0))
+    : Number(investment.baselinePnlPercent || 0);
+  const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
+  const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
+  const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
+  let settlement;
+  let releaseError = "";
+
+  try {
+    settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
+  } catch (error) {
+    releaseError = error.message || String(error);
+    settlement = {
+      releasedPrincipalUsdt: "0",
+      netSettlementUsdt: "0",
+      releasedSources: [],
+    };
+  }
+
+  const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
+  investment.status = "STOPPED";
+  investment.stoppedAt = nowIso();
+  investment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
+  investment.settledPnlUsdt = settledPnlUsdt;
+  investment.netSettlementUsdt = settlement.netSettlementUsdt;
+  investment.stopReason = options.reason || (trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND");
+
+  db.transactions.unshift({
+    id: randomId(12),
+    userId: user.id,
+    type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
+    currency: "USDT",
+    amount: settledPnlUsdt,
+    balanceBefore,
+    balanceAfter,
+    reference: investment.id,
+    status: "APPROVED",
+    description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
+    createdBy: options.createdBy || "system",
+    createdAt: nowIso(),
+    metadata: {
+      tradeId: investment.tradeId,
+      pnlPercent: toMoneyDecimal(pnlDeltaPercent),
+      lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING",
+      releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
+      netSettlementUsdt: settlement.netSettlementUsdt,
+      releasedSources: settlement.releasedSources,
+      releaseError,
+    },
+  });
+
+  financialService.createNotification({
+    userId: user.id,
+    type: "TRADE",
+    title: "Trade settled",
+    message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`,
+    entityType: "Trade",
+    entityId: investment.tradeId,
+  });
+
+  return investment;
+}
+
+async function settleInactiveTradeInvestmentsForUsers(options = {}) {
   const marketCache = new Map();
   const settled = [];
-  let changed = false;
+  const activeInvestments = ensureTradeInvestmentsState().filter(
+    (investment) => investment.status === "ACTIVE" && (!options.userId || investment.userId === options.userId)
+  );
 
   for (const investment of activeInvestments) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
     if (trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
       continue;
     }
-
-    const pnlPercent = trade
-      ? await getTradePnlPercentSnapshot(trade, marketCache).catch(() => Number(investment.baselinePnlPercent || 0))
-      : Number(investment.baselinePnlPercent || 0);
-    const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
-    const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
-    let settlement;
-    let releaseError = "";
-    try {
-      settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
-    } catch (error) {
-      releaseError = error.message || String(error);
-      settlement = {
-        releasedPrincipalUsdt: "0",
-        netSettlementUsdt: "0",
-        releasedSources: [],
-      };
+    const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
+    if (!user) {
+      continue;
     }
-    investment.status = "STOPPED";
-    investment.stoppedAt = nowIso();
-    investment.settledPnlUsdt = settledPnlUsdt;
-    investment.netSettlementUsdt = settlement.netSettlementUsdt;
-    investment.stopReason = trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND";
-    changed = true;
-
-    db.transactions.unshift({
-      id: randomId(12),
-      userId: user.id,
-      type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
-      currency: "USDT",
-      amount: settledPnlUsdt,
-      balanceBefore: "",
-      balanceAfter: "",
-      reference: investment.id,
-      status: "APPROVED",
-      description: "Inactive trade investment settled.",
-      createdBy: "system",
-      createdAt: nowIso(),
-      metadata: {
-        tradeId: investment.tradeId,
-        pnlPercent: toMoneyDecimal(pnlDeltaPercent),
-        lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING",
-        releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
-        netSettlementUsdt: settlement.netSettlementUsdt,
-        releasedSources: settlement.releasedSources,
-        releaseError,
-      },
-    });
-    settled.push(investment);
+    settled.push(await settleTradeInvestment(user, investment, trade, marketCache, {
+      reason: options.reason || (trade ? "TRADE_CLOSED" : "TRADE_NOT_FOUND"),
+      description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
+      createdBy: options.createdBy || "system",
+    }));
   }
 
-  if (changed) {
+  if (settled.length) {
     persist();
   }
 
+  return settled;
+}
+
+async function settleClosedTradeInvestments(trade, options = {}) {
+  if (!trade || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+    return [];
+  }
+
+  const marketCache = new Map();
+  const settled = [];
+  const activeInvestments = ensureTradeInvestmentsState().filter(
+    (investment) => investment.status === "ACTIVE" && investment.tradeId === trade.id
+  );
+  for (const investment of activeInvestments) {
+    const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
+    if (!user) {
+      continue;
+    }
+    settled.push(await settleTradeInvestment(user, investment, trade, marketCache, {
+      reason: options.reason || "TRADE_CLOSED",
+      description: options.description || `${trade.symbol} investment settled.`,
+      createdBy: options.createdBy || "system",
+    }));
+  }
+
+  if (settled.length) {
+    persist();
+  }
+
+  return settled;
+}
+
+async function settleStaleTradeInvestmentsForWithdrawal(user) {
+  const settled = await settleInactiveTradeInvestmentsForUsers({
+    userId: user.id,
+    reason: "TRADE_INACTIVE",
+    description: "Inactive trade investment settled.",
+    createdBy: "system",
+  });
   return {
     blocking: getWithdrawalBlockingTradeInvestments(user.id),
     settled,
@@ -4333,6 +4404,12 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
+    await settleInactiveTradeInvestmentsForUsers({
+      userId: user.id,
+      reason: "TRADE_CLOSED",
+      description: "Closed trade investment settled.",
+      createdBy: "system",
+    });
     const dashboard = financialService.getDashboard(user);
     const financeSummary = await buildUserTradeInvestmentSummary(user);
     sendJson(res, 200, {
@@ -5791,10 +5868,9 @@ async function handleApi(req, res, url) {
         return true;
       }
 
-      const body = await readBody(req);
-      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id, body);
+      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id);
       if (compare(amountUsdt, "0") <= 0) {
-        sendJson(res, 400, { error: "Enter an investment amount." });
+        sendJson(res, 400, { error: "No available balance to join this trade." });
         return true;
       }
       if (compare(amountUsdt, freeUsdt) > 0) {
@@ -6005,6 +6081,12 @@ async function handleApi(req, res, url) {
     }
     const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(user));
     await waitForTradeReconciliation();
+    await settleInactiveTradeInvestmentsForUsers({
+      userId: user.role === "user" ? user.id : "",
+      reason: "TRADE_CLOSED",
+      description: "Closed trade investment settled.",
+      createdBy: "system",
+    });
     const trades =
       user.role === "admin"
         ? db.tradeIntents.filter((trade) => getTradeExchange(trade) === exchange).map(serializeTradeForAdmin)
@@ -6044,10 +6126,9 @@ async function handleApi(req, res, url) {
         return true;
       }
 
-      const body = await readBody(req);
-      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id, body);
+      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
       if (compare(amountUsdt, "0") <= 0) {
-        sendJson(res, 400, { error: "Enter an investment amount." });
+        sendJson(res, 400, { error: "No available balance to join this trade." });
         return true;
       }
       if (compare(amountUsdt, freeUsdt) > 0) {
