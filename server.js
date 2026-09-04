@@ -3182,7 +3182,7 @@ function normalizeOrderInput(body) {
   if (!["MARKET", "LIMIT"].includes(type)) {
     throw new Error("Type must be MARKET or LIMIT.");
   }
-  if (type === "MARKET" && !quantity && !quoteOrderQty) {
+  if (type === "MARKET" && side === "SELL" && !quantity && !quoteOrderQty) {
     throw new Error("Provide quantity or quote order size for market orders.");
   }
   if (type === "LIMIT" && (!quantity || !price)) {
@@ -3246,6 +3246,18 @@ function getBaseAssetForSymbol(exchangeInfo, symbol) {
     return details.baseAsset;
   }
   return inferBaseAssetFromSymbol(symbol);
+}
+
+function getQuoteAssetForSymbol(exchangeInfo, symbol) {
+  const details = exchangeInfo.symbols?.find((item) => item.symbol === symbol);
+  if (details?.quoteAsset) {
+    return details.quoteAsset;
+  }
+  const normalizedSymbol = String(symbol || "").trim().toUpperCase();
+  const quoteAsset = KNOWN_QUOTE_ASSETS.find(
+    (item) => normalizedSymbol.endsWith(item) && normalizedSymbol.length > item.length
+  );
+  return quoteAsset || "USDT";
 }
 
 function countDecimals(value) {
@@ -3506,6 +3518,40 @@ async function resolveSellOrderInputForExchange(account, orderInput, exchangeInf
   };
 }
 
+async function resolveBuyOrderInputForExchange(account, orderInput, exchangeInfoOverride = null) {
+  if (orderInput.side !== "BUY" || orderInput.type !== "MARKET") {
+    return orderInput;
+  }
+
+  const exchange = getAccountExchange(account);
+  const exchangeInfo = exchangeInfoOverride || (await getExchangeInfo(orderInput.symbol, account.testnet, exchange));
+  const quoteAsset = getQuoteAssetForSymbol(exchangeInfo, orderInput.symbol);
+  const accountInfo = await getAccountInfo(account, exchange);
+  const quoteBalance = Number(
+    (accountInfo.balances || []).find((item) => String(item.asset || "").toUpperCase() === quoteAsset)?.free || 0
+  );
+  const accountAvailableBalance = quoteAsset === "USDT" ? Number(accountInfo.totalAvailableBalance || 0) : 0;
+  const availableCandidates = [quoteBalance, accountAvailableBalance].filter((value) => Number(value) > 0);
+  const spendableBalance = availableCandidates.length ? Math.min(...availableCandidates) : 0;
+
+  if (!spendableBalance) {
+    throw new Error(`No free ${quoteAsset} balance is available to buy ${orderInput.symbol}.`);
+  }
+
+  if (orderInput.quantity && !orderInput.quoteOrderQty) {
+    return orderInput;
+  }
+
+  const requestedSpend = Number(orderInput.quoteOrderQty || 0);
+  const spendAmount = requestedSpend > 0 ? Math.min(requestedSpend, spendableBalance) : spendableBalance;
+
+  return {
+    ...orderInput,
+    quantity: undefined,
+    quoteOrderQty: toMoneyDecimal(spendAmount),
+  };
+}
+
 async function executeOrderForUser(user, orderInput, purpose, exchange) {
   const normalizedExchange = normalizeExchange(exchange, getPreferredExchange(user));
   const account = getExchangeAccount(user, normalizedExchange);
@@ -3523,9 +3569,14 @@ async function executeOrderForUser(user, orderInput, purpose, exchange) {
 
   try {
     const exchangeInfo = await getExchangeInfo(orderInput.symbol, account.testnet, normalizedExchange);
-    const resolvedOrderInput = await resolveSellOrderInputForExchange(
+    const sellResolvedOrderInput = await resolveSellOrderInputForExchange(
       { ...account, exchange: normalizedExchange },
       orderInput,
+      exchangeInfo
+    );
+    const resolvedOrderInput = await resolveBuyOrderInputForExchange(
+      { ...account, exchange: normalizedExchange },
+      sellResolvedOrderInput,
       exchangeInfo
     );
     const normalizedOrderInput = await normalizeOrderForExchange(
@@ -3644,7 +3695,8 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   }
 
   const exchangeInfo = await getExchangeInfo(orderInput.symbol, adminAccount.testnet, exchange);
-  const resolvedOrderInput = await resolveSellOrderInputForExchange({ ...adminAccount, exchange }, orderInput, exchangeInfo);
+  const sellResolvedOrderInput = await resolveSellOrderInputForExchange({ ...adminAccount, exchange }, orderInput, exchangeInfo);
+  const resolvedOrderInput = await resolveBuyOrderInputForExchange({ ...adminAccount, exchange }, sellResolvedOrderInput, exchangeInfo);
   const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, resolvedOrderInput, exchangeInfo);
   await validateNotionalRule({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
   const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, normalizedOrderInput, exchange);
@@ -5914,9 +5966,6 @@ async function handleApi(req, res, url) {
         : db.tradeIntents
             .filter(
               (trade) => {
-                if (getTradeExchange(trade) !== exchange) {
-                  return false;
-                }
                 if (trade.mirroredExecutions.some((row) => row.userId === user.id)) {
                   return true;
                 }
