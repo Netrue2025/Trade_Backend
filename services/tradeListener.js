@@ -242,6 +242,19 @@ function buildPublicTakeProfitMessage({ exchange, trade, exitOrder, profitPercen
   ].filter(Boolean).join("\n");
 }
 
+function buildPublicTradeClosedMessage({ exchange, trade, exitOrder, profitPercent }) {
+  const execution = exitOrder?.adminExecution || null;
+  return [
+    "TRADE CLOSED",
+    `Exchange: ${getExchangeLabel(exchange)}`,
+    `Pair: ${trade.symbol}`,
+    `Entry: ${formatNumber(getExecutionPrice(trade.adminExecution) || trade.price, 6)}`,
+    `Exit: ${formatNumber(getExecutionPrice(execution) || exitOrder.price, 6)}`,
+    profitPercent === null ? null : `P&L: ${formatSignedPercent(profitPercent)}`,
+    exitOrder?.kind === "MANUAL_SELL" ? "Status: Closed before TP" : null,
+  ].filter(Boolean).join("\n");
+}
+
 function buildTargetMessage(exchange) {
   if (normalizeExchange(exchange) === "bybit") {
     return [
@@ -465,6 +478,14 @@ class TradeListener {
         await this.broadcast(buildShortSwingStopMessage(trade, exitOrder), exchange, { exchange });
       } else {
         await this.broadcast(buildOrderFilledMessage({ exchange, trade, exitOrder, profitPercent }), exchange, { exchange });
+        if (exitOrder.kind === "MANUAL_SELL") {
+          await this.sendChannel(buildPublicTradeClosedMessage({ exchange, trade, exitOrder, profitPercent }), {
+            type: "TRADE_CLOSED",
+            exchange,
+            trade,
+            telegramOptions: this.buildTradeTelegramOptions(trade),
+          });
+        }
       }
       await this.updateDailyProfit(exchange, profitPercent);
       return;
@@ -488,6 +509,14 @@ class TradeListener {
         exchange,
         { exchange }
       );
+      if (exitOrder.kind === "MANUAL_SELL") {
+        await this.sendChannel(buildPublicTradeClosedMessage({ exchange, trade, exitOrder, profitPercent }), {
+          type: "TRADE_CLOSED",
+          exchange,
+          trade,
+          telegramOptions: this.buildTradeTelegramOptions(trade),
+        });
+      }
     }
 
     await this.updateDailyProfit(exchange, profitPercent);

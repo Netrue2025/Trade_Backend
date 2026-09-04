@@ -814,7 +814,14 @@ function isPaymentRateLimited(req, userId, action) {
 }
 
 function getFrontendUrl() {
-  return normalizeOrigin(getEnvValue("FRONTEND_URL", "FRONTEND_ORIGIN") || DEFAULT_FRONTEND_ORIGIN);
+  const configured = normalizeOrigin(getEnvValue("FRONTEND_URL", "FRONTEND_ORIGIN") || "");
+  if (!configured) {
+    return DEFAULT_FRONTEND_ORIGIN;
+  }
+  if (RENDER_FRONTEND_ORIGIN_PATTERN.test(configured) && configured !== DEFAULT_FRONTEND_ORIGIN) {
+    return DEFAULT_FRONTEND_ORIGIN;
+  }
+  return configured;
 }
 
 function getBackendUrl() {
@@ -5294,7 +5301,10 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/market/watchlist") {
     try {
       const currentUser = getCurrentUser(req);
-      const exchange = currentUser ? getUserMarketExchange(currentUser) : "bybit";
+      const requestedExchange = url.searchParams.get("exchange");
+      const exchange = requestedExchange
+        ? normalizeExchange(requestedExchange, currentUser ? getUserMarketExchange(currentUser) : "bybit")
+        : currentUser ? getUserMarketExchange(currentUser) : "bybit";
       const testnet = !!getExchangeAccount(currentUser, exchange)?.testnet;
       const watchlist = await getMarketWatchlist(testnet, exchange);
       sendJson(res, 200, { watchlist });
@@ -5333,7 +5343,10 @@ async function handleApi(req, res, url) {
 
     try {
       const currentUser = getCurrentUser(req);
-      const exchange = currentUser ? getUserMarketExchange(currentUser) : "bybit";
+      const requestedExchange = url.searchParams.get("exchange");
+      const exchange = requestedExchange
+        ? normalizeExchange(requestedExchange, currentUser ? getUserMarketExchange(currentUser) : "bybit")
+        : currentUser ? getUserMarketExchange(currentUser) : "bybit";
       const testnet = !!getExchangeAccount(currentUser, exchange)?.testnet;
       const [prices, stats] = await Promise.all([
         getTickerPrices(testnet, exchange),
