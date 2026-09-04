@@ -1939,27 +1939,10 @@ async function getMarketWatchlist(testnet = false, exchange = "bybit") {
       .filter((item) => item.symbol?.endsWith("USDT") && Number(item.turnover24h || 0) > 0)
       .sort((a, b) => Number(b.turnover24h || 0) - Number(a.turnover24h || 0));
 
-    const liquidUniverse = liquidUsdtPairs.slice(0, 80);
-    const topPump = [...liquidUniverse]
-      .sort((a, b) => {
-        const changeDiff = Number(b.priceChangePercent || 0) - Number(a.priceChangePercent || 0);
-        return changeDiff || Number(b.turnover24h || 0) - Number(a.turnover24h || 0);
-      })
-      .slice(0, 4);
-    const topDip = [...liquidUniverse]
-      .sort((a, b) => {
-        const changeDiff = Number(a.priceChangePercent || 0) - Number(b.priceChangePercent || 0);
-        return changeDiff || Number(b.turnover24h || 0) - Number(a.turnover24h || 0);
-      })
-      .slice(0, 4);
-    const anchors = MARKET_WATCHLIST_SYMBOLS
-      .map((symbol) => liquidUsdtPairs.find((item) => item.symbol === symbol))
-      .filter(Boolean);
-
-    items = [...new Map([...topPump, ...topDip, ...anchors].map((item) => [item.symbol, item])).values()]
+    items = liquidUsdtPairs
+      .slice(0, 10)
       .map(normalizeWatchlistItem)
-      .filter((item) => item.symbol)
-      .slice(0, 12);
+      .filter((item) => item.symbol);
   } catch {
     items = [];
   }
@@ -2016,6 +1999,22 @@ async function getMarketWatchlist(testnet = false, exchange = "bybit") {
   });
 
   return items;
+}
+
+async function getSpotMarketSymbols(testnet = false, exchange = "bybit") {
+  const exchangeInfo = await getExchangeInfo("", testnet, exchange);
+  return (exchangeInfo.symbols || [])
+    .filter((item) => {
+      const status = String(item.status || "").trim().toUpperCase();
+      return item.symbol && (!status || ["TRADING", "ONLINE"].includes(status));
+    })
+    .sort((a, b) => a.symbol.localeCompare(b.symbol))
+    .map((item) => ({
+      symbol: item.symbol,
+      baseAsset: item.baseAsset || "",
+      quoteAsset: item.quoteAsset || "",
+      status: item.status || "",
+    }));
 }
 
 function shouldPersistLoginExchange(user, exchange) {
@@ -4859,6 +4858,20 @@ async function handleApi(req, res, url) {
       const testnet = !!getExchangeAccount(currentUser, exchange)?.testnet;
       const watchlist = await getMarketWatchlist(testnet, exchange);
       sendJson(res, 200, { watchlist });
+    } catch (error) {
+      sendJson(res, 500, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/market/symbols") {
+    try {
+      const currentUser = getCurrentUser(req);
+      const requestedExchange = url.searchParams.get("exchange");
+      const exchange = requestedExchange ? normalizeExchange(requestedExchange, "bybit") : "bybit";
+      const testnet = !!getExchangeAccount(currentUser, exchange)?.testnet;
+      const symbols = await getSpotMarketSymbols(testnet, exchange);
+      sendJson(res, 200, { symbols, exchange });
     } catch (error) {
       sendJson(res, 500, { error: error.message });
     }
