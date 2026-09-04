@@ -44,6 +44,37 @@ function normalizeNonNegativeAmount(value, label = "Amount") {
   return amount || "0";
 }
 
+const LEGACY_USDT_BALANCE_FIELDS = ["usdtBalance", "balanceUsdt", "availableUsdt", "availableBalanceUsdt"];
+const LEGACY_NGN_BALANCE_FIELDS = ["ngnBalance", "nairaBalance", "balanceNgn", "availableNgn", "availableBalanceNgn"];
+const LEGACY_GENERIC_BALANCE_FIELDS = ["balance", "availableBalance", "accountBalance", "walletBalance"];
+
+function readLegacyAmount(user, fields) {
+  for (const field of fields) {
+    const raw = user?.[field];
+    if (raw === undefined || raw === null || raw === "") {
+      continue;
+    }
+    try {
+      const cleaned = String(raw).replace(/,/g, "").replace(/(?:NGN|NAIRA|USDT|USD|\$|₦)/gi, "").trim();
+      const amount = normalizeNonNegativeAmount(cleaned, field);
+      if (compare(amount, "0") > 0) {
+        return amount;
+      }
+    } catch {
+      // Ignore historical non-balance strings on legacy user records.
+    }
+  }
+  return "0";
+}
+
+function inferLegacyGenericBalanceCurrency(user, amount) {
+  const explicit = String(user?.balanceCurrency || user?.currency || user?.walletCurrency || "").trim().toUpperCase();
+  if (SUPPORTED_CURRENCIES.includes(explicit)) {
+    return explicit;
+  }
+  return Number(amount || 0) >= 1000 ? "NGN" : "USDT";
+}
+
 function defaultSettings() {
   const configuredRate = getEnvValue("USDT_NGN_RATE", "BYBIT_USDT_NGN_RATE") || "1600";
   return {
@@ -156,6 +187,7 @@ class FinancialService {
         for (const currency of SUPPORTED_CURRENCIES) {
           this.ensureWallet(user.id, currency);
         }
+        this.migrateLegacyUserBalance(user);
       }
     }
 
@@ -174,6 +206,57 @@ class FinancialService {
   getSettings() {
     this.ensureState();
     return clone(this.db.systemSettings);
+  }
+
+  migrateLegacyUserBalance(user) {
+    if (!user || user.legacyBalanceMigratedAt) {
+      return false;
+    }
+
+    const usdtWallet = this.ensureWallet(user.id, "USDT");
+    const ngnWallet = this.ensureWallet(user.id, "NGN");
+    const hasWalletBalance =
+      compare(usdtWallet.availableBalance, "0") > 0 ||
+      compare(usdtWallet.lockedBalance, "0") > 0 ||
+      compare(ngnWallet.availableBalance, "0") > 0 ||
+      compare(ngnWallet.lockedBalance, "0") > 0;
+
+    if (hasWalletBalance) {
+      return false;
+    }
+
+    let migrated = false;
+    const legacyUsdt = readLegacyAmount(user, LEGACY_USDT_BALANCE_FIELDS);
+    const legacyNgn = readLegacyAmount(user, LEGACY_NGN_BALANCE_FIELDS);
+
+    if (compare(legacyUsdt, "0") > 0) {
+      usdtWallet.availableBalance = legacyUsdt;
+      usdtWallet.updatedAt = this.clock();
+      migrated = true;
+    }
+
+    if (compare(legacyNgn, "0") > 0) {
+      ngnWallet.availableBalance = legacyNgn;
+      ngnWallet.updatedAt = this.clock();
+      migrated = true;
+    }
+
+    if (!migrated) {
+      const legacyGeneric = readLegacyAmount(user, LEGACY_GENERIC_BALANCE_FIELDS);
+      if (compare(legacyGeneric, "0") > 0) {
+        const currency = inferLegacyGenericBalanceCurrency(user, legacyGeneric);
+        const wallet = currency === "NGN" ? ngnWallet : usdtWallet;
+        wallet.availableBalance = legacyGeneric;
+        wallet.updatedAt = this.clock();
+        migrated = true;
+      }
+    }
+
+    if (migrated) {
+      user.legacyBalanceMigratedAt = this.clock();
+    }
+
+    return migrated;
   }
 
   updateSettings(admin, patch = {}, requestMeta = {}) {

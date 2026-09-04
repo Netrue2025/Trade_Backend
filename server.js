@@ -87,7 +87,7 @@ const BYBIT_USDT_NGN_URL = getEnvValue("BYBIT_USDT_NGN_URL") || "https://www.byb
 const FIAT_RATE_CACHE_TTL_MS = 1000 * 60 * 15;
 const MARKET_WATCHLIST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "PEPEUSDT"];
 const WATCHLIST_CACHE_TTL_MS = 1000 * 10;
-const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 3;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 const SESSION_TTL_SECONDS = Math.round(SESSION_TTL_MS / 1000);
 const SIGNAL_STREAM_KEEPALIVE_MS = 20_000;
 const SIGNAL_EXPIRY_SWEEP_MS = 60_000;
@@ -1076,16 +1076,16 @@ function slugifyUsername(value) {
     .slice(0, 48);
 }
 
+function normalizeEmailAddress(value) {
+  const email = String(value || "").trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error("Enter a valid email address.");
+  }
+  return email;
+}
+
 function getSignupEmail(name, email) {
-  const normalizedEmail = String(email || "").trim().toLowerCase();
-  if (normalizedEmail) {
-    return normalizedEmail;
-  }
-  const username = slugifyUsername(name);
-  if (!username) {
-    throw new Error("Name is required.");
-  }
-  return `${username}@netrue.local`;
+  return normalizeEmailAddress(email);
 }
 
 function findUserByLogin(login) {
@@ -1130,10 +1130,11 @@ function getCurrentUser(req) {
   return db.users.find((user) => user.id === session.userId) || null;
 }
 
-function createSession(userId) {
+function createSession(userId, { remember = false } = {}) {
   const session = {
     id: randomId(18),
     userId,
+    remember: !!remember,
     createdAt: nowIso(),
     expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
   };
@@ -4122,7 +4123,7 @@ function shouldUseCrossSiteCookie(req) {
   return origin !== requestOrigin && isSecureRequest(req);
 }
 
-function buildSessionCookie(req, value, maxAgeSeconds = 0) {
+function buildSessionCookie(req, value, maxAgeSeconds = null) {
   const parts = [
     `sid=${encodeURIComponent(value)}`,
     "HttpOnly",
@@ -4130,12 +4131,12 @@ function buildSessionCookie(req, value, maxAgeSeconds = 0) {
     shouldUseCrossSiteCookie(req) ? "SameSite=None" : "SameSite=Lax",
   ];
 
-  if (maxAgeSeconds > 0) {
-    parts.push(`Max-Age=${maxAgeSeconds}`);
-    parts.push(`Expires=${new Date(Date.now() + maxAgeSeconds * 1000).toUTCString()}`);
-  } else {
+  if (!value || maxAgeSeconds === 0) {
     parts.push("Max-Age=0");
     parts.push("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+  } else if (maxAgeSeconds > 0) {
+    parts.push(`Max-Age=${maxAgeSeconds}`);
+    parts.push(`Expires=${new Date(Date.now() + maxAgeSeconds * 1000).toUTCString()}`);
   }
 
   if (isSecureRequest(req)) {
@@ -4145,8 +4146,8 @@ function buildSessionCookie(req, value, maxAgeSeconds = 0) {
   return parts.join("; ");
 }
 
-function sendSessionCookie(req, res, sessionId) {
-  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, SESSION_TTL_SECONDS));
+function sendSessionCookie(req, res, sessionId, { remember = false } = {}) {
+  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, remember ? SESSION_TTL_SECONDS : null));
 }
 
 function clearSessionCookie(req, res) {
@@ -4236,7 +4237,13 @@ async function handleApi(req, res, url) {
       sendJson(res, 400, { error: "Name and password are required." });
       return true;
     }
-    const email = getSignupEmail(name, body.email);
+    let email;
+    try {
+      email = getSignupEmail(name, body.email);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return true;
+    }
     if (role === "admin" && !isAdminSelfSignupEnabled()) {
       sendJson(res, 403, { error: "Admin signup is disabled. Sign in with an existing admin account." });
       return true;
@@ -4269,8 +4276,9 @@ async function handleApi(req, res, url) {
     db.users.push(user);
     financialService.ensureState();
     financialService.audit(user, "USER_REGISTERED", "User", user.id, {}, getRequestMeta(req));
-    const session = createSession(user.id);
-    sendSessionCookie(req, res, session.id);
+    const remember = parseBooleanFlag(body.remember, false);
+    const session = createSession(user.id, { remember });
+    sendSessionCookie(req, res, session.id, { remember });
     sendJson(res, 201, { user: sanitizeUser(user) });
     return true;
   }
@@ -4301,13 +4309,14 @@ async function handleApi(req, res, url) {
     }
 
     clearFailedLogins(req, login);
-    const session = createSession(user.id);
+    const remember = parseBooleanFlag(body.remember, false);
+    const session = createSession(user.id, { remember });
     if (shouldPersistLoginExchange(user, exchange)) {
       setUserPreferredExchange(user, exchange);
     }
     financialService.audit(user, user.role === "admin" ? "ADMIN_LOGIN" : "USER_LOGIN", "User", user.id, {}, getRequestMeta(req));
     persist();
-    sendSessionCookie(req, res, session.id);
+    sendSessionCookie(req, res, session.id, { remember });
     sendJson(res, 200, { user: sanitizeUser(user) });
     return true;
   }
@@ -5836,6 +5845,7 @@ async function handleApi(req, res, url) {
 
   const adminUserMessageMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/message$/);
   const adminUserBalanceMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/balance$/);
+  const adminUserEmailMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/email$/);
   if (req.method === "POST" && adminUserBalanceMatch) {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {
@@ -5850,6 +5860,41 @@ async function handleApi(req, res, url) {
       );
       scheduleSettingsUsersBroadcast("admin_balance_updated");
       sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && adminUserEmailMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+
+    const targetUser = getAdminManagedUser(decodeURIComponent(adminUserEmailMatch[1] || "").trim());
+    if (!targetUser) {
+      sendJson(res, 404, { error: "User not found." });
+      return true;
+    }
+
+    try {
+      const body = await readBody(req);
+      const email = normalizeEmailAddress(body.email);
+      const duplicate = db.users.find(
+        (user) => user.id !== targetUser.id && String(user.email || "").trim().toLowerCase() === email
+      );
+      if (duplicate) {
+        sendJson(res, 409, { error: "That email is already registered." });
+        return true;
+      }
+
+      targetUser.email = email;
+      persist();
+      scheduleSettingsUsersBroadcast("admin_email_updated");
+      sendJson(res, 200, {
+        user: await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
+      });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }

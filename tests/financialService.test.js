@@ -456,6 +456,31 @@ test("legacy wallet balance fields are available for one click trade join", () =
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "32000");
 });
 
+test("legacy user balance field migrates into wallet rows", () => {
+  const db = {
+    users: [
+      {
+        id: "user-legacy",
+        name: "Legacy User",
+        email: "legacy@example.com",
+        role: "user",
+        balance: "75000",
+      },
+    ],
+  };
+  const service = new FinancialService({
+    db,
+    idGenerator: () => "id-legacy",
+    clock: () => "2026-08-30T10:00:00.000Z",
+  });
+
+  service.ensureState();
+
+  assert.equal(service.ensureWallet("user-legacy", "NGN").availableBalance, "75000");
+  assert.equal(service.getAvailableUsdtEquivalent("user-legacy"), "46.875");
+  assert.equal(db.users[0].legacyBalanceMigratedAt, "2026-08-30T10:00:00.000Z");
+});
+
 test("Paystack kobo conversion and webhook signature verification", () => {
   const secretKey = "sk_test_example";
   const rawBody = Buffer.from(JSON.stringify({ event: "transfer.success", data: { reference: "wd_test" } }));
