@@ -903,7 +903,7 @@ function getDepositUser(deposit) {
 }
 
 function buildWithdrawalAdminUrl(withdrawal) {
-  return `${getBackendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
+  return `${getFrontendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
 }
 
 async function sendDepositSuccessChannelAlert(deposit) {
