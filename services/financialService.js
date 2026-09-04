@@ -113,6 +113,9 @@ function defaultSettings() {
       updatedAt: nowIso(),
       updatedBy: "system",
     },
+    telegram: {
+      channelUsername: getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME") || "netruesignal",
+    },
     trading: {
       tradingEnabled: true,
       dailyPerformanceMode: "manual",
@@ -170,6 +173,10 @@ class FinancialService {
       exchangeRate: {
         ...defaultSettings().exchangeRate,
         ...(this.db.systemSettings?.exchangeRate || {}),
+      },
+      telegram: {
+        ...defaultSettings().telegram,
+        ...(this.db.systemSettings?.telegram || {}),
       },
       trading: {
         ...defaultSettings().trading,
@@ -280,6 +287,10 @@ class FinancialService {
         ...before.exchangeRate,
         ...(patch.exchangeRate || {}),
       },
+      telegram: {
+        ...before.telegram,
+        ...(patch.telegram || {}),
+      },
       trading: {
         ...before.trading,
         ...(patch.trading || {}),
@@ -290,6 +301,10 @@ class FinancialService {
       next.exchangeRate.usdtToNgn = normalizeAmount(patch.exchangeRate.usdtToNgn, "USDT to NGN rate");
       next.exchangeRate.updatedAt = this.clock();
       next.exchangeRate.updatedBy = admin.id;
+    }
+
+    if (patch.telegram?.channelUsername !== undefined) {
+      next.telegram.channelUsername = String(patch.telegram.channelUsername || "").trim();
     }
 
     next.withdrawal.maxDailyCount = 0;
@@ -589,6 +604,7 @@ class FinancialService {
         deposit: clone(this.db.systemSettings.deposit),
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
+        telegram: clone(this.db.systemSettings.telegram),
       },
     };
   }
@@ -1841,6 +1857,7 @@ class FinancialService {
         deposit: clone(this.db.systemSettings.deposit),
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
+        telegram: clone(this.db.systemSettings.telegram),
       },
       todayPnl: this.getTodayPnl(),
       totalPnl: this.db.transactions

@@ -126,6 +126,8 @@ const paystackService = new PaystackService();
 const tradeListener = new TradeListener({
   telegramService: telegramTradeService,
   subscriberModel,
+  channelSender: sendTelegramChannelAlert,
+  tradeUrlBuilder: buildTradeDeepLink,
 });
 const signalConfig = createSignalConfig();
 const signalLogger = createLogger("signals");
@@ -823,16 +825,142 @@ function getTelegramAdminChatId() {
   return String(getEnvValue("TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID") || "").trim();
 }
 
+function normalizeTelegramChannelUsername(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const withoutUrl = raw.replace(/^https?:\/\/(?:t\.me|telegram\.me)\//i, "");
+  const username = withoutUrl.replace(/^@+/, "").split(/[/?#]/)[0].trim();
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(username)) {
+    return "";
+  }
+  return `@${username}`;
+}
+
+function getTelegramSignalChannelChatId() {
+  const configured = financialService?.getSettings?.().telegram?.channelUsername;
+  return normalizeTelegramChannelUsername(configured || getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME") || "netruesignal");
+}
+
+function buildTradeDeepLink(trade) {
+  try {
+    const url = new URL(`${getFrontendUrl()}/`);
+    url.searchParams.set("tab", "signals");
+    if (trade?.id) {
+      url.searchParams.set("trade", trade.id);
+    }
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+async function sendTelegramChannelAlert(message, options = {}) {
+  const chatId = getTelegramSignalChannelChatId();
+  if (!chatId || !telegramTradeService?.bot) {
+    return { sent: 0, skipped: 1, disabled: true };
+  }
+
+  await telegramTradeService.sendMessage(chatId, String(message || "").trim(), options.telegramOptions || {});
+  return { sent: 1, skipped: 0, failed: 0, disabled: false };
+}
+
 function formatNgnAmount(value) {
   return `NGN ${Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatUsdtAmount(value) {
+  return `${Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })} USDT`;
+}
+
+function maskPublicText(value, visible = 2) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "User";
+  }
+  const digest = crypto.createHash("sha256").update(text).digest("hex").slice(0, 6);
+  return `${text.slice(0, Math.min(visible, text.length))}***${digest}`;
+}
+
+function maskPublicReference(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (text.length <= 8) {
+    return `${text.slice(0, 2)}***`;
+  }
+  return `${text.slice(0, 4)}...${text.slice(-4)}`;
 }
 
 function getWithdrawalUser(withdrawal) {
   return db.users.find((user) => user.id === withdrawal.userId) || {};
 }
 
+function getDepositUser(deposit) {
+  return db.users.find((user) => user.id === deposit.userId) || {};
+}
+
 function buildWithdrawalAdminUrl(withdrawal) {
   return `${getBackendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
+}
+
+async function sendDepositSuccessChannelAlert(deposit) {
+  const record = financialService.getDeposit(deposit.id);
+  if (record.channelAlertSentAt) {
+    return null;
+  }
+  const user = getDepositUser(record);
+  const displayAmounts = record.displayAmounts || financialService.getDisplayAmounts(record.amount, record.currency, record.exchangeRate);
+  const reference = maskPublicReference(record.transactionHash || record.id);
+  const lines = [
+    "DEPOSIT SUCCESSFUL",
+    `User: ${maskPublicText(user.name || user.email || user.id)}`,
+    `Amount: ${record.currency === "NGN" ? formatNgnAmount(record.amount) : formatUsdtAmount(record.amount)}`,
+    `USDT: ${formatUsdtAmount(displayAmounts.USDT)}`,
+    `NGN: ${formatNgnAmount(displayAmounts.NGN)}`,
+    reference ? `Ref: ${reference}` : null,
+  ].filter(Boolean);
+
+  const sent = await sendTelegramChannelAlert(lines.join("\n")).catch((error) => {
+    console.warn("Deposit channel notification failed:", error.message || error);
+    return null;
+  });
+  if (sent && !sent.disabled) {
+    record.channelAlertSentAt = nowIso();
+    persist();
+  }
+  return sent;
+}
+
+async function sendWithdrawalSuccessChannelAlert(withdrawal) {
+  const record = financialService.getWithdrawal(withdrawal.id);
+  if (record.channelAlertSentAt) {
+    return null;
+  }
+  const user = getWithdrawalUser(record);
+  const bank = record.bank || record.destination || {};
+  const displayAmounts = record.displayAmounts || financialService.getDisplayAmounts(record.amount, record.currency, record.exchangeRate);
+  const lines = [
+    "WITHDRAWAL SUCCESSFUL",
+    `User: ${maskPublicText(user.name || user.email || user.id)}`,
+    `Amount: ${record.currency === "NGN" ? formatNgnAmount(record.amount) : formatUsdtAmount(record.amount)}`,
+    `USDT: ${formatUsdtAmount(displayAmounts.USDT)}`,
+    `NGN: ${formatNgnAmount(displayAmounts.NGN)}`,
+    bank.bankName ? `Bank: ${maskPublicText(bank.bankName, 3)}` : null,
+    bank.accountNumber || bank.maskedAccountNumber ? `Account: ${bank.maskedAccountNumber || maskAccountNumber(bank.accountNumber)}` : null,
+  ].filter(Boolean);
+
+  const sent = await sendTelegramChannelAlert(lines.join("\n")).catch((error) => {
+    console.warn("Withdrawal channel notification failed:", error.message || error);
+    return null;
+  });
+  if (sent && !sent.disabled) {
+    record.channelAlertSentAt = nowIso();
+    persist();
+  }
+  return sent;
 }
 
 async function sendWithdrawalTelegramMessage(withdrawal, title, extraLines = []) {
@@ -998,6 +1126,7 @@ async function syncProcessingPaystackWithdrawals(requestMeta = {}) {
       const updated = applyPaystackTransferStatus(withdrawal.paystackReference, data, requestMeta);
       if (updated?.status === "SUCCESS") {
         await editWithdrawalTelegramMessage(updated, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+        await sendWithdrawalSuccessChannelAlert(updated);
       } else if (updated?.status === "FAILED") {
         await editWithdrawalTelegramMessage(updated, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
       } else if (updated?.status === "REVERSED") {
@@ -1038,6 +1167,7 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
       || financialService.markPaystackTransferProcessing(admin, withdrawal.id, transfer, requestMeta);
     if (withdrawal.status === "SUCCESS") {
       await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+      await sendWithdrawalSuccessChannelAlert(withdrawal);
     } else {
       await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
     }
@@ -2906,6 +3036,15 @@ function resolveTradeInvestmentAmount(userId) {
   return { amountUsdt: freeUsdt, freeUsdt };
 }
 
+async function assertTradeCanAcceptInvestment(trade) {
+  const marketCache = new Map();
+  const pnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
+  if (pnlPercent < 0) {
+    throw new Error("Hold. This trade can be joined when admin P&L is zero or in profit.");
+  }
+  return pnlPercent;
+}
+
 function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user.id) {
   const fundingSources = financialService.resolveWithdrawalFunding(user.id, "USDT", amountUsdt);
 
@@ -4259,6 +4398,7 @@ async function handleApi(req, res, url) {
       if (statusSettled?.status === "SUCCESS") {
         withdrawal = statusSettled;
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+        await sendWithdrawalSuccessChannelAlert(withdrawal);
       } else if (statusSettled?.status === "FAILED") {
         withdrawal = statusSettled;
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
@@ -4268,6 +4408,7 @@ async function handleApi(req, res, url) {
       } else if (eventType === "transfer.success") {
         withdrawal = financialService.applyPaystackTransferSuccess(reference, data, getRequestMeta(req));
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+        await sendWithdrawalSuccessChannelAlert(withdrawal);
       } else if (eventType === "transfer.failed") {
         withdrawal = financialService.applyPaystackTransferFailed(reference, data, getRequestMeta(req));
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL FAILED", ["Funds returned to wallet."]);
@@ -4723,6 +4864,7 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      await sendDepositSuccessChannelAlert(deposit);
       sendJson(res, 200, { deposit });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -4819,6 +4961,7 @@ async function handleApi(req, res, url) {
         || financialService.markPaystackTransferProcessing(admin, withdrawalId, result, getRequestMeta(req));
       if (nextWithdrawal.status === "SUCCESS") {
         await editWithdrawalTelegramMessage(nextWithdrawal, "WITHDRAWAL COMPLETED", ["Status: Successfully Paid"]);
+        await sendWithdrawalSuccessChannelAlert(nextWithdrawal);
       }
       sendJson(res, 200, { withdrawal: nextWithdrawal });
     } catch (error) {
@@ -4883,6 +5026,7 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      await sendWithdrawalSuccessChannelAlert(withdrawal);
       sendJson(res, 200, { withdrawal });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -5863,6 +6007,7 @@ async function handleApi(req, res, url) {
         sendJson(res, 400, { error: "This order is still queued. Users can only join filled open trades." });
         return true;
       }
+      await assertTradeCanAcceptInvestment(trade);
       if (getUserTradeInvestment(trade.id, targetUser.id)) {
         sendJson(res, 400, { error: "User already joined this trade." });
         return true;
@@ -6121,6 +6266,7 @@ async function handleApi(req, res, url) {
         sendJson(res, 400, { error: "This order is still queued. You can only join filled open trades." });
         return true;
       }
+      await assertTradeCanAcceptInvestment(trade);
       if (getUserTradeInvestment(trade.id, user.id)) {
         sendJson(res, 400, { error: "You already joined this trade." });
         return true;

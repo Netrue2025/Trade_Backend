@@ -2,6 +2,8 @@ const cron = require("node-cron");
 
 const { createBroadcaster } = require("../utils/broadcast");
 
+const DAILY_PROFIT_TARGET_PERCENT = 1;
+
 function normalizeExchange(exchange) {
   const value = String(exchange || "").trim().toLowerCase();
   return value === "binance" || value === "bybit" ? value : "bybit";
@@ -97,6 +99,10 @@ function isQualityEmaTrade(trade) {
 
 function isManagedStrategyTrade(trade) {
   return isShortSwingTrade(trade) || isQualityEmaTrade(trade);
+}
+
+function isBuyEntryTrade(trade) {
+  return String(trade?.side || "").trim().toUpperCase() === "BUY";
 }
 
 function getStrategyReason(trade, exitOrder = null) {
@@ -211,6 +217,31 @@ function buildTakeProfitHitMessage({ exchange, trade, exitOrder, profitPercent }
   ].filter(Boolean).join("\n");
 }
 
+function buildPublicOpenTradeMessage({ exchange, trade }) {
+  const entry = getExecutionPrice(trade?.adminExecution) || toNumber(trade?.price);
+  return [
+    "OPEN TRADE",
+    `Exchange: ${getExchangeLabel(exchange)}`,
+    `Pair: ${trade.symbol}`,
+    `Entry: ${formatNumber(entry, 6)}`,
+    trade.takeProfitTargetPrice ? `TP: ${formatNumber(trade.takeProfitTargetPrice, 6)}` : null,
+    trade.stopLossTargetPrice ? `SL: ${formatNumber(trade.stopLossTargetPrice, 6)}` : null,
+    "Status: Open",
+  ].filter(Boolean).join("\n");
+}
+
+function buildPublicTakeProfitMessage({ exchange, trade, exitOrder, profitPercent }) {
+  const execution = exitOrder?.adminExecution || null;
+  return [
+    "TAKE PROFIT HIT",
+    `Exchange: ${getExchangeLabel(exchange)}`,
+    `Pair: ${trade.symbol}`,
+    `Entry: ${formatNumber(getExecutionPrice(trade.adminExecution) || trade.price, 6)}`,
+    `Exit: ${formatNumber(getExecutionPrice(execution) || exitOrder.price, 6)}`,
+    profitPercent === null ? null : `Profit: ${formatSignedPercent(profitPercent)}`,
+  ].filter(Boolean).join("\n");
+}
+
 function buildTargetMessage(exchange) {
   if (normalizeExchange(exchange) === "bybit") {
     return [
@@ -230,11 +261,23 @@ function buildTargetMessage(exchange) {
   ].join("\n");
 }
 
+function buildDailyTargetMessage(exchange) {
+  return [
+    `${getExchangeLabel(exchange)} Update`,
+    "",
+    `Daily ${DAILY_PROFIT_TARGET_PERCENT}% Target Reached`,
+    "",
+    `Congratulations. The daily ${DAILY_PROFIT_TARGET_PERCENT}% target has been reached.`,
+  ].join("\n");
+}
+
 class TradeListener {
-  constructor({ telegramService, subscriberModel, logger = console } = {}) {
+  constructor({ telegramService, subscriberModel, logger = console, channelSender = null, tradeUrlBuilder = null } = {}) {
     this.telegramService = telegramService;
     this.subscriberModel = subscriberModel;
     this.logger = logger;
+    this.channelSender = typeof channelSender === "function" ? channelSender : null;
+    this.tradeUrlBuilder = typeof tradeUrlBuilder === "function" ? tradeUrlBuilder : null;
     this.broadcaster = createBroadcaster({
       telegramService,
       subscriberModel,
@@ -320,6 +363,37 @@ class TradeListener {
     return result;
   }
 
+  async sendChannel(message, options = {}) {
+    if (!this.channelSender) {
+      return { sent: 0, skipped: 1, disabled: true };
+    }
+
+    return this.channelSender(message, options).catch((error) => {
+      this.logger.warn("Telegram channel alert skipped:", error.message || error);
+      return { sent: 0, failed: 1, disabled: false };
+    });
+  }
+
+  buildTradeKeyboard(trade) {
+    const url = this.tradeUrlBuilder ? this.tradeUrlBuilder(trade) : "";
+    if (!url) {
+      return null;
+    }
+    return {
+      inline_keyboard: [[
+        {
+          text: "View trade",
+          url,
+        },
+      ]],
+    };
+  }
+
+  buildTradeTelegramOptions(trade) {
+    const replyMarkup = this.buildTradeKeyboard(trade);
+    return replyMarkup ? { reply_markup: replyMarkup } : {};
+  }
+
   async handleStrategySignalDetected(signal, exchange = "bybit") {
     if (!signal?.pair) {
       return;
@@ -381,6 +455,12 @@ class TradeListener {
     if (isManagedStrategyTrade(trade)) {
       if (exitOrder.kind === "TAKE_PROFIT") {
         await this.broadcast(buildShortSwingTakeProfitMessage(trade, exitOrder), exchange, { exchange });
+        await this.sendChannel(buildPublicTakeProfitMessage({ exchange, trade, exitOrder, profitPercent }), {
+          type: "TAKE_PROFIT",
+          exchange,
+          trade,
+          telegramOptions: this.buildTradeTelegramOptions(trade),
+        });
       } else if (exitOrder.kind === "STOP_LOSS" || exitOrder.kind === "BREAKEVEN_STOP") {
         await this.broadcast(buildShortSwingStopMessage(trade, exitOrder), exchange, { exchange });
       } else {
@@ -396,6 +476,12 @@ class TradeListener {
         exchange,
         { exchange }
       );
+      await this.sendChannel(buildPublicTakeProfitMessage({ exchange, trade, exitOrder, profitPercent }), {
+        type: "TAKE_PROFIT",
+        exchange,
+        trade,
+        telegramOptions: this.buildTradeTelegramOptions(trade),
+      });
     } else {
       await this.broadcast(
         buildOrderFilledMessage({ exchange, trade, exitOrder, profitPercent }),
@@ -436,10 +522,26 @@ class TradeListener {
     const exchange = normalizeExchange(orderEvent.exchange || trade.exchange);
     if (isManagedStrategyTrade(trade)) {
       await this.broadcast(buildShortSwingExecutedMessage(trade), exchange, { exchange });
+      if (isBuyEntryTrade(trade)) {
+        await this.sendChannel(buildPublicOpenTradeMessage({ exchange, trade }), {
+          type: "OPEN_TRADE",
+          exchange,
+          trade,
+          telegramOptions: this.buildTradeTelegramOptions(trade),
+        });
+      }
       return { ok: true, managed: true };
     }
 
     await this.broadcast(buildOrderFilledMessage({ exchange, trade }), exchange, { exchange });
+    if (isBuyEntryTrade(trade)) {
+      await this.sendChannel(buildPublicOpenTradeMessage({ exchange, trade }), {
+        type: "OPEN_TRADE",
+        exchange,
+        trade,
+        telegramOptions: this.buildTradeTelegramOptions(trade),
+      });
+    }
     return { ok: true, managed: false };
   }
 
@@ -456,9 +558,14 @@ class TradeListener {
       this.bybitDailyProfit += numericProfit;
     }
 
-    if (this.getDailyProfit(normalizedExchange) >= 2 && !this.hasTargetHit(normalizedExchange)) {
+    if (this.getDailyProfit(normalizedExchange) >= DAILY_PROFIT_TARGET_PERCENT && !this.hasTargetHit(normalizedExchange)) {
       this.markTargetHit(normalizedExchange);
-      await this.broadcast(buildTargetMessage(normalizedExchange), "dailyProfit", {
+      const message = buildDailyTargetMessage(normalizedExchange);
+      await this.broadcast(message, "dailyProfit", {
+        exchange: normalizedExchange,
+      });
+      await this.sendChannel(message, {
+        type: "DAILY_TARGET",
         exchange: normalizedExchange,
       });
     }
