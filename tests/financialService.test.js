@@ -838,6 +838,31 @@ test("bank account name match details include warning for mismatched names", () 
   assert.match(result.warning, /does not match your registered name/i);
 });
 
+test("user can remove a saved bank account", () => {
+  const { service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  const first = service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "ADA USER",
+  });
+  const second = service.updateVerifiedBankAccount(user, {
+    bankName: "Second Bank",
+    bankCode: "044",
+    accountNumber: "2222222222",
+    accountName: "ADA USER",
+  });
+
+  const result = service.removeVerifiedBankAccount(user, second.id);
+
+  assert.equal(result.removedBankAccountId, second.id);
+  assert.equal(result.bankAccounts.length, 1);
+  assert.equal(result.bankAccounts[0].id, first.id);
+  assert.equal(user.bankAccount.id, first.id);
+});
+
 test("notification can be marked as read by owner", () => {
   const { service, user } = createHarness();
   const notification = service.createNotification({

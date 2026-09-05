@@ -507,6 +507,51 @@ class FinancialService {
     return clone(bankAccount);
   }
 
+  removeVerifiedBankAccount(user, bankAccountId = "", requestMeta = {}) {
+    this.ensureState();
+    if (!user || user.role !== "user") {
+      throw new Error("User not found.");
+    }
+    const targetId = String(bankAccountId || "").trim();
+    if (!targetId) {
+      throw new Error("Saved account was not found.");
+    }
+    const bankAccounts = [
+      ...(Array.isArray(user.bankAccounts) ? user.bankAccounts : []),
+      user.bankAccount,
+    ].filter(Boolean);
+    const target = bankAccounts.find((account) => String(account.id || "").trim() === targetId);
+    if (!target) {
+      throw new Error("Saved account was not found.");
+    }
+    const targetKey = `${target.bankCode || ""}:${target.accountNumber || ""}`;
+    const nextAccounts = [];
+    const seen = new Set();
+    for (const account of bankAccounts) {
+      const key = `${account.id || ""}:${account.bankCode || ""}:${account.accountNumber || ""}`;
+      if (String(account.id || "").trim() === targetId || `${account.bankCode || ""}:${account.accountNumber || ""}` === targetKey) {
+        continue;
+      }
+      if (!seen.has(key)) {
+        seen.add(key);
+        nextAccounts.push(account);
+      }
+    }
+    user.bankAccounts = nextAccounts;
+    user.bankAccount = nextAccounts[0] || null;
+    this.audit(user, "BANK_ACCOUNT_REMOVED", "User", user.id, {
+      bankName: target.bankName,
+      bankCode: target.bankCode,
+      maskedAccountNumber: target.maskedAccountNumber || maskAccountNumber(target.accountNumber),
+    }, requestMeta);
+    this.persist();
+    return {
+      bankAccount: clone(user.bankAccount || null),
+      bankAccounts: clone(user.bankAccounts || []),
+      removedBankAccountId: targetId,
+    };
+  }
+
   ensureWallet(userId, currency) {
     const normalizedCurrency = normalizeCurrency(currency);
     let wallet = this.db.wallets.find((item) => item.userId === userId && item.currency === normalizedCurrency);

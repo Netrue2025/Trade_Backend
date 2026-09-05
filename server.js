@@ -5151,6 +5151,25 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const userBankAccountDeleteMatch = url.pathname.match(/^\/api\/user\/bank-account\/([^/]+)$/);
+  if (req.method === "DELETE" && userBankAccountDeleteMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const result = financialService.removeVerifiedBankAccount(
+        user,
+        decodeURIComponent(userBankAccountDeleteMatch[1] || "").trim(),
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/withdrawals") {
     const user = requireAuth(req, res);
     if (!user) {
