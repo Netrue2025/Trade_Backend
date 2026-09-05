@@ -130,7 +130,7 @@ test("wallet history includes deposit and withdrawal request statuses", () => {
   const rejectedDeposit = service.createDeposit(user, { amount: "12", currency: "USDT", transactionHash: "0xreject" });
   service.rejectDeposit(admin, rejectedDeposit.id);
   const pendingWithdrawal = service.createWithdrawal(user, {
-    amount: "5",
+    amount: "50",
     currency: "USDT",
     destination: {
       address: "TUserWalletAddress",
@@ -149,7 +149,7 @@ test("withdrawal completion reserves funds and clears locked balance", () => {
   setWallet(service, user.id, "USDT", "100");
 
   const withdrawal = service.createWithdrawal(user, {
-    amount: "20",
+    amount: "50",
     currency: "USDT",
     destination: {
       address: "TUserWalletAddress",
@@ -157,11 +157,11 @@ test("withdrawal completion reserves funds and clears locked balance", () => {
     },
   });
 
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "80");
-  assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "20");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "50");
+  assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "50");
 
   service.completeWithdrawal(admin, withdrawal.id, { transactionHash: "0xdef" });
-  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "80");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "50");
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "0");
 });
 
@@ -170,7 +170,7 @@ test("withdrawal rejection refunds reserved funds", () => {
   setWallet(service, user.id, "USDT", "100");
 
   const withdrawal = service.createWithdrawal(user, {
-    amount: "20",
+    amount: "50",
     currency: "USDT",
     destination: {
       address: "TUserWalletAddress",
@@ -193,7 +193,7 @@ test("USDT withdrawal accepts wallet aliases and configured network", () => {
   });
 
   const withdrawal = service.createWithdrawal(user, {
-    amount: "20",
+    amount: "50",
     currency: "USDT",
     destination: {
       walletAddress: "TUserWalletAddress",
@@ -373,7 +373,7 @@ test("daily NGN withdrawal limit is enforced by amount, not request count", () =
 
   for (let index = 0; index < 3; index += 1) {
     service.createWithdrawal(user, {
-      amount: "10",
+      amount: "50",
       currency: "USDT",
       destination: {
         address: `TUserWalletAddress${index}`,
@@ -419,6 +419,67 @@ test("admin bonus credits user wallet and creates notification", () => {
   assert.equal(result.transaction.type, "BONUS");
   assert.equal(result.profile.wallets.find((wallet) => wallet.currency === "NGN").availableBalance, "10000");
   assert.equal(service.listNotifications(user)[0].type, "BONUS");
+});
+
+test("admin can generate and track Netrue gift cards", () => {
+  const { admin, service } = createHarness();
+
+  const giftCard = service.createGiftCard(admin, {
+    amount: "2500",
+    currency: "NGN",
+    note: "Promo",
+  });
+
+  assert.match(giftCard.code, /^\d{14}$/);
+  assert.equal(giftCard.status, "UNUSED");
+  assert.equal(giftCard.amount, "2500");
+  assert.equal(service.listGiftCards(admin)[0].id, giftCard.id);
+});
+
+test("user can redeem a Netrue gift card once", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "500");
+  const giftCard = service.createGiftCard(admin, {
+    amount: "2500",
+    currency: "NGN",
+  });
+
+  const result = service.redeemGiftCard(user, { code: giftCard.code });
+
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "3000");
+  assert.equal(result.giftCard.status, "USED");
+  assert.equal(result.transaction.type, "GIFT_CARD");
+  assert.equal(result.transaction.amount, "2500");
+  assert.equal(service.listGiftCards(admin)[0].redeemedByUserId, user.id);
+  assert.throws(() => service.redeemGiftCard(user, { code: giftCard.code }), /already been used/i);
+});
+
+test("withdrawal minimums are enforced for NGN and USDT", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "100");
+  setWallet(service, user.id, "NGN", "1000");
+  setVerifiedBank(service, user);
+
+  assert.throws(
+    () =>
+      service.createWithdrawal(user, {
+        amount: "49.99",
+        currency: "USDT",
+        destination: {
+          address: "TUserWalletAddress",
+          network: "TRC20",
+        },
+      }),
+    /between 50/i
+  );
+  assert.throws(
+    () =>
+      service.createWithdrawal(user, {
+        amount: "499",
+        currency: "NGN",
+      }),
+    /between 500/i
+  );
 });
 
 test("admin can set a user balance", () => {
@@ -611,10 +672,10 @@ test("reversed successful Paystack withdrawal credits user once", () => {
 test("USDT withdrawal can reserve NGN equivalent when USDT wallet is short", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "USDT", "5");
-  setWallet(service, user.id, "NGN", "32000");
+  setWallet(service, user.id, "NGN", "72000");
 
   const withdrawal = service.createWithdrawal(user, {
-    amount: "25",
+    amount: "50",
     currency: "USDT",
     destination: {
       address: "TUserWalletAddress",
@@ -624,12 +685,12 @@ test("USDT withdrawal can reserve NGN equivalent when USDT wallet is short", () 
 
   assert.deepEqual(withdrawal.fundingSources, [
     { currency: "USDT", amount: "5" },
-    { currency: "NGN", amount: "32000" },
+    { currency: "NGN", amount: "72000" },
   ]);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "0");
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "5");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "0");
-  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "32000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "72000");
 });
 
 test("NGN withdrawal can reserve USDT equivalent when naira wallet is short", () => {

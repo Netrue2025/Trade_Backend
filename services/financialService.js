@@ -7,6 +7,7 @@ const {
   percentChange,
   subtract,
 } = require("../lib/money");
+const crypto = require("node:crypto");
 const { getEnvValue } = require("../lib/env");
 const { randomId } = require("../lib/security");
 const { maskAccountNumber, toKobo } = require("./paystackService");
@@ -15,6 +16,10 @@ const SUPPORTED_CURRENCIES = ["USDT", "NGN"];
 const WITHDRAWAL_STATUSES = ["PENDING", "APPROVED", "PROCESSING", "SUCCESS", "FAILED", "REJECTED", "REVERSED", "COMPLETED", "CANCELLED"];
 const DEPOSIT_STATUSES = ["PENDING", "APPROVED", "REJECTED"];
 const ACTIVE_WITHDRAWAL_STATUSES = ["PENDING", "APPROVED", "PROCESSING"];
+const MIN_WITHDRAWAL_AMOUNTS = {
+  NGN: "500",
+  USDT: "50",
+};
 
 function nowIso() {
   return new Date().toISOString();
@@ -42,6 +47,14 @@ function normalizeNonNegativeAmount(value, label = "Amount") {
     throw new Error(`${label} cannot be negative.`);
   }
   return amount || "0";
+}
+
+function normalizeGiftCardCode(value) {
+  const code = String(value || "").replace(/\D/g, "").trim();
+  if (!/^\d{14}$/.test(code)) {
+    throw new Error("Enter a valid 14 digit gift card number.");
+  }
+  return code;
 }
 
 const LEGACY_USDT_BALANCE_FIELDS = ["usdtBalance", "balanceUsdt", "availableUsdt", "availableBalanceUsdt"];
@@ -99,9 +112,9 @@ function defaultSettings() {
     withdrawal: {
       ngnEnabled: true,
       usdtEnabled: true,
-      minUsdt: getEnvValue("MIN_WITHDRAWAL_USDT") || "1",
+      minUsdt: getEnvValue("MIN_WITHDRAWAL_USDT") || "50",
       maxUsdt: getEnvValue("MAX_WITHDRAWAL_USDT") || "1000000",
-      minNgn: getEnvValue("MIN_WITHDRAWAL_NGN") || "1000",
+      minNgn: getEnvValue("MIN_WITHDRAWAL_NGN") || "500",
       maxNgn: getEnvValue("MAX_WITHDRAWAL_NGN") || "1000000000",
       maxDailyCount: 0,
       maxDailyNgn: getEnvValue("MAX_DAILY_WITHDRAWAL_NGN") || "10000000",
@@ -149,6 +162,7 @@ class FinancialService {
     this.db.transactions = Array.isArray(this.db.transactions) ? this.db.transactions : [];
     this.db.deposits = Array.isArray(this.db.deposits) ? this.db.deposits : [];
     this.db.withdrawals = Array.isArray(this.db.withdrawals) ? this.db.withdrawals : [];
+    this.db.giftCards = Array.isArray(this.db.giftCards) ? this.db.giftCards : [];
     this.db.tradeInvestments = Array.isArray(this.db.tradeInvestments) ? this.db.tradeInvestments : [];
     this.db.notifications = Array.isArray(this.db.notifications) ? this.db.notifications : [];
     this.db.dailyPerformances = Array.isArray(this.db.dailyPerformances) ? this.db.dailyPerformances : [];
@@ -183,6 +197,12 @@ class FinancialService {
         ...(this.db.systemSettings?.trading || {}),
       },
     };
+    if (compare(this.db.systemSettings.withdrawal.minUsdt || "0", MIN_WITHDRAWAL_AMOUNTS.USDT) < 0) {
+      this.db.systemSettings.withdrawal.minUsdt = MIN_WITHDRAWAL_AMOUNTS.USDT;
+    }
+    if (compare(this.db.systemSettings.withdrawal.minNgn || "0", MIN_WITHDRAWAL_AMOUNTS.NGN) < 0) {
+      this.db.systemSettings.withdrawal.minNgn = MIN_WITHDRAWAL_AMOUNTS.NGN;
+    }
 
     for (const user of this.db.users || []) {
       if (user.role === "user") {
@@ -1004,6 +1024,144 @@ class FinancialService {
       return this.updateVerifiedBankAccount(user, input.destination || input, requestMeta);
     }
     throw new Error("Verify the bank account before saving it.");
+  }
+
+  generateGiftCardCode() {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      let code = "";
+      for (let index = 0; index < 14; index += 1) {
+        code += String(crypto.randomInt(0, 10));
+      }
+      if (!this.db.giftCards.some((card) => card.code === code)) {
+        return code;
+      }
+    }
+
+    const fallback = crypto
+      .createHash("sha256")
+      .update(`${this.idGenerator(24)}:${this.clock()}`)
+      .digest("hex")
+      .replace(/\D/g, "")
+      .padEnd(14, "0")
+      .slice(0, 14);
+    return this.db.giftCards.some((card) => card.code === fallback)
+      ? String(Date.now()).slice(-14).padStart(14, "0")
+      : fallback;
+  }
+
+  createGiftCard(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const currency = normalizeCurrency(input.currency || "NGN");
+    const amount = normalizeAmount(input.amount, "Gift card amount");
+    const note = String(input.note || "Netrue Gift Card").trim();
+    const giftCard = {
+      id: this.idGenerator(12),
+      code: this.generateGiftCardCode(),
+      amount,
+      currency,
+      status: "UNUSED",
+      note,
+      createdBy: admin.id,
+      createdAt: this.clock(),
+      redeemedAt: null,
+      redeemedByUserId: "",
+      redeemedByName: "",
+      redeemedByEmail: "",
+      transactionId: "",
+    };
+    this.db.giftCards.unshift(giftCard);
+    this.audit(admin, "GIFT_CARD_CREATED", "GiftCard", giftCard.id, { amount, currency }, requestMeta);
+    this.persist();
+    return clone(giftCard);
+  }
+
+  listGiftCards(admin, { status } = {}) {
+    this.ensureState();
+    if (admin.role !== "admin") {
+      throw new Error("Admin access is required.");
+    }
+    const normalizedStatus = String(status || "").trim().toUpperCase();
+    return this.db.giftCards
+      .filter((card) => !normalizedStatus || String(card.status || "").toUpperCase() === normalizedStatus)
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      .map(clone);
+  }
+
+  redeemGiftCard(user, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const idempotent = this.findIdempotent("gift-card:redeem", user.id, requestMeta.idempotencyKey);
+    if (idempotent) {
+      return idempotent;
+    }
+    if (["SUSPENDED", "BLOCKED"].includes(String(user.status || "").trim().toUpperCase())) {
+      throw new Error("This account cannot redeem gift cards right now.");
+    }
+
+    const code = normalizeGiftCardCode(input.code);
+    const giftCard = this.db.giftCards.find((card) => card.code === code);
+    if (!giftCard) {
+      throw new Error("Gift card not found.");
+    }
+    if (String(giftCard.status || "").toUpperCase() !== "UNUSED") {
+      throw new Error("Gift card has already been used.");
+    }
+
+    const currency = normalizeCurrency(giftCard.currency || "NGN");
+    const amount = normalizeAmount(giftCard.amount, "Gift card amount");
+    const wallet = this.ensureWallet(user.id, currency);
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = add(wallet.availableBalance, amount);
+    wallet.updatedAt = this.clock();
+    const transaction = {
+      id: this.idGenerator(12),
+      userId: user.id,
+      type: "GIFT_CARD",
+      currency,
+      amount,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      reference: giftCard.id,
+      status: "APPROVED",
+      description: "Netrue Gift Card redeemed.",
+      createdBy: user.id,
+      createdAt: this.clock(),
+      metadata: {
+        displayAmounts: this.getDisplayAmounts(amount, currency),
+        giftCardCodeLast4: code.slice(-4),
+        principalCredit: true,
+      },
+    };
+    this.db.transactions.unshift(transaction);
+    giftCard.status = "USED";
+    giftCard.redeemedAt = this.clock();
+    giftCard.redeemedByUserId = user.id;
+    giftCard.redeemedByName = user.name || "";
+    giftCard.redeemedByEmail = user.email || "";
+    giftCard.transactionId = transaction.id;
+    this.createNotification({
+      userId: user.id,
+      type: "GIFT_CARD",
+      title: "Gift card redeemed",
+      message: `${amount} ${currency} added to your wallet.`,
+      entityType: "GiftCard",
+      entityId: giftCard.id,
+    });
+    this.notifyAdmins({
+      type: "GIFT_CARD",
+      title: "Gift card used",
+      message: `${user.name || "User"} redeemed ${amount} ${currency}.`,
+      entityType: "GiftCard",
+      entityId: giftCard.id,
+    });
+    this.audit(user, "GIFT_CARD_REDEEMED", "GiftCard", giftCard.id, { amount, currency }, requestMeta);
+    const response = {
+      giftCard: clone(giftCard),
+      transaction: clone(transaction),
+      dashboard: this.getDashboard(user),
+    };
+    this.saveIdempotent("gift-card:redeem", user.id, requestMeta.idempotencyKey, response);
+    this.persist();
+    return response;
   }
 
   addBonus(admin, userId, input = {}, requestMeta = {}) {
@@ -2022,7 +2180,9 @@ class FinancialService {
     if (currency === "NGN" && !settings.ngnEnabled) {
       throw new Error("NGN withdrawals are currently disabled.");
     }
-    const min = currency === "USDT" ? settings.minUsdt : settings.minNgn;
+    const configuredMin = currency === "USDT" ? settings.minUsdt : settings.minNgn;
+    const requiredMin = MIN_WITHDRAWAL_AMOUNTS[currency] || configuredMin;
+    const min = compare(configuredMin || "0", requiredMin) > 0 ? configuredMin : requiredMin;
     const max = currency === "USDT" ? settings.maxUsdt : settings.maxNgn;
     if (compare(amount, min) < 0 || compare(amount, max) > 0) {
       throw new Error(`Withdrawal amount must be between ${min} and ${max} ${currency}.`);

@@ -4842,6 +4842,24 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/gift-cards/redeem") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "gift-card-redeem")) {
+      sendJson(res, 429, { error: "Too many gift card attempts. Please try again shortly." });
+      return true;
+    }
+    try {
+      const result = financialService.redeemGiftCard(user, await readBody(req), getRequestMeta(req));
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/deposits") {
     const user = requireAuth(req, res);
     if (!user) {
@@ -5141,6 +5159,33 @@ async function handleApi(req, res, url) {
       return true;
     }
     sendJson(res, 200, { transactions: financialService.listTransactions(admin, { limit: 500 }) });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/gift-cards") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      sendJson(res, 200, { giftCards: financialService.listGiftCards(admin, { status: url.searchParams.get("status") }) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/gift-cards") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const giftCard = financialService.createGiftCard(admin, await readBody(req), getRequestMeta(req));
+      sendJson(res, 201, { giftCard });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
