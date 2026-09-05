@@ -1285,10 +1285,15 @@ function writeSse(res, payload) {
 
 function getSession(req) {
   const cookies = parseCookies(req);
-  if (!cookies.sid) {
+  const authorizationHeader = String(req.headers.authorization || "").trim();
+  const bearerSessionId = authorizationHeader.toLowerCase().startsWith("bearer ")
+    ? authorizationHeader.slice(7).trim()
+    : "";
+  const sessionId = cookies.sid || bearerSessionId;
+  if (!sessionId) {
     return null;
   }
-  const session = db.sessions.find((item) => item.id === cookies.sid);
+  const session = db.sessions.find((item) => item.id === sessionId);
   if (!session) {
     return null;
   }
@@ -3424,9 +3429,12 @@ function normalizeOrderInput(body) {
   const symbol = String(body.symbol || "").trim().toUpperCase();
   const side = String(body.side || "").trim().toUpperCase();
   const type = String(body.type || "").trim().toUpperCase();
-  const timeInForce = String(body.timeInForce || "GTC").trim().toUpperCase();
+  const rawTimeInForce = String(body.timeInForce || (type === "LIMIT" ? "POST_ONLY" : "GTC")).trim().toUpperCase();
+  const timeInForce = ["POSTONLY", "POST_ONLY", "MAKER_ONLY", "LIMIT_MAKER"].includes(rawTimeInForce)
+    ? "POST_ONLY"
+    : rawTimeInForce;
   const quantity = body.quantity ? String(body.quantity).trim() : "";
-  const quoteOrderQty = body.quoteOrderQty ? String(body.quoteOrderQty).trim() : "";
+  const quoteOrderQty = type === "LIMIT" ? "" : body.quoteOrderQty ? String(body.quoteOrderQty).trim() : "";
   const price = body.price ? String(body.price).trim() : "";
   const takeProfitPrice = body.takeProfitPrice ? String(body.takeProfitPrice).trim() : "";
 
@@ -4713,7 +4721,7 @@ async function handleApi(req, res, url) {
     const remember = parseBooleanFlag(body.remember, false);
     const session = createSession(user.id, { remember });
     sendSessionCookie(req, res, session.id, { remember });
-    sendJson(res, 201, { user: sanitizeUser(user) });
+    sendJson(res, 201, { user: sanitizeUser(user), sessionToken: session.id });
     return true;
   }
 
@@ -4751,7 +4759,7 @@ async function handleApi(req, res, url) {
     financialService.audit(user, user.role === "admin" ? "ADMIN_LOGIN" : "USER_LOGIN", "User", user.id, {}, getRequestMeta(req));
     persist();
     sendSessionCookie(req, res, session.id, { remember });
-    sendJson(res, 200, { user: sanitizeUser(user) });
+    sendJson(res, 200, { user: sanitizeUser(user), sessionToken: session.id });
     return true;
   }
 
