@@ -47,6 +47,7 @@ const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { emitOrderExecuted, orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
+const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
 const { TradeLearningService } = require("./services/tradeLearning");
@@ -115,6 +116,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 let db = null;
 let financialService = null;
+let questService = null;
 const loginAttemptBuckets = new Map();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
@@ -4906,6 +4908,77 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && (url.pathname === "/api/quest/available" || url.pathname === "/api/quest/my-status")) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      sendJson(res, 200, questService.getUserStatus(user));
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const questStartMatch = url.pathname.match(/^\/api\/quest\/([^/]+)\/start$/);
+  if (req.method === "POST" && questStartMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const result = questService.startQuest(user, decodeURIComponent(questStartMatch[1] || ""), getRequestMeta(req));
+      sendJson(res, 201, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const questSessionActionMatch = url.pathname.match(/^\/api\/quest\/session\/([^/]+)\/(answer|complete|reveal|redeem)$/);
+  if (req.method === "POST" && questSessionActionMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const sessionId = decodeURIComponent(questSessionActionMatch[1] || "");
+      const action = questSessionActionMatch[2];
+      const body = action === "answer" ? await readBody(req) : {};
+      const meta = getRequestMeta(req);
+      const result = action === "answer"
+        ? questService.answerStage(user, sessionId, body, meta)
+        : action === "complete"
+          ? questService.completeQuest(user, sessionId, meta)
+          : action === "reveal"
+            ? questService.revealReward(user, sessionId, meta)
+            : questService.redeemReward(user, sessionId, meta);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/quest/history") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    sendJson(res, 200, { history: questService.listHistory(user) });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/quest/rewards") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    sendJson(res, 200, { rewards: questService.listRewards(user) });
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/deposits") {
     const user = requireAuth(req, res);
     if (!user) {
@@ -5228,7 +5301,100 @@ async function handleApi(req, res, url) {
     }
     try {
       const giftCard = financialService.createGiftCard(admin, await readBody(req), getRequestMeta(req));
+      if (giftCard.isQuestReward) {
+        questService.syncQuestAvailability(admin, getRequestMeta(req));
+      }
       sendJson(res, 201, { giftCard });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/quests") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      sendJson(res, 200, {
+        quests: questService.listAdminQuests(admin),
+        rewardVault: questService.getRewardVaultStatus(admin),
+        statistics: questService.getQuestStats(admin),
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/quests") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const quest = questService.createQuest(admin, await readBody(req), getRequestMeta(req));
+      sendJson(res, 201, { quest });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminQuestDetailMatch = url.pathname.match(/^\/api\/admin\/quests\/([^/]+)$/);
+  if (adminQuestDetailMatch && ["GET", "PUT", "DELETE"].includes(req.method)) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const questId = decodeURIComponent(adminQuestDetailMatch[1] || "");
+      if (req.method === "GET") {
+        sendJson(res, 200, { quest: questService.getAdminQuest(admin, questId) });
+        return true;
+      }
+      if (req.method === "DELETE") {
+        sendJson(res, 200, questService.deleteQuest(admin, questId, getRequestMeta(req)));
+        return true;
+      }
+      sendJson(res, 200, { quest: questService.updateQuest(admin, questId, await readBody(req), getRequestMeta(req)) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminQuestActionMatch = url.pathname.match(/^\/api\/admin\/quests\/([^/]+)\/(activate|disable|duplicate|statistics)$/);
+  if (adminQuestActionMatch && ["GET", "POST"].includes(req.method)) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const questId = decodeURIComponent(adminQuestActionMatch[1] || "");
+      const action = adminQuestActionMatch[2];
+      if (action === "statistics") {
+        sendJson(res, 200, { statistics: questService.getQuestStats(admin, questId) });
+        return true;
+      }
+      const quest = action === "duplicate"
+        ? questService.duplicateQuest(admin, questId, getRequestMeta(req))
+        : questService.setQuestActive(admin, questId, action === "activate", getRequestMeta(req));
+      sendJson(res, 200, { quest });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/quest-rewards/status") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      sendJson(res, 200, { rewardVault: questService.getRewardVaultStatus(admin) });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -7005,6 +7171,8 @@ async function startServer() {
   ensureAdminUser(db);
   financialService = new FinancialService({ db, persist });
   financialService.ensureState();
+  questService = new QuestService({ db, financialService, persist });
+  questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));
   await tradeLearningService.init();
   await signalEngine.setTimeframe(db.meta?.signalTimeframe, { scan: false }).catch(async () => {

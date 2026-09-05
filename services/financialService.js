@@ -57,6 +57,14 @@ function normalizeGiftCardCode(value) {
   return code;
 }
 
+function normalizeGiftCardPin(value) {
+  const pin = String(value || "").replace(/\D/g, "").trim();
+  if (pin && !/^\d{4,8}$/.test(pin)) {
+    throw new Error("Enter a valid gift card PIN.");
+  }
+  return pin;
+}
+
 const LEGACY_USDT_BALANCE_FIELDS = ["usdtBalance", "balanceUsdt", "availableUsdt", "availableBalanceUsdt"];
 const LEGACY_NGN_BALANCE_FIELDS = ["ngnBalance", "nairaBalance", "balanceNgn", "availableNgn", "availableBalanceNgn"];
 const LEGACY_GENERIC_BALANCE_FIELDS = ["balance", "availableBalance", "accountBalance", "walletBalance"];
@@ -1049,18 +1057,33 @@ class FinancialService {
       : fallback;
   }
 
+  generateGiftCardPin() {
+    return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  }
+
   createGiftCard(admin, input = {}, requestMeta = {}) {
     this.ensureState();
     const currency = normalizeCurrency(input.currency || "NGN");
     const amount = normalizeAmount(input.amount, "Gift card amount");
     const note = String(input.note || "Netrue Gift Card").trim();
+    const isQuestReward = input.isQuestReward === true || String(input.rewardPool || "").trim().toLowerCase() === "quest";
     const giftCard = {
       id: this.idGenerator(12),
       code: this.generateGiftCardCode(),
+      pin: this.generateGiftCardPin(),
       amount,
       currency,
       status: "UNUSED",
       note,
+      rewardPool: isQuestReward ? "quest" : "standard",
+      isQuestReward,
+      assignedTo: "",
+      assignedToName: "",
+      assignedToEmail: "",
+      assignedAt: null,
+      revealedAt: null,
+      questId: "",
+      questSessionId: "",
       createdBy: admin.id,
       createdAt: this.clock(),
       redeemedAt: null,
@@ -1102,8 +1125,18 @@ class FinancialService {
     if (!giftCard) {
       throw new Error("Gift card not found.");
     }
-    if (String(giftCard.status || "").toUpperCase() !== "UNUSED") {
+    const cardStatus = String(giftCard.status || "").toUpperCase();
+    const assignedTo = String(giftCard.assignedTo || "").trim();
+    if (["ASSIGNED", "REVEALED"].includes(cardStatus)) {
+      if (!assignedTo || assignedTo !== user.id) {
+        throw new Error("Gift card has already been assigned.");
+      }
+    } else if (cardStatus !== "UNUSED") {
       throw new Error("Gift card has already been used.");
+    }
+    const pin = normalizeGiftCardPin(input.pin);
+    if (pin && giftCard.pin && pin !== String(giftCard.pin)) {
+      throw new Error("Gift card PIN is incorrect.");
     }
 
     const currency = normalizeCurrency(giftCard.currency || "NGN");
