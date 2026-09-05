@@ -713,6 +713,70 @@ test("NGN withdrawal can reserve USDT equivalent when naira wallet is short", ()
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "5");
 });
 
+test("NGN withdrawal is clear when bank account name matches first and last name", () => {
+  const { service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  setWallet(service, user.id, "NGN", "50000");
+  service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "ADA CHUKWU USER",
+  });
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+  });
+
+  assert.equal(withdrawal.fraudReview.status, "CLEAR");
+  assert.equal(user.fraudReview, undefined);
+});
+
+test("NGN withdrawal is flagged when bank account name does not match user names", () => {
+  const { db, service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  const relatedUser = {
+    id: "user-copy",
+    name: "Ada User",
+    firstName: "Ada",
+    lastName: "User",
+    email: "copy@example.com",
+    role: "user",
+    bankAccounts: [
+      {
+        id: "bank-copy",
+        bankName: "Test Bank",
+        bankCode: "058",
+        accountNumber: "2222222222",
+        accountName: "OTHER NAME",
+        verified: true,
+      },
+    ],
+  };
+  db.users.push(relatedUser);
+  setWallet(service, user.id, "NGN", "50000");
+  service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "2222222222",
+    accountName: "OTHER NAME",
+  });
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+  });
+
+  assert.equal(withdrawal.fraudReview.status, "SUSPICIOUS");
+  assert.equal(withdrawal.fraudReview.reason, "BANK_NAME_MISMATCH");
+  assert.deepEqual(withdrawal.fraudReview.relatedUserIds, ["user-copy"]);
+  assert.equal(user.fraudReview.status, "SUSPICIOUS");
+  assert.equal(relatedUser.fraudReview.status, "SUSPICIOUS");
+});
+
 test("notification can be marked as read by owner", () => {
   const { service, user } = createHarness();
   const notification = service.createNotification({

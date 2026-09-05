@@ -65,6 +65,36 @@ function normalizeGiftCardPin(value) {
   return pin;
 }
 
+function normalizeNameToken(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function getUserFirstLastName(user = {}) {
+  const fullNameTokens = normalizeNameToken(user.name);
+  const firstName = normalizeNameToken(user.firstName)[0] || fullNameTokens[0] || "";
+  const lastName = normalizeNameToken(user.lastName)[0] || fullNameTokens[fullNameTokens.length - 1] || "";
+  return { firstName, lastName };
+}
+
+function getNormalizedFullName(user = {}) {
+  const { firstName, lastName } = getUserFirstLastName(user);
+  return [firstName, lastName].filter(Boolean).join(" ");
+}
+
+function bankAccountNameMatchesUser(user = {}, bank = {}) {
+  const { firstName, lastName } = getUserFirstLastName(user);
+  const accountTokens = new Set(normalizeNameToken(bank.accountName));
+  if (!firstName || !lastName || firstName === lastName) {
+    return false;
+  }
+  return accountTokens.has(firstName) && accountTokens.has(lastName);
+}
+
 const LEGACY_USDT_BALANCE_FIELDS = ["usdtBalance", "balanceUsdt", "availableUsdt", "availableBalanceUsdt"];
 const LEGACY_NGN_BALANCE_FIELDS = ["ngnBalance", "nairaBalance", "balanceNgn", "availableNgn", "availableBalanceNgn"];
 const LEGACY_GENERIC_BALANCE_FIELDS = ["balance", "availableBalance", "accountBalance", "walletBalance"];
@@ -1370,6 +1400,62 @@ class FinancialService {
     return sources;
   }
 
+  findRelatedFraudReviewUsers(user, bank = {}) {
+    const normalizedName = getNormalizedFullName(user);
+    const accountNumber = String(bank.accountNumber || "").trim();
+    const bankCode = String(bank.bankCode || "").trim();
+    return (this.db.users || [])
+      .filter((item) => item.role === "user" && item.id !== user.id)
+      .filter((item) => {
+        const sameName = normalizedName && getNormalizedFullName(item) === normalizedName;
+        const accounts = [
+          ...(Array.isArray(item.bankAccounts) ? item.bankAccounts : []),
+          item.bankAccount,
+        ].filter(Boolean);
+        const sameBank = accountNumber && accounts.some((account) =>
+          String(account.accountNumber || "").trim() === accountNumber &&
+          (!bankCode || String(account.bankCode || "").trim() === bankCode)
+        );
+        return sameName || sameBank;
+      })
+      .map((item) => item.id);
+  }
+
+  createWithdrawalFraudReview(user, bank = {}, currency = "NGN", amount = "0") {
+    const nameMatched = currency !== "NGN" || bankAccountNameMatchesUser(user, bank);
+    const relatedUserIds = nameMatched ? [] : this.findRelatedFraudReviewUsers(user, bank);
+    const now = this.clock();
+    const review = {
+      status: nameMatched ? "CLEAR" : "SUSPICIOUS",
+      reason: nameMatched ? "" : "BANK_NAME_MISMATCH",
+      expectedFirstName: getUserFirstLastName(user).firstName,
+      expectedLastName: getUserFirstLastName(user).lastName,
+      accountName: bank.accountName || "",
+      accountNumberLast4: String(bank.accountNumber || "").slice(-4),
+      relatedUserIds,
+      flaggedAt: nameMatched ? null : now,
+      reviewedAt: null,
+      reviewedBy: "",
+    };
+    if (!nameMatched) {
+      const flaggedUsers = [user.id, ...relatedUserIds];
+      for (const targetUser of this.db.users.filter((item) => flaggedUsers.includes(item.id))) {
+        targetUser.fraudReview = {
+          status: "SUSPICIOUS",
+          reason: targetUser.id === user.id ? "BANK_NAME_MISMATCH" : "RELATED_BANK_OR_NAME_MATCH",
+          relatedWithdrawalAmount: amount,
+          relatedWithdrawalCurrency: currency,
+          sourceUserId: user.id,
+          accountName: bank.accountName || "",
+          accountNumberLast4: String(bank.accountNumber || "").slice(-4),
+          flaggedAt: targetUser.fraudReview?.flaggedAt || now,
+          updatedAt: now,
+        };
+      }
+    }
+    return review;
+  }
+
   createWithdrawal(user, input = {}, requestMeta = {}) {
     this.ensureState();
     const idempotent = this.findIdempotent("withdrawal:create", user.id, requestMeta.idempotencyKey);
@@ -1420,6 +1506,7 @@ class FinancialService {
     if (currency !== "NGN") {
       destination = this.normalizeWithdrawalDestination(currency, input.destination || input);
     }
+    const fraudReview = this.createWithdrawalFraudReview(user, bank || {}, currency, amount);
     const paystackReference = currency === "NGN" ? this.createPaystackReference() : "";
     const withdrawal = {
       id: this.idGenerator(12),
@@ -1455,7 +1542,10 @@ class FinancialService {
       })),
       externalTransactionReference: paystackReference,
       adminNote: "",
-      metadata: {},
+      fraudReview,
+      metadata: {
+        fraudReviewStatus: fraudReview.status,
+      },
     };
 
     for (const source of fundingSources) {
@@ -1487,9 +1577,11 @@ class FinancialService {
     }
     this.db.withdrawals.unshift(withdrawal);
     this.notifyAdmins({
-      type: "WITHDRAWAL_REQUEST",
-      title: "New Withdrawal Request",
-      message: `${user.name || "User"} requested ${amount} ${currency}.`,
+      type: fraudReview.status === "SUSPICIOUS" ? "WITHDRAWAL_FRAUD_REVIEW" : "WITHDRAWAL_REQUEST",
+      title: fraudReview.status === "SUSPICIOUS" ? "Suspicious Withdrawal" : "New Withdrawal Request",
+      message: fraudReview.status === "SUSPICIOUS"
+        ? `${user.name || "User"} requested ${amount} ${currency} with a bank name mismatch.`
+        : `${user.name || "User"} requested ${amount} ${currency}.`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
@@ -1501,7 +1593,7 @@ class FinancialService {
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
-    this.audit(user, "WITHDRAWAL_CREATED", "Withdrawal", withdrawal.id, { amount, currency }, requestMeta);
+    this.audit(user, "WITHDRAWAL_CREATED", "Withdrawal", withdrawal.id, { amount, currency, fraudReviewStatus: fraudReview.status }, requestMeta);
     this.saveIdempotent("withdrawal:create", user.id, requestMeta.idempotencyKey, withdrawal);
     this.persist();
     return clone(withdrawal);

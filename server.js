@@ -1233,6 +1233,39 @@ function getSignupEmail(name, email) {
   return normalizeEmailAddress(email);
 }
 
+function normalizePersonNamePart(value, label) {
+  const cleaned = String(value || "")
+    .replace(/[^a-zA-Z\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned || cleaned.length < 2) {
+    throw new Error(`${label} is required.`);
+  }
+  return cleaned;
+}
+
+function buildSignupName(body = {}) {
+  const legacyName = String(body.name || "").replace(/\s+/g, " ").trim();
+  const firstName = normalizePersonNamePart(body.firstName || legacyName.split(" ")[0], "First name");
+  const lastName = normalizePersonNamePart(
+    body.lastName || legacyName.split(" ").slice(1).join(" "),
+    "Last name"
+  );
+  return {
+    firstName,
+    lastName,
+    name: `${firstName} ${lastName}`.replace(/\s+/g, " ").trim(),
+  };
+}
+
+function normalizeIdentityText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function findUserByLogin(login) {
   const normalized = String(login || "").trim().toLowerCase();
   return db.users.find(
@@ -4490,7 +4523,7 @@ async function autoPlaceTakeProfit(trade, options = {}) {
 
 function isSecureRequest(req) {
   const forwardedProto = String(req.headers["x-forwarded-proto"] || "").toLowerCase();
-  return forwardedProto.includes("https");
+  return forwardedProto.includes("https") || !!req.socket?.encrypted;
 }
 
 function shouldUseCrossSiteCookie(req) {
@@ -4500,7 +4533,7 @@ function shouldUseCrossSiteCookie(req) {
   }
 
   const requestOrigin = normalizeOrigin(`${isSecureRequest(req) ? "https" : "http"}://${req.headers.host || ""}`);
-  return origin !== requestOrigin && isSecureRequest(req);
+  return origin !== requestOrigin && /^https:\/\//i.test(origin);
 }
 
 function buildSessionCookie(req, value, maxAgeSeconds = null) {
@@ -4519,7 +4552,7 @@ function buildSessionCookie(req, value, maxAgeSeconds = null) {
     parts.push(`Expires=${new Date(Date.now() + maxAgeSeconds * 1000).toUTCString()}`);
   }
 
-  if (isSecureRequest(req)) {
+  if (isSecureRequest(req) || shouldUseCrossSiteCookie(req)) {
     parts.push("Secure");
   }
 
@@ -4610,12 +4643,19 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/auth/register") {
     const body = await readBody(req);
     const password = String(body.password || "");
-    const name = String(body.name || "").trim();
     const role = normalizeAuthRole(body.role, "user");
     const exchange = normalizeExchange(body.exchange, "bybit");
+    let identity;
+    try {
+      identity = buildSignupName(body);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+      return true;
+    }
+    const { firstName, lastName, name } = identity;
 
-    if (!password || !name) {
-      sendJson(res, 400, { error: "Name and password are required." });
+    if (!password) {
+      sendJson(res, 400, { error: "Password is required." });
       return true;
     }
     let email;
@@ -4629,14 +4669,17 @@ async function handleApi(req, res, url) {
       sendJson(res, 403, { error: "Admin signup is disabled. Sign in with an existing admin account." });
       return true;
     }
-    if (
-      db.users.some(
-        (user) =>
-          String(user.email || "").trim().toLowerCase() === email ||
-          String(user.name || "").trim().toLowerCase() === name.toLowerCase()
-      )
-    ) {
-      sendJson(res, 409, { error: "That account name is already registered." });
+    const normalizedName = normalizeIdentityText(name);
+    const existingIdentity = db.users.find((user) =>
+      String(user.email || "").trim().toLowerCase() === email &&
+      normalizeIdentityText(user.name || `${user.firstName || ""} ${user.lastName || ""}`) === normalizedName
+    );
+    if (existingIdentity) {
+      sendJson(res, 409, { error: "That email and full name are already registered." });
+      return true;
+    }
+    if (db.users.some((user) => String(user.email || "").trim().toLowerCase() === email)) {
+      sendJson(res, 409, { error: "That email is already registered." });
       return true;
     }
 
@@ -4645,6 +4688,8 @@ async function handleApi(req, res, url) {
       id: randomId(12),
       email,
       name,
+      firstName,
+      lastName,
       role,
       mirrorEnabled: role === "user",
       passwordSalt: salt,
