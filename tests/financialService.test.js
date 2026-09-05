@@ -727,6 +727,20 @@ test("notification can be marked as read by owner", () => {
   assert.equal(service.listNotifications(user)[0].readAt, read.readAt);
 });
 
+test("user support message creates admin notification", () => {
+  const { admin, service, user } = createHarness();
+
+  const notifications = service.sendSupportMessage(user, {
+    message: "Please check my withdrawal.",
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].userId, admin.id);
+  assert.equal(notifications[0].type, "MESSAGE");
+  assert.match(notifications[0].message, /Ada User/);
+  assert.match(service.listNotifications(admin)[0].message, /withdrawal/);
+});
+
 test("admin can delete selected finance history records", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

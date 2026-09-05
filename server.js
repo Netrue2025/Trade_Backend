@@ -4707,6 +4707,50 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/user/password") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const currentPassword = String(body.currentPassword || "");
+      const newPassword = String(body.newPassword || "").trim();
+      if (!verifyPassword(currentPassword, user.passwordSalt, user.passwordHash)) {
+        sendJson(res, 401, { error: "Current password is incorrect." });
+        return true;
+      }
+      if (newPassword.length < 6) {
+        sendJson(res, 400, { error: "New password must be at least 6 characters long." });
+        return true;
+      }
+      const { salt, hash } = hashPassword(newPassword);
+      user.passwordSalt = salt;
+      user.passwordHash = hash;
+      financialService.audit(user, "PASSWORD_CHANGED", "User", user.id, {}, getRequestMeta(req));
+      persist();
+      sendJson(res, 200, { ok: true });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/support/messages") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const notifications = financialService.sendSupportMessage(user, await readBody(req), getRequestMeta(req));
+      scheduleSettingsUsersBroadcast("support_message_sent");
+      sendJson(res, 201, { notifications });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/user/dashboard") {
     const user = requireAuth(req, res, "user");
     if (!user) {

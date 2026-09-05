@@ -1287,6 +1287,32 @@ class FinancialService {
     return clone(notification);
   }
 
+  sendSupportMessage(user, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (!user || user.role !== "user") {
+      throw new Error("Only users can send support messages.");
+    }
+    const message = String(input.message || "").trim();
+    if (!message) {
+      throw new Error("Message is required.");
+    }
+    const title = String(input.title || "Support message").trim() || "Support message";
+    const notifications = [];
+    for (const admin of this.db.users.filter((item) => item.role === "admin")) {
+      notifications.push(this.createNotification({
+        userId: admin.id,
+        type: "MESSAGE",
+        title,
+        message: `${user.name || user.email || "User"}: ${message}`,
+        entityType: "User",
+        entityId: user.id,
+      }));
+    }
+    this.audit(user, "SUPPORT_MESSAGE_SENT", "User", user.id, { count: notifications.length }, requestMeta);
+    this.persist();
+    return notifications.map((notification) => clone(notification));
+  }
+
   resolveWithdrawalFunding(userId, currency, amount) {
     const primaryWallet = this.ensureWallet(userId, currency);
     if (compare(primaryWallet.availableBalance, amount) >= 0) {
