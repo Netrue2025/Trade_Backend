@@ -86,13 +86,39 @@ function getNormalizedFullName(user = {}) {
   return [firstName, lastName].filter(Boolean).join(" ");
 }
 
-function bankAccountNameMatchesUser(user = {}, bank = {}) {
+function getBankAccountNameMatchDetails(user = {}, bank = {}) {
   const { firstName, lastName } = getUserFirstLastName(user);
   const accountTokens = new Set(normalizeNameToken(bank.accountName));
-  if (!firstName || !lastName || firstName === lastName) {
-    return false;
+  const expectedTokens = [...new Set([firstName, lastName].filter(Boolean))];
+  const matchedTokens = expectedTokens.filter((token) => accountTokens.has(token));
+  return {
+    expectedFirstName: firstName,
+    expectedLastName: lastName,
+    expectedName: [firstName, lastName].filter(Boolean).join(" "),
+    accountName: bank.accountName || "",
+    matchedTokens,
+    matchedCount: matchedTokens.length,
+    requiredCount: 2,
+    matches: expectedTokens.length >= 2 && matchedTokens.length >= 2,
+  };
+}
+
+function getBankNameMismatchWarning() {
+  return "Resolved account name does not match your registered name. Please use a bank account with the same first and last name or your withdrawal may be rejected and your account may be blocked.";
+}
+
+function bankAccountNameMatchesUser(user = {}, bank = {}) {
+  return getBankAccountNameMatchDetails(user, bank).matches;
+}
+
+function addMapSet(map, key, value) {
+  if (!key) {
+    return;
   }
-  return accountTokens.has(firstName) && accountTokens.has(lastName);
+  if (!map.has(key)) {
+    map.set(key, new Set());
+  }
+  map.get(key).add(value);
 }
 
 const LEGACY_USDT_BALANCE_FIELDS = ["usdtBalance", "balanceUsdt", "availableUsdt", "availableBalanceUsdt"];
@@ -406,6 +432,7 @@ class FinancialService {
     if (!bankName || !bankCode || !accountName || !/^\d{10}$/.test(accountNumber)) {
       throw new Error("A verified Nigerian bank account is required.");
     }
+    const nameMatch = input.nameMatch === undefined ? undefined : !!input.nameMatch;
     return {
       id: String(input.id || this.idGenerator(12)).trim(),
       type: "NGN_BANK",
@@ -414,10 +441,26 @@ class FinancialService {
       accountNumber,
       maskedAccountNumber: maskAccountNumber(accountNumber),
       accountName,
+      ...(nameMatch === undefined
+        ? {}
+        : {
+            nameMatch,
+            nameMatchWarning: nameMatch ? "" : getBankNameMismatchWarning(),
+            matchedNameCount: Number(input.matchedNameCount || 0),
+            expectedName: String(input.expectedName || "").trim(),
+          }),
       paystackRecipientCode: String(input.paystackRecipientCode || input.recipientCode || "").trim(),
       verified: input.verified !== false,
       verifiedAt: input.verifiedAt || this.clock(),
       updatedAt: this.clock(),
+    };
+  }
+
+  evaluateBankAccountNameMatch(user, bank = {}) {
+    const details = getBankAccountNameMatchDetails(user, bank);
+    return {
+      ...details,
+      warning: details.matches ? "" : getBankNameMismatchWarning(),
     };
   }
 
@@ -438,7 +481,14 @@ class FinancialService {
 
   updateVerifiedBankAccount(user, input = {}, requestMeta = {}) {
     this.ensureState();
-    const bankAccount = this.normalizeBankAccount({ ...input, verified: true });
+    const nameMatch = this.evaluateBankAccountNameMatch(user, input);
+    const bankAccount = this.normalizeBankAccount({
+      ...input,
+      verified: true,
+      nameMatch: nameMatch.matches,
+      matchedNameCount: nameMatch.matchedCount,
+      expectedName: nameMatch.expectedName,
+    });
     user.bankAccount = bankAccount;
     user.bankAccounts = Array.isArray(user.bankAccounts) ? user.bankAccounts : [];
     user.bankAccounts = [
@@ -451,6 +501,7 @@ class FinancialService {
       bankName: bankAccount.bankName,
       bankCode: bankAccount.bankCode,
       maskedAccountNumber: bankAccount.maskedAccountNumber,
+      nameMatch: bankAccount.nameMatch,
     }, requestMeta);
     this.persist();
     return clone(bankAccount);
@@ -566,10 +617,10 @@ class FinancialService {
       .map((item) => this.enrichUserRecord(item));
   }
 
-  listNotifications(user, { limit = 20 } = {}) {
+  listNotifications(user, { limit = 20, includeRead = true } = {}) {
     this.ensureState();
     return this.db.notifications
-      .filter((item) => item.userId === user.id)
+      .filter((item) => item.userId === user.id && (includeRead || !item.readAt))
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(0, limit)
       .map((item) => this.enrichUserRecord(item));
@@ -606,6 +657,132 @@ class FinancialService {
     for (const admin of this.db.users.filter((user) => user.role === "admin")) {
       this.createNotification({ ...input, userId: admin.id });
     }
+  }
+
+  scanDuplicateUserReviews({ persistChanges = true } = {}) {
+    this.ensureState();
+    const users = (this.db.users || []).filter((user) => user.role === "user");
+    const emailMap = new Map();
+    const nameMap = new Map();
+    const bankMap = new Map();
+    const reasonsByUser = new Map();
+
+    const addReason = (userId, reason, relatedUserIds = []) => {
+      if (!userId) {
+        return;
+      }
+      if (!reasonsByUser.has(userId)) {
+        reasonsByUser.set(userId, { reasons: new Set(), relatedUserIds: new Set() });
+      }
+      const bucket = reasonsByUser.get(userId);
+      bucket.reasons.add(reason);
+      relatedUserIds.forEach((id) => {
+        if (id && id !== userId) {
+          bucket.relatedUserIds.add(id);
+        }
+      });
+    };
+
+    users.forEach((user) => {
+      addMapSet(emailMap, String(user.email || "").trim().toLowerCase(), user.id);
+      addMapSet(nameMap, getNormalizedFullName(user), user.id);
+      [
+        ...(Array.isArray(user.bankAccounts) ? user.bankAccounts : []),
+        user.bankAccount,
+      ]
+        .filter(Boolean)
+        .forEach((account) => {
+          const accountNumber = String(account.accountNumber || "").replace(/\D/g, "").trim();
+          const bankCode = String(account.bankCode || "").trim();
+          addMapSet(bankMap, accountNumber ? `${bankCode}:${accountNumber}` : "", user.id);
+        });
+    });
+
+    for (const ids of emailMap.values()) {
+      if (ids.size > 1) {
+        const related = [...ids];
+        related.forEach((id) => addReason(id, "DUPLICATE_EMAIL", related));
+      }
+    }
+    for (const ids of nameMap.values()) {
+      if (ids.size > 1) {
+        const related = [...ids];
+        related.forEach((id) => addReason(id, "DUPLICATE_FULL_NAME", related));
+      }
+    }
+    for (const ids of bankMap.values()) {
+      if (ids.size > 1) {
+        const related = [...ids];
+        related.forEach((id) => addReason(id, "DUPLICATE_BANK_ACCOUNT", related));
+      }
+    }
+
+    for (let index = 0; index < users.length; index += 1) {
+      const left = users[index];
+      const leftTokens = new Set(normalizeNameToken(`${left.firstName || ""} ${left.lastName || ""} ${left.name || ""}`));
+      for (let nextIndex = index + 1; nextIndex < users.length; nextIndex += 1) {
+        const right = users[nextIndex];
+        const rightTokens = new Set(normalizeNameToken(`${right.firstName || ""} ${right.lastName || ""} ${right.name || ""}`));
+        const shared = [...leftTokens].filter((token) => rightTokens.has(token));
+        if (shared.length >= 2 && getNormalizedFullName(left) !== getNormalizedFullName(right)) {
+          addReason(left.id, "SIMILAR_NAME", [right.id]);
+          addReason(right.id, "SIMILAR_NAME", [left.id]);
+        }
+      }
+    }
+
+    let flaggedCount = 0;
+    const now = this.clock();
+    for (const user of users) {
+      const currentStatus = String(user.fraudReview?.status || "").trim().toUpperCase();
+      if (currentStatus === "CLEARED") {
+        continue;
+      }
+      const duplicateReview = reasonsByUser.get(user.id);
+      if (!duplicateReview) {
+        continue;
+      }
+      user.fraudReview = {
+        ...(user.fraudReview || {}),
+        status: "SUSPICIOUS",
+        reason: "DUPLICATE_ACCOUNT_REVIEW",
+        reasons: [...duplicateReview.reasons],
+        relatedUserIds: [...duplicateReview.relatedUserIds],
+        flaggedAt: user.fraudReview?.flaggedAt || now,
+        updatedAt: now,
+      };
+      flaggedCount += 1;
+    }
+
+    if (flaggedCount && persistChanges) {
+      this.persist();
+    }
+
+    return {
+      flaggedCount,
+      reviewedCount: users.length,
+    };
+  }
+
+  clearUserFraudReview(admin, userId, requestMeta = {}) {
+    this.ensureState();
+    const targetUser = this.db.users.find((user) => user.id === userId && user.role === "user");
+    if (!targetUser) {
+      throw new Error("User not found.");
+    }
+    targetUser.fraudReview = {
+      status: "CLEARED",
+      reason: "",
+      reasons: [],
+      relatedUserIds: [],
+      reviewedAt: this.clock(),
+      reviewedBy: admin.id,
+      clearedAt: this.clock(),
+      updatedAt: this.clock(),
+    };
+    this.audit(admin, "USER_FRAUD_REVIEW_CLEARED", "User", targetUser.id, {}, requestMeta);
+    this.persist();
+    return clone(targetUser.fraudReview);
   }
 
   getDashboard(user) {
@@ -657,7 +834,7 @@ class FinancialService {
       },
       recentTransactions: this.getTransactions(user.id, { limit: 10 }),
       walletHistory: this.getWalletHistory(user, { limit: 80 }),
-      notifications: this.listNotifications(user, { limit: 12 }),
+      notifications: this.listNotifications(user, { limit: 12, includeRead: false }),
       settings: {
         deposit: clone(this.db.systemSettings.deposit),
         withdrawal: clone(this.db.systemSettings.withdrawal),
@@ -2161,7 +2338,7 @@ class FinancialService {
       totalUserBalance: walletTotals,
       pendingDeposits: this.db.deposits.filter((deposit) => deposit.status === "PENDING").length,
       pendingWithdrawals: this.db.withdrawals.filter((withdrawal) => withdrawal.status === "PENDING").length,
-      notifications: this.listNotifications(this.db.users.find((user) => user.role === "admin") || { role: "admin" }, { limit: 20 }),
+      notifications: this.listNotifications(this.db.users.find((user) => user.role === "admin") || { role: "admin" }, { limit: 20, includeRead: false }),
       settings: {
         deposit: clone(this.db.systemSettings.deposit),
         withdrawal: clone(this.db.systemSettings.withdrawal),

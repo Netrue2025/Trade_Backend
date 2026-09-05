@@ -777,6 +777,67 @@ test("NGN withdrawal is flagged when bank account name does not match user names
   assert.equal(relatedUser.fraudReview.status, "SUSPICIOUS");
 });
 
+test("duplicate user detail scan flags similar accounts for admin review", () => {
+  const { admin, db, service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  user.bankAccounts = [
+    {
+      id: "bank-1",
+      bankName: "Test Bank",
+      bankCode: "058",
+      accountNumber: "1234567890",
+      accountName: "ADA USER",
+      verified: true,
+    },
+  ];
+  const duplicate = {
+    id: "user-2",
+    name: "Ada User",
+    firstName: "Ada",
+    lastName: "User",
+    email: "ada.two@example.com",
+    role: "user",
+    bankAccounts: [
+      {
+        id: "bank-2",
+        bankName: "Test Bank",
+        bankCode: "058",
+        accountNumber: "1234567890",
+        accountName: "ADA USER",
+        verified: true,
+      },
+    ],
+  };
+  db.users.push(duplicate);
+
+  const result = service.scanDuplicateUserReviews();
+
+  assert.equal(result.flaggedCount, 2);
+  assert.equal(user.fraudReview.status, "SUSPICIOUS");
+  assert.equal(duplicate.fraudReview.status, "SUSPICIOUS");
+  assert.ok(user.fraudReview.reasons.includes("DUPLICATE_FULL_NAME"));
+  assert.ok(user.fraudReview.reasons.includes("DUPLICATE_BANK_ACCOUNT"));
+
+  service.clearUserFraudReview(admin, user.id);
+  service.scanDuplicateUserReviews();
+  assert.equal(user.fraudReview.status, "CLEARED");
+});
+
+test("bank account name match details include warning for mismatched names", () => {
+  const { service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+
+  const result = service.evaluateBankAccountNameMatch(user, {
+    accountName: "CHINEDU OKAFOR",
+  });
+
+  assert.equal(result.matches, false);
+  assert.equal(result.matchedCount, 0);
+  assert.match(result.warning, /does not match your registered name/i);
+});
+
 test("notification can be marked as read by owner", () => {
   const { service, user } = createHarness();
   const notification = service.createNotification({
@@ -789,6 +850,7 @@ test("notification can be marked as read by owner", () => {
   const read = service.markNotificationRead(user, notification.id);
   assert.ok(read.readAt);
   assert.equal(service.listNotifications(user)[0].readAt, read.readAt);
+  assert.equal(service.listNotifications(user, { includeRead: false }).length, 0);
 });
 
 test("user support message creates admin notification", () => {

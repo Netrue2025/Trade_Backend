@@ -4678,6 +4678,14 @@ async function handleApi(req, res, url) {
       sendJson(res, 409, { error: "That email and full name are already registered." });
       return true;
     }
+    const existingFullName = db.users.find((user) =>
+      user.role === "user" &&
+      normalizeIdentityText(user.name || `${user.firstName || ""} ${user.lastName || ""}`) === normalizedName
+    );
+    if (existingFullName) {
+      sendJson(res, 409, { error: "That full name is already registered. Use your real account or contact support." });
+      return true;
+    }
     if (db.users.some((user) => String(user.email || "").trim().toLowerCase() === email)) {
       sendJson(res, 409, { error: "That email is already registered." });
       return true;
@@ -4845,7 +4853,12 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    sendJson(res, 200, { notifications: financialService.listNotifications(user) });
+    sendJson(res, 200, {
+      notifications: financialService.listNotifications(user, {
+        includeRead: url.searchParams.get("includeRead") === "true",
+        limit: 40,
+      }),
+    });
     return true;
   }
 
@@ -4903,10 +4916,16 @@ async function handleApi(req, res, url) {
         accountName: resolved.accountName,
         verified: true,
       };
+      const nameMatch = financialService.evaluateBankAccountNameMatch(user, bankInput);
       const shouldSave = body.saveBankAccount !== false;
       const bankAccount = shouldSave
         ? financialService.updateVerifiedBankAccount(user, bankInput, getRequestMeta(req))
-        : financialService.normalizeBankAccount(bankInput);
+        : financialService.normalizeBankAccount({
+            ...bankInput,
+            nameMatch: nameMatch.matches,
+            matchedNameCount: nameMatch.matchedCount,
+            expectedName: nameMatch.expectedName,
+          });
       sendJson(res, 200, {
         success: true,
         accountNumber: resolved.accountNumber,
@@ -4914,6 +4933,9 @@ async function handleApi(req, res, url) {
         bankCode: resolved.bankCode,
         bankAccount,
         saved: shouldSave,
+        nameMatch: nameMatch.matches,
+        matchedNameCount: nameMatch.matchedCount,
+        nameMatchWarning: nameMatch.warning,
       });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
@@ -6404,6 +6426,7 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    financialService.scanDuplicateUserReviews();
     const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
     const users = await Promise.all(
       db.users
@@ -6616,6 +6639,29 @@ async function handleApi(req, res, url) {
   }
 
   const adminPasswordMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/password$/);
+  const adminClearReviewMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/fraud-review\/clear$/);
+  if (req.method === "POST" && adminClearReviewMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const userId = decodeURIComponent(adminClearReviewMatch[1] || "").trim();
+      const fraudReview = financialService.clearUserFraudReview(admin, userId, getRequestMeta(req));
+      const targetUser = getAdminManagedUser(userId);
+      scheduleSettingsUsersBroadcast("admin_review_cleared");
+      sendJson(res, 200, {
+        fraudReview,
+        user: targetUser
+          ? await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null))
+          : null,
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && adminPasswordMatch) {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {
@@ -7216,6 +7262,7 @@ async function startServer() {
   ensureAdminUser(db);
   financialService = new FinancialService({ db, persist });
   financialService.ensureState();
+  financialService.scanDuplicateUserReviews({ persistChanges: false });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));
