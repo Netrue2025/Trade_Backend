@@ -3209,11 +3209,6 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
   const liveUsdt = add(baseUsdt, pnlUsdt);
   const liveNgn = financialService.convertAmount(liveUsdt, "USDT", "NGN", rate);
   const baseNgn = financialService.convertAmount(baseUsdt, "USDT", "NGN", rate);
-  const dashboardTodayUsdt = String(dashboard.performance?.todayUsdt || "0");
-  const dashboardTodayPercentage = String(dashboard.performance?.todayPercentage || "0");
-  const realizedTodayPercentage = dashboardTodayPercentage !== "0" || compare(dashboardTodayUsdt, "0") === 0 || compare(baseUsdt, "0") === 0
-    ? dashboardTodayPercentage
-    : multiplyRatio(dashboardTodayUsdt, "100", baseUsdt);
   const performance = enriched.length
     ? {
         ...dashboard.performance,
@@ -3223,7 +3218,9 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
       }
     : {
         ...dashboard.performance,
-        todayPercentage: realizedTodayPercentage,
+        todayUsdt: "0",
+        todayPercentage: "0",
+        source: "IDLE_WALLET",
       };
   return {
     totalBalance: {
