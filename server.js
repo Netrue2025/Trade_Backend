@@ -910,7 +910,13 @@ function getDepositUser(deposit) {
 }
 
 function buildWithdrawalAdminUrl(withdrawal) {
-  return `${getFrontendUrl()}/admin/withdrawals/${encodeURIComponent(withdrawal.id)}`;
+  const url = new URL(`${getFrontendUrl()}/`);
+  url.searchParams.set("tab", "history");
+  url.searchParams.set("section", "finance");
+  if (withdrawal?.id) {
+    url.searchParams.set("withdrawal", withdrawal.id);
+  }
+  return url.toString();
 }
 
 async function sendDepositSuccessChannelAlert(deposit) {
@@ -4529,8 +4535,7 @@ function clearSessionCookie(req, res) {
 async function handleApi(req, res, url) {
   const withdrawalAdminPageMatch = url.pathname.match(/^\/admin\/withdrawals\/([^/]+)\/?$/);
   if (req.method === "GET" && withdrawalAdminPageMatch) {
-    const withdrawalId = encodeURIComponent(decodeURIComponent(withdrawalAdminPageMatch[1] || ""));
-    sendRedirect(res, `${getFrontendUrl()}/admin/withdrawals/${withdrawalId}`);
+    sendRedirect(res, buildWithdrawalAdminUrl({ id: decodeURIComponent(withdrawalAdminPageMatch[1] || "") }));
     return true;
   }
 
