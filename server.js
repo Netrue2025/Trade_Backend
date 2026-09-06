@@ -6595,6 +6595,7 @@ async function handleApi(req, res, url) {
   const adminUserMessageMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/message$/);
   const adminUserBalanceMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/balance$/);
   const adminUserEmailMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/email$/);
+  const adminUserNameMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/name$/);
   if (req.method === "POST" && adminUserBalanceMatch) {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {
@@ -6641,6 +6642,49 @@ async function handleApi(req, res, url) {
       targetUser.email = email;
       persist();
       scheduleSettingsUsersBroadcast("admin_email_updated");
+      sendJson(res, 200, {
+        user: await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && adminUserNameMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+
+    const targetUser = getAdminManagedUser(decodeURIComponent(adminUserNameMatch[1] || "").trim());
+    if (!targetUser) {
+      sendJson(res, 404, { error: "User not found." });
+      return true;
+    }
+
+    try {
+      const body = await readBody(req);
+      const identity = buildSignupName(body);
+      const normalizedName = normalizeIdentityText(identity.name);
+      const duplicateName = db.users.find((user) =>
+        user.role === "user" &&
+        user.id !== targetUser.id &&
+        normalizeIdentityText(user.name || `${user.firstName || ""} ${user.lastName || ""}`) === normalizedName
+      );
+      if (duplicateName) {
+        sendJson(res, 409, { error: "That full name is already registered." });
+        return true;
+      }
+
+      targetUser.firstName = identity.firstName;
+      targetUser.lastName = identity.lastName;
+      targetUser.name = identity.name;
+      financialService.audit(admin, "USER_NAME_UPDATED", "User", targetUser.id, {
+        name: targetUser.name,
+      }, getRequestMeta(req));
+      persist();
+      scheduleSettingsUsersBroadcast("admin_name_updated");
       sendJson(res, 200, {
         user: await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
       });
