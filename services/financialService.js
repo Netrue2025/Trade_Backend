@@ -1736,6 +1736,35 @@ class FinancialService {
     return sources;
   }
 
+  findActiveWithdrawalForUser(userId, { excludeId = "" } = {}) {
+    return this.db.withdrawals.find((withdrawal) =>
+      withdrawal.userId === userId &&
+      withdrawal.id !== excludeId &&
+      ACTIVE_WITHDRAWAL_STATUSES.includes(String(withdrawal.status || "").trim().toUpperCase())
+    );
+  }
+
+  assertNoActiveWithdrawal(userId, { excludeId = "" } = {}) {
+    const activeWithdrawal = this.findActiveWithdrawalForUser(userId, { excludeId });
+    if (activeWithdrawal) {
+      throw new Error("A withdrawal request is already processing. Please wait for success or rejection before placing another withdrawal.");
+    }
+  }
+
+  markWithdrawalReservationTransactions(withdrawal, status, description = "") {
+    const normalizedStatus = String(status || "").trim().toUpperCase();
+    for (const transaction of this.db.transactions.filter((item) =>
+      item.type === "WITHDRAWAL" &&
+      item.reference === withdrawal.id
+    )) {
+      transaction.status = normalizedStatus;
+      if (description) {
+        transaction.description = description;
+      }
+      transaction.updatedAt = this.clock();
+    }
+  }
+
   findRelatedFraudReviewUsers(user, bank = {}) {
     const normalizedName = getNormalizedFullName(user);
     const accountNumber = String(bank.accountNumber || "").trim();
@@ -1809,6 +1838,7 @@ class FinancialService {
     if (activeInvestments.length) {
       throw new Error("Stop active trades before requesting a withdrawal.");
     }
+    this.assertNoActiveWithdrawal(user.id);
     this.validateDailyWithdrawalLimit(user.id, currency, amount);
     let destination = null;
     let bank = null;
@@ -1956,6 +1986,7 @@ class FinancialService {
     const withdrawal = this.changeWithdrawalStatus(admin, withdrawalId, "PROCESSING", input, requestMeta);
     withdrawal.processingAt = this.clock();
     withdrawal.processedBy = admin.id;
+    this.markWithdrawalReservationTransactions(withdrawal, "PROCESSING", "Withdrawal amount held for processing.");
     this.persist();
     return clone(withdrawal);
   }
@@ -2061,6 +2092,7 @@ class FinancialService {
         status: data.status || "",
       },
     };
+    this.markWithdrawalReservationTransactions(withdrawal, "PROCESSING", "Withdrawal amount held while payment is processing.");
     this.audit(admin, "PAYSTACK_TRANSFER_INITIATED", "Withdrawal", withdrawal.id, {
       amountKobo: withdrawal.amountKobo,
       reference: withdrawal.paystackReference,
@@ -2127,6 +2159,7 @@ class FinancialService {
         },
       });
     }
+    this.markWithdrawalReservationTransactions(withdrawal, "COMPLETED", "Withdrawal completed.");
     withdrawal.status = "COMPLETED";
     withdrawal.completedAt = this.clock();
     withdrawal.completedBy = admin.id;
@@ -2259,6 +2292,7 @@ class FinancialService {
         },
       });
     }
+    this.markWithdrawalReservationTransactions(withdrawal, status, description);
     withdrawal.balanceReserved = false;
   }
 
@@ -2302,6 +2336,7 @@ class FinancialService {
         },
       });
     }
+    this.markWithdrawalReservationTransactions(withdrawal, status, description);
     withdrawal.balanceReserved = false;
   }
 

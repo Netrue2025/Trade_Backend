@@ -183,6 +183,45 @@ test("withdrawal rejection refunds reserved funds", () => {
   assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "0");
 });
 
+test("active withdrawal blocks another withdrawal until it settles", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "100");
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "50",
+    currency: "USDT",
+    destination: {
+      address: "TUserWalletAddress",
+      network: "TRC20",
+    },
+  });
+
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "50");
+  assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "50");
+  assert.throws(() => service.createWithdrawal(user, {
+    amount: "50",
+    currency: "USDT",
+    destination: {
+      address: "TUserWalletAddress2",
+      network: "TRC20",
+    },
+  }), /already processing/i);
+
+  service.rejectWithdrawal(admin, withdrawal.id, { adminNote: "Retry allowed" });
+  const nextWithdrawal = service.createWithdrawal(user, {
+    amount: "50",
+    currency: "USDT",
+    destination: {
+      address: "TUserWalletAddress2",
+      network: "TRC20",
+    },
+  });
+
+  assert.equal(nextWithdrawal.status, "PENDING");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "50");
+  assert.equal(service.ensureWallet(user.id, "USDT").lockedBalance, "50");
+});
+
 test("USDT withdrawal accepts wallet aliases and configured network", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
@@ -368,11 +407,11 @@ test("withdrawal is blocked while user has an active trade investment", () => {
 });
 
 test("daily NGN withdrawal limit is enforced by amount, not request count", () => {
-  const { service, user } = createHarness();
+  const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "7000");
 
   for (let index = 0; index < 3; index += 1) {
-    service.createWithdrawal(user, {
+    const withdrawal = service.createWithdrawal(user, {
       amount: "50",
       currency: "USDT",
       destination: {
@@ -380,9 +419,10 @@ test("daily NGN withdrawal limit is enforced by amount, not request count", () =
         network: "TRC20",
       },
     });
+    service.completeWithdrawal(admin, withdrawal.id, { transactionHash: `0x${index}` });
   }
 
-  service.createWithdrawal(user, {
+  const largeWithdrawal = service.createWithdrawal(user, {
     amount: "5000",
     currency: "USDT",
     destination: {
@@ -390,6 +430,7 @@ test("daily NGN withdrawal limit is enforced by amount, not request count", () =
       network: "TRC20",
     },
   });
+  service.completeWithdrawal(admin, largeWithdrawal.id, { transactionHash: "0xlarge" });
 
   assert.throws(
     () =>
