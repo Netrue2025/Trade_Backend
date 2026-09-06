@@ -1164,6 +1164,12 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
   if (withdrawal.currency !== "NGN") {
     throw new Error("Only NGN withdrawals can be approved through Paystack.");
   }
+  if (String(withdrawal.fraudReview?.status || "").trim().toUpperCase() === "SUSPICIOUS") {
+    withdrawal = financialService.completeReviewedWithdrawal(admin, withdrawalId, {}, requestMeta);
+    await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Flagged request approved by admin.", "Status: Successful"]);
+    await sendWithdrawalSuccessChannelAlert(withdrawal);
+    return withdrawal;
+  }
   if (withdrawal.status === "APPROVED" && withdrawal.metadata?.paystackTransferAttemptedAt) {
     return verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta);
   }

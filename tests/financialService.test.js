@@ -734,6 +734,30 @@ test("NGN withdrawal is clear when bank account name matches first and last name
   assert.equal(user.fraudReview, undefined);
 });
 
+test("NGN withdrawal accepts reversed first and last account names", () => {
+  const { service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  setWallet(service, user.id, "NGN", "50000");
+  const bankAccount = service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "USER ADA",
+  });
+
+  const dashboard = service.getDashboard(user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+    bankAccountId: bankAccount.id,
+  });
+
+  assert.equal(dashboard.bankAccount.nameMatch, true);
+  assert.equal(dashboard.bankAccount.matchedNameCount, 2);
+  assert.equal(withdrawal.fraudReview.status, "CLEAR");
+});
+
 test("NGN withdrawal is flagged when bank account name does not match user names", () => {
   const { db, service, user } = createHarness();
   user.firstName = "Ada";
@@ -775,6 +799,30 @@ test("NGN withdrawal is flagged when bank account name does not match user names
   assert.deepEqual(withdrawal.fraudReview.relatedUserIds, ["user-copy"]);
   assert.equal(user.fraudReview.status, "SUSPICIOUS");
   assert.equal(relatedUser.fraudReview.status, "SUSPICIOUS");
+});
+
+test("flagged NGN withdrawal becomes successful when admin approves review", () => {
+  const { admin, service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  setWallet(service, user.id, "NGN", "50000");
+  service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "OTHER NAME",
+  });
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+  });
+
+  const approved = service.completeReviewedWithdrawal(admin, withdrawal.id);
+
+  assert.equal(approved.status, "SUCCESS");
+  assert.equal(approved.fraudReview.status, "APPROVED");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "49000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
 });
 
 test("duplicate user detail scan flags similar accounts for admin review", () => {

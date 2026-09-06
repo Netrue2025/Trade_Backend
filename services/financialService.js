@@ -117,6 +117,10 @@ function bankAccountNameMatchesUser(user = {}, bank = {}) {
   return getBankAccountNameMatchDetails(user, bank).matches;
 }
 
+function isSuspiciousFraudReview(review = {}) {
+  return String(review.status || "").trim().toUpperCase() === "SUSPICIOUS";
+}
+
 function addMapSet(map, key, value) {
   if (!key) {
     return;
@@ -470,6 +474,20 @@ class FinancialService {
     };
   }
 
+  enrichBankAccountForUser(user, bank = null) {
+    if (!bank) {
+      return null;
+    }
+    const match = this.evaluateBankAccountNameMatch(user, bank);
+    return {
+      ...clone(bank),
+      nameMatch: match.matches,
+      nameMatchWarning: match.warning,
+      matchedNameCount: match.matchedCount,
+      expectedName: match.expectedName,
+    };
+  }
+
   getVerifiedBankAccount(user, bankAccountId = "") {
     const candidates = [
       ...(Array.isArray(user.bankAccounts) ? user.bankAccounts : []),
@@ -482,7 +500,13 @@ class FinancialService {
     if (!account || !account.verified) {
       throw new Error("Add and verify a Nigerian bank account before withdrawal.");
     }
-    return this.normalizeBankAccount(account);
+    const match = this.evaluateBankAccountNameMatch(user, account);
+    return this.normalizeBankAccount({
+      ...account,
+      nameMatch: match.matches,
+      matchedNameCount: match.matchedCount,
+      expectedName: match.expectedName,
+    });
   }
 
   updateVerifiedBankAccount(user, input = {}, requestMeta = {}) {
@@ -552,8 +576,8 @@ class FinancialService {
     }, requestMeta);
     this.persist();
     return {
-      bankAccount: clone(user.bankAccount || null),
-      bankAccounts: clone(user.bankAccounts || []),
+      bankAccount: this.enrichBankAccountForUser(user, user.bankAccount || null),
+      bankAccounts: clone(user.bankAccounts || []).map((account) => this.enrichBankAccountForUser(user, account)),
       removedBankAccountId: targetId,
     };
   }
@@ -886,8 +910,8 @@ class FinancialService {
         name: user.name,
         email: user.email,
       },
-      bankAccount: clone(user.bankAccount || null),
-      bankAccounts: clone(user.bankAccounts || []),
+      bankAccount: this.enrichBankAccountForUser(user, user.bankAccount || null),
+      bankAccounts: clone(user.bankAccounts || []).map((account) => this.enrichBankAccountForUser(user, account)),
       wallets,
       totalBalance: {
         usdt: availableUsdtEquivalent,
@@ -2056,6 +2080,57 @@ class FinancialService {
       entityId: withdrawal.id,
     });
     this.audit(admin, "WITHDRAWAL_COMPLETED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
+  completeReviewedWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    if (!isSuspiciousFraudReview(withdrawal.fraudReview)) {
+      throw new Error("Only flagged withdrawals can be approved as reviewed.");
+    }
+    if (["SUCCESS", "COMPLETED"].includes(withdrawal.status)) {
+      return clone(withdrawal);
+    }
+    if (!["PENDING", "APPROVED", "PROCESSING"].includes(withdrawal.status)) {
+      throw new Error("Only pending or processing flagged withdrawals can be approved.");
+    }
+    if (withdrawal.balanceReserved !== true) {
+      throw new Error("Withdrawal balance was not reserved.");
+    }
+
+    this.consumeWithdrawalReservation(withdrawal, admin, "SUCCESS", "Flagged withdrawal approved by admin.");
+    withdrawal.status = "SUCCESS";
+    withdrawal.approvedBy = withdrawal.approvedBy || admin.id;
+    withdrawal.approvedAt = withdrawal.approvedAt || this.clock();
+    withdrawal.completedAt = this.clock();
+    withdrawal.completedBy = admin.id;
+    withdrawal.externalTransactionReference = String(input.externalTransactionReference || withdrawal.externalTransactionReference || withdrawal.paystackReference || "").trim();
+    withdrawal.adminNote = String(input.adminNote || withdrawal.adminNote || "Approved after admin review.").trim();
+    withdrawal.fraudReview = {
+      ...(withdrawal.fraudReview || {}),
+      status: "APPROVED",
+      reviewedAt: this.clock(),
+      reviewedBy: admin.id,
+    };
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      fraudReviewStatus: "APPROVED",
+      reviewedApprovalAt: this.clock(),
+    };
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal successful",
+      message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit(admin, "WITHDRAWAL_REVIEW_APPROVED", "Withdrawal", withdrawal.id, {
+      amount: withdrawal.amount,
+      currency: withdrawal.currency,
+    }, requestMeta);
     this.persist();
     return clone(withdrawal);
   }
