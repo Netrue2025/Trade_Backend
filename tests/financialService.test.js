@@ -1026,6 +1026,122 @@ test("chat notifications expire after 24 hours", () => {
   assert.equal(service.db.chatMessages.length, 0);
 });
 
+test("VTU settings encrypt credentials and never return secrets", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service } = createHarness();
+    const settings = service.updateVtuSettings(admin, {
+      username: "vtu@example.com",
+      password: "super-secret-password",
+      pin: "1234",
+      airtimeEnabled: true,
+      dataEnabled: true,
+      airtimeMarkupPercent: "0",
+      dataMarkupPercent: "4",
+    });
+
+    assert.equal(settings.configured, true);
+    assert.equal(settings.hasPassword, true);
+    assert.equal(settings.hasPin, true);
+    assert.equal(settings.password, undefined);
+    assert.equal(settings.pin, undefined);
+    assert.equal(db.systemSettings.vtu.usernameEncrypted.includes("vtu@example.com"), false);
+    assert.equal(db.systemSettings.vtu.passwordEncrypted.includes("super-secret-password"), false);
+    assert.equal(db.systemSettings.vtu.pinEncrypted.includes("1234"), false);
+
+    const publicSettings = service.getSettings().vtu;
+    assert.equal(publicSettings.hasPassword, true);
+    assert.equal(publicSettings.passwordEncrypted, undefined);
+    assert.equal(publicSettings.accessTokenEncrypted, undefined);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("VTU purchase reserves wallet and success consumes reserve once", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "10000");
+
+  const transaction = service.createVtuTransaction(user, {
+    productType: "airtime",
+    requestId: "airtime_test_1",
+    phone: "08012345678",
+    network: "mtn",
+    faceValue: "1000",
+    providerCost: "1000",
+    amountCharged: "1000",
+    markupAmount: "0",
+  });
+
+  assert.equal(transaction.status, "processing");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "9000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
+
+  const settled = service.applyVtuProviderResult("airtime_test_1", {
+    code: "success",
+    data: {
+      status: "completed-api",
+      amount_charged: "975",
+      order_id: "VTU-1",
+    },
+  });
+  const duplicateRefund = service.applyVtuProviderResult("airtime_test_1", {
+    code: "success",
+    data: {
+      status: "refunded",
+    },
+  });
+
+  assert.equal(settled.status, "successful");
+  assert.equal(duplicateRefund.status, "successful");
+  assert.equal(duplicateRefund.markupAmount, "25");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "9000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  assert.equal(service.getWalletHistory(user).some((item) => item.kind === "VTU" && item.reference === "airtime_test_1"), true);
+});
+
+test("VTU refund releases reserved wallet exactly once", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "2500");
+
+  service.createVtuTransaction(user, {
+    productType: "data",
+    requestId: "data_test_1",
+    phone: "08012345678",
+    network: "airtel",
+    variationId: "airtel-1gb",
+    planName: "1GB - 30 Days",
+    faceValue: "500",
+    providerCost: "500",
+    amountCharged: "520",
+    markupAmount: "20",
+  });
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1980");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "520");
+
+  service.applyVtuProviderResult("data_test_1", {
+    code: "success",
+    data: {
+      status: "refunded",
+    },
+  });
+  service.applyVtuProviderResult("data_test_1", {
+    code: "success",
+    data: {
+      status: "refunded",
+    },
+  });
+
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  assert.equal(service.listTransactions(user).filter((item) => item.type === "VTU_REFUND").length, 1);
+});
+
 test("admin can delete selected finance history records", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

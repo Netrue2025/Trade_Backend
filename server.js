@@ -50,6 +50,14 @@ const { FinancialService } = require("./services/financialService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
+const {
+  VtuService,
+  VTU_BASE_URL,
+  extractProviderData,
+  mapProviderStatus,
+  normalizeNetwork,
+  normalizePhone,
+} = require("./services/vtuService");
 const { TradeLearningService } = require("./services/tradeLearning");
 const { TradeListener } = require("./services/tradeListener");
 const { createSignalConfig } = require("./src/config/signalConfig");
@@ -117,6 +125,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 let db = null;
 let financialService = null;
 let questService = null;
+let vtuService = null;
 const loginAttemptBuckets = new Map();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
@@ -4639,6 +4648,42 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/webhooks/vtu") {
+    try {
+      const rawBody = await readRawBody(req);
+      const signature = String(req.headers["x-signature"] || "").trim();
+      if (!vtuService.verifyWebhook(rawBody, signature)) {
+        sendJson(res, 401, { error: "Invalid VTU.ng signature." });
+        return true;
+      }
+      const payloadHash = crypto.createHash("sha256").update(rawBody).digest("hex");
+      const payload = JSON.parse(rawBody.toString("utf8") || "{}");
+      const data = extractProviderData(payload);
+      const requestId = String(data.request_id || payload.request_id || "").trim();
+      if (!requestId) {
+        sendJson(res, 400, { error: "VTU.ng webhook missing request_id." });
+        return true;
+      }
+      const status = mapProviderStatus(data.status, payload.code);
+      const webhookEvent = financialService.recordVtuWebhookEvent({ requestId, payloadHash, status });
+      if (webhookEvent.duplicate) {
+        sendJson(res, 200, { received: true, duplicate: true });
+        return true;
+      }
+      const transaction = financialService.applyVtuProviderResult(
+        requestId,
+        { ...payload, mappedStatus: status },
+        { id: "vtu_ng", role: "system" },
+        getRequestMeta(req)
+      );
+      financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
+      sendJson(res, 200, { received: true, transaction });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, {
       ok: true,
@@ -4950,6 +4995,200 @@ async function handleApi(req, res, url) {
         matchedNameCount: nameMatch.matchedCount,
         nameMatchWarning: nameMatch.warning,
       });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/vtu/settings") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    const settings = financialService.getSettings().vtu;
+    sendJson(res, 200, {
+      settings: {
+        configured: settings.configured,
+        airtimeEnabled: settings.airtimeEnabled,
+        dataEnabled: settings.dataEnabled,
+        minAirtimeAmount: settings.minAirtimeAmount,
+        maxAirtimeAmount: settings.maxAirtimeAmount,
+      },
+    });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/vtu/data/plans") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const settings = financialService.getSettings().vtu;
+      if (!settings.configured || !settings.dataEnabled) {
+        throw new Error("Data purchase is not available now.");
+      }
+      const plans = await vtuService.getDataPlans({
+        network: url.searchParams.get("network") || "",
+        markupPercent: settings.dataMarkupPercent,
+      });
+      sendJson(res, 200, { plans });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/vtu/transactions") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 300);
+    sendJson(res, 200, { transactions: financialService.listVtuTransactions(user, { limit }) });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/vtu/airtime") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "vtu-airtime")) {
+      sendJson(res, 429, { error: "Too many airtime requests. Please try again shortly." });
+      return true;
+    }
+    const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    const cachedResponse = financialService.findIdempotent("vtu-airtime", user.id, idempotencyKey);
+    if (cachedResponse) {
+      sendJson(res, 200, cachedResponse);
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const settings = financialService.getSettings().vtu;
+      if (!settings.configured || !settings.airtimeEnabled) {
+        throw new Error("Airtime purchase is not available now.");
+      }
+      const phone = normalizePhone(body.phone);
+      const network = normalizeNetwork(body.network);
+      const amount = String(body.amount || "").replace(/,/g, "").trim();
+      if (compare(amount, settings.minAirtimeAmount) < 0 || compare(amount, settings.maxAirtimeAmount) > 0) {
+        throw new Error(`Airtime amount must be between NGN ${settings.minAirtimeAmount} and NGN ${settings.maxAirtimeAmount}.`);
+      }
+      const price = financialService.calculateVtuSellingPrice(amount, settings.airtimeMarkupPercent);
+      if (Number(settings.lastKnownBalance || 0) > 0 && compare(settings.lastKnownBalance, price.providerCost) < 0) {
+        throw new Error("Airtime service balance is low. Please try again later.");
+      }
+      const transaction = financialService.createVtuTransaction(user, {
+        productType: "airtime",
+        requestId: financialService.createVtuRequestId("airtime"),
+        phone,
+        network,
+        faceValue: amount,
+        providerCost: price.providerCost,
+        amountCharged: price.sellingPrice,
+        markupAmount: price.markupAmount,
+      }, getRequestMeta(req));
+      try {
+        const providerResponse = await vtuService.purchaseAirtime({
+          requestId: transaction.requestId,
+          phone,
+          network,
+          amount,
+        });
+        const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
+        const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, user, getRequestMeta(req));
+        const responsePayload = { transaction: settled };
+        financialService.saveIdempotent("vtu-airtime", user.id, idempotencyKey, responsePayload);
+        sendJson(res, status === "processing" ? 202 : 201, responsePayload);
+      } catch (providerError) {
+        const fallbackStatus = providerError.statusCode && providerError.statusCode < 500 ? "failed" : "processing";
+        const settled = financialService.applyVtuProviderResult(
+          transaction.requestId,
+          { code: providerError.statusCode ? "error" : "success", message: providerError.message, mappedStatus: fallbackStatus, data: { status: fallbackStatus } },
+          user,
+          getRequestMeta(req)
+        );
+        const responsePayload = { transaction: settled, error: providerError.message };
+        financialService.saveIdempotent("vtu-airtime", user.id, idempotencyKey, responsePayload);
+        sendJson(res, fallbackStatus === "failed" ? 400 : 202, responsePayload);
+      }
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/vtu/data") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "vtu-data")) {
+      sendJson(res, 429, { error: "Too many data requests. Please try again shortly." });
+      return true;
+    }
+    const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    const cachedResponse = financialService.findIdempotent("vtu-data", user.id, idempotencyKey);
+    if (cachedResponse) {
+      sendJson(res, 200, cachedResponse);
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const settings = financialService.getSettings().vtu;
+      if (!settings.configured || !settings.dataEnabled) {
+        throw new Error("Data purchase is not available now.");
+      }
+      const phone = normalizePhone(body.phone);
+      const network = normalizeNetwork(body.network);
+      const variationId = String(body.variationId || "").trim();
+      const plans = await vtuService.getDataPlans({ network, markupPercent: settings.dataMarkupPercent });
+      const plan = plans.find((item) => item.id === variationId);
+      if (!plan) {
+        throw new Error("Select a valid data plan.");
+      }
+      if (Number(settings.lastKnownBalance || 0) > 0 && compare(settings.lastKnownBalance, plan.providerCost) < 0) {
+        throw new Error("Data service balance is low. Please try again later.");
+      }
+      const transaction = financialService.createVtuTransaction(user, {
+        productType: "data",
+        requestId: financialService.createVtuRequestId("data"),
+        phone,
+        network,
+        variationId,
+        planName: plan.name,
+        faceValue: plan.sellingPrice,
+        providerCost: plan.providerCost,
+        amountCharged: plan.sellingPrice,
+        markupAmount: subtract(plan.sellingPrice, plan.providerCost),
+      }, getRequestMeta(req));
+      try {
+        const providerResponse = await vtuService.purchaseData({
+          requestId: transaction.requestId,
+          phone,
+          network,
+          variationId,
+        });
+        const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
+        const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, user, getRequestMeta(req));
+        const responsePayload = { transaction: settled };
+        financialService.saveIdempotent("vtu-data", user.id, idempotencyKey, responsePayload);
+        sendJson(res, status === "processing" ? 202 : 201, responsePayload);
+      } catch (providerError) {
+        const fallbackStatus = providerError.statusCode && providerError.statusCode < 500 ? "failed" : "processing";
+        const settled = financialService.applyVtuProviderResult(
+          transaction.requestId,
+          { code: providerError.statusCode ? "error" : "success", message: providerError.message, mappedStatus: fallbackStatus, data: { status: fallbackStatus } },
+          user,
+          getRequestMeta(req)
+        );
+        const responsePayload = { transaction: settled, error: providerError.message };
+        financialService.saveIdempotent("vtu-data", user.id, idempotencyKey, responsePayload);
+        sendJson(res, fallbackStatus === "failed" ? 400 : 202, responsePayload);
+      }
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -5599,6 +5838,120 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, { settings });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/integrations/vtu/settings") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    sendJson(res, 200, {
+      settings: financialService.getSettings().vtu,
+      webhookUrl: `${getBackendUrl()}/api/webhooks/vtu`,
+      apiBaseUrl: VTU_BASE_URL,
+    });
+    return true;
+  }
+
+  if (req.method === "PUT" && url.pathname === "/api/admin/integrations/vtu/settings") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const wantsUsernameChange = Object.prototype.hasOwnProperty.call(body, "username") && String(body.username || "").trim();
+      const wantsPasswordChange = Object.prototype.hasOwnProperty.call(body, "password") && String(body.password || "").trim();
+      if ((wantsUsernameChange || wantsPasswordChange) && !(wantsUsernameChange && wantsPasswordChange)) {
+        throw new Error("Enter both VTU username and password to change credentials.");
+      }
+      const hasNewCredentials = wantsUsernameChange && wantsPasswordChange;
+      if (hasNewCredentials) {
+        const tokenPayload = await vtuService.request("/jwt-auth/v1/token", {
+          method: "POST",
+          body: {
+            username: String(body.username || "").trim(),
+            password: String(body.password || ""),
+          },
+          publicEndpoint: true,
+        });
+        if (!String(tokenPayload.token || "").trim()) {
+          throw new Error("Unable to authenticate with VTU.ng. Check your reseller username/email and password.");
+        }
+      }
+      const settings = financialService.updateVtuSettings(admin, body, getRequestMeta(req));
+      if (hasNewCredentials) {
+        await vtuService.getAccessToken({ forceRefresh: true });
+      }
+      sendJson(res, 200, {
+        settings,
+        webhookUrl: `${getBackendUrl()}/api/webhooks/vtu`,
+      });
+    } catch (error) {
+      sendJson(res, error.code === "SETTINGS_ENCRYPTION_KEY_MISSING" ? 500 : 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/vtu/test") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const result = await vtuService.getWalletBalance();
+      sendJson(res, 200, { ...result, settings: financialService.getSettings().vtu });
+    } catch (error) {
+      financialService.updateVtuBalanceCache(financialService.getRawVtuSettings().lastKnownBalance || "0", "failed");
+      sendJson(res, error.statusCode || 400, { error: error.message, settings: financialService.getSettings().vtu });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/integrations/vtu/balance") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const result = await vtuService.getWalletBalance();
+      sendJson(res, 200, { ...result, settings: financialService.getSettings().vtu });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, settings: financialService.getSettings().vtu });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/integrations/vtu/transactions") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 250), 1), 500);
+    const status = url.searchParams.get("status") || "";
+    sendJson(res, 200, {
+      transactions: financialService.listVtuTransactions(admin, { limit, status }),
+      summary: financialService.getVtuAdminSummary(),
+    });
+    return true;
+  }
+
+  const adminVtuRequeryMatch = url.pathname.match(/^\/api\/admin\/integrations\/vtu\/transactions\/([^/]+)\/requery$/);
+  if (req.method === "POST" && adminVtuRequeryMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const transaction = financialService.getVtuTransaction(admin, decodeURIComponent(adminVtuRequeryMatch[1] || ""));
+      const providerResponse = await vtuService.requeryOrder(transaction.requestId);
+      const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
+      const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, admin, getRequestMeta(req));
+      sendJson(res, 200, { transaction: settled });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -7339,6 +7692,7 @@ async function startServer() {
   financialService = new FinancialService({ db, persist });
   financialService.ensureState();
   financialService.scanDuplicateUserReviews({ persistChanges: false });
+  vtuService = new VtuService({ financialService, logger: console });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

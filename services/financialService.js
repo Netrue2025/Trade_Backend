@@ -10,6 +10,7 @@ const {
 const crypto = require("node:crypto");
 const { getEnvValue } = require("../lib/env");
 const { randomId } = require("../lib/security");
+const { decryptSetting, encryptSetting, maskSecret } = require("../lib/settingsCrypto");
 const { maskAccountNumber, toKobo } = require("./paystackService");
 
 const SUPPORTED_CURRENCIES = ["USDT", "NGN"];
@@ -21,6 +22,9 @@ const MIN_WITHDRAWAL_AMOUNTS = {
   USDT: "50",
 };
 const MESSAGE_NOTIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
+const VTU_FINAL_STATUSES = ["successful", "failed", "refunded"];
+const VTU_ACTIVE_STATUSES = ["initiated", "processing"];
+const VTU_LEDGER_TYPES = ["VTU_AIRTIME", "VTU_DATA", "VTU_REFUND"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -69,6 +73,33 @@ function normalizeGiftCardPin(value) {
     throw new Error("Enter a valid gift card PIN.");
   }
   return pin;
+}
+
+function normalizeBoolean(value) {
+  return value === true || value === "true" || value === "1" || value === 1 || value === "on";
+}
+
+function normalizePercent(value, label = "Percent") {
+  const percent = normalizeNonNegativeAmount(value ?? "0", label);
+  if (compare(percent, "100") > 0) {
+    throw new Error(`${label} cannot be more than 100%.`);
+  }
+  return percent;
+}
+
+function mapVtuProviderStatus(status, fallbackCode = "") {
+  const normalized = String(status || "").trim().toLowerCase();
+  const fallback = String(fallbackCode || "").trim().toLowerCase();
+  if (["completed-api", "successful", "success"].includes(normalized)) {
+    return "successful";
+  }
+  if (normalized === "refunded") {
+    return "refunded";
+  }
+  if (["failed", "cancelled"].includes(normalized) || fallback === "error") {
+    return "failed";
+  }
+  return "processing";
 }
 
 function normalizeNameToken(value) {
@@ -203,6 +234,30 @@ function defaultSettings() {
     telegram: {
       channelUsername: getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME") || "netruesignal",
     },
+    vtu: {
+      provider: "vtu_ng",
+      usernameEncrypted: "",
+      passwordEncrypted: "",
+      pinEncrypted: "",
+      accessTokenEncrypted: "",
+      tokenObtainedAt: null,
+      tokenExpiresAt: null,
+      airtimeEnabled: false,
+      dataEnabled: false,
+      airtimeMarkupPercent: "0",
+      dataMarkupPercent: "0",
+      minAirtimeAmount: "100",
+      maxAirtimeAmount: "50000",
+      lowBalanceThreshold: "5000",
+      configured: false,
+      lastConnectionTestAt: null,
+      lastConnectionStatus: "",
+      lastKnownBalance: null,
+      lastBalanceCheckedAt: null,
+      updatedBy: "",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    },
     trading: {
       tradingEnabled: true,
       dailyPerformanceMode: "manual",
@@ -244,6 +299,7 @@ class FinancialService {
     this.db.auditLogs = Array.isArray(this.db.auditLogs) ? this.db.auditLogs : [];
     this.db.idempotencyKeys = Array.isArray(this.db.idempotencyKeys) ? this.db.idempotencyKeys : [];
     this.db.webhookEvents = Array.isArray(this.db.webhookEvents) ? this.db.webhookEvents : [];
+    this.db.vtuTransactions = Array.isArray(this.db.vtuTransactions) ? this.db.vtuTransactions : [];
     this.db.systemSettings = {
       ...defaultSettings(),
       ...(this.db.systemSettings || {}),
@@ -266,6 +322,10 @@ class FinancialService {
       telegram: {
         ...defaultSettings().telegram,
         ...(this.db.systemSettings?.telegram || {}),
+      },
+      vtu: {
+        ...defaultSettings().vtu,
+        ...(this.db.systemSettings?.vtu || {}),
       },
       trading: {
         ...defaultSettings().trading,
@@ -307,7 +367,130 @@ class FinancialService {
 
   getSettings() {
     this.ensureState();
-    return clone(this.db.systemSettings);
+    const settings = clone(this.db.systemSettings);
+    settings.vtu = this.sanitizeVtuSettings(settings.vtu);
+    return settings;
+  }
+
+  sanitizeVtuSettings(settings = this.db.systemSettings?.vtu || {}) {
+    const username = settings.usernameEncrypted ? decryptSetting(settings.usernameEncrypted) : "";
+    return {
+      provider: settings.provider || "vtu_ng",
+      configured: !!(settings.configured && settings.usernameEncrypted && settings.passwordEncrypted),
+      username: username ? maskSecret(username, { visibleStart: 2, visibleEnd: 2 }) : "",
+      usernameMasked: username ? maskSecret(username, { visibleStart: 2, visibleEnd: 2 }) : "",
+      hasUsername: !!settings.usernameEncrypted,
+      hasPassword: !!settings.passwordEncrypted,
+      hasPin: !!settings.pinEncrypted,
+      tokenCached: !!settings.accessTokenEncrypted,
+      tokenObtainedAt: settings.tokenObtainedAt || null,
+      tokenExpiresAt: settings.tokenExpiresAt || null,
+      airtimeEnabled: !!settings.airtimeEnabled,
+      dataEnabled: !!settings.dataEnabled,
+      airtimeMarkupPercent: String(settings.airtimeMarkupPercent ?? "0"),
+      dataMarkupPercent: String(settings.dataMarkupPercent ?? "0"),
+      minAirtimeAmount: String(settings.minAirtimeAmount ?? "100"),
+      maxAirtimeAmount: String(settings.maxAirtimeAmount ?? "50000"),
+      lowBalanceThreshold: String(settings.lowBalanceThreshold ?? "5000"),
+      lastConnectionTestAt: settings.lastConnectionTestAt || null,
+      lastConnectionStatus: settings.lastConnectionStatus || "",
+      lastKnownBalance: settings.lastKnownBalance ?? null,
+      lastBalanceCheckedAt: settings.lastBalanceCheckedAt || null,
+      updatedBy: settings.updatedBy || "",
+      createdAt: settings.createdAt || null,
+      updatedAt: settings.updatedAt || null,
+    };
+  }
+
+  getRawVtuSettings() {
+    this.ensureState();
+    return clone(this.db.systemSettings.vtu);
+  }
+
+  updateVtuSettings(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const before = this.db.systemSettings.vtu || defaultSettings().vtu;
+    const next = {
+      ...before,
+      provider: "vtu_ng",
+      airtimeEnabled: input.airtimeEnabled !== undefined ? normalizeBoolean(input.airtimeEnabled) : !!before.airtimeEnabled,
+      dataEnabled: input.dataEnabled !== undefined ? normalizeBoolean(input.dataEnabled) : !!before.dataEnabled,
+      airtimeMarkupPercent: normalizePercent(input.airtimeMarkupPercent ?? before.airtimeMarkupPercent ?? "0", "Airtime markup"),
+      dataMarkupPercent: normalizePercent(input.dataMarkupPercent ?? before.dataMarkupPercent ?? "0", "Data markup"),
+      minAirtimeAmount: normalizeAmount(input.minAirtimeAmount ?? before.minAirtimeAmount ?? "100", "Minimum airtime amount"),
+      maxAirtimeAmount: normalizeAmount(input.maxAirtimeAmount ?? before.maxAirtimeAmount ?? "50000", "Maximum airtime amount"),
+      lowBalanceThreshold: normalizeNonNegativeAmount(input.lowBalanceThreshold ?? before.lowBalanceThreshold ?? "5000", "Low balance threshold"),
+      updatedBy: admin?.id || "admin",
+      updatedAt: this.clock(),
+    };
+    if (compare(next.minAirtimeAmount, next.maxAirtimeAmount) > 0) {
+      throw new Error("Minimum airtime amount cannot be higher than maximum airtime amount.");
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "username") && String(input.username || "").trim()) {
+      next.usernameEncrypted = encryptSetting(String(input.username || "").trim());
+      next.accessTokenEncrypted = "";
+      next.tokenObtainedAt = null;
+      next.tokenExpiresAt = null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "password") && String(input.password || "").trim()) {
+      next.passwordEncrypted = encryptSetting(String(input.password || ""));
+      next.accessTokenEncrypted = "";
+      next.tokenObtainedAt = null;
+      next.tokenExpiresAt = null;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "pin") && String(input.pin || "").trim()) {
+      next.pinEncrypted = encryptSetting(String(input.pin || "").trim());
+    }
+    next.configured = !!(next.usernameEncrypted && next.passwordEncrypted);
+    this.db.systemSettings.vtu = next;
+    this.audit(admin, "VTU_SETTINGS_UPDATED", "SystemSettings", "vtu", {
+      airtimeEnabled: next.airtimeEnabled,
+      dataEnabled: next.dataEnabled,
+      configured: next.configured,
+    }, requestMeta);
+    this.persist();
+    return this.sanitizeVtuSettings(next);
+  }
+
+  saveVtuToken(input = {}) {
+    this.ensureState();
+    this.db.systemSettings.vtu = {
+      ...this.db.systemSettings.vtu,
+      accessTokenEncrypted: input.accessTokenEncrypted || "",
+      tokenObtainedAt: input.tokenObtainedAt || this.clock(),
+      tokenExpiresAt: input.tokenExpiresAt || null,
+      updatedAt: this.clock(),
+    };
+    this.persist();
+  }
+
+  updateVtuBalanceCache(balance, status = "connected") {
+    this.ensureState();
+    this.db.systemSettings.vtu = {
+      ...this.db.systemSettings.vtu,
+      lastKnownBalance: String(balance ?? "0"),
+      lastBalanceCheckedAt: this.clock(),
+      lastConnectionTestAt: this.clock(),
+      lastConnectionStatus: status,
+      updatedAt: this.clock(),
+    };
+    this.persist();
+    return this.sanitizeVtuSettings(this.db.systemSettings.vtu);
+  }
+
+  createVtuRequestId(productType = "vtu") {
+    const prefix = String(productType || "vtu").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 8) || "vtu";
+    return `${prefix}_${Date.now().toString(36)}_${this.idGenerator(10).toLowerCase().replace(/[^a-z0-9]/g, "")}`.slice(0, 50);
+  }
+
+  calculateVtuSellingPrice(providerCost, markupPercent = "0") {
+    const cost = normalizeAmount(providerCost, "VTU amount");
+    const markup = multiplyRatio(cost, normalizePercent(markupPercent, "VTU markup"), "100");
+    return {
+      providerCost: cost,
+      markupAmount: markup,
+      sellingPrice: add(cost, markup),
+    };
   }
 
   migrateLegacyUserBalance(user) {
@@ -363,7 +546,7 @@ class FinancialService {
 
   updateSettings(admin, patch = {}, requestMeta = {}) {
     this.ensureState();
-    const before = this.getSettings();
+    const before = clone(this.db.systemSettings);
     const next = {
       ...before,
       general: {
@@ -679,18 +862,285 @@ class FinancialService {
         createdAt: withdrawal.submittedAt,
         userId: withdrawal.userId,
       }));
+    const vtuPurchases = this.db.vtuTransactions
+      .filter(canSee)
+      .map((transaction) => ({
+        id: transaction.id,
+        kind: "VTU",
+        type: transaction.productType === "data" ? "VTU_DATA" : "VTU_AIRTIME",
+        status: String(transaction.status || "processing").toUpperCase(),
+        currency: "NGN",
+        amount: `-${transaction.amountCharged}`,
+        displayAmounts: this.getDisplayAmounts(transaction.amountCharged, "NGN"),
+        reference: transaction.requestId,
+        description: transaction.productType === "data"
+          ? `Data ${String(transaction.network || "").toUpperCase()} ${transaction.planName || ""}`.trim()
+          : `Airtime ${String(transaction.network || "").toUpperCase()}`.trim(),
+        createdAt: transaction.createdAt,
+        userId: transaction.userId,
+        metadata: {
+          productType: transaction.productType,
+          phone: transaction.phone,
+          network: transaction.network,
+          planName: transaction.planName,
+          faceValue: transaction.faceValue,
+          providerStatus: transaction.providerStatus,
+        },
+      }));
     const ledgerTransactions = this.db.transactions
-      .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL"].includes(transaction.type))
+      .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL", ...VTU_LEDGER_TYPES].includes(transaction.type))
       .map((transaction) => ({
         ...clone(transaction),
         kind: "LEDGER",
         displayAmounts: transaction.metadata?.displayAmounts || this.getDisplayAmounts(transaction.amount, transaction.currency),
       }));
 
-    return [...deposits, ...withdrawals, ...ledgerTransactions]
+    return [...deposits, ...withdrawals, ...vtuPurchases, ...ledgerTransactions]
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(0, limit)
       .map((item) => this.enrichUserRecord(item));
+  }
+
+  createVtuTransaction(user, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (!user || user.role !== "user") {
+      throw new Error("User not found.");
+    }
+    const productType = String(input.productType || "").trim().toLowerCase();
+    if (!["airtime", "data"].includes(productType)) {
+      throw new Error("Select airtime or data.");
+    }
+    const requestId = String(input.requestId || this.createVtuRequestId(productType)).trim();
+    const amountCharged = normalizeAmount(input.amountCharged, "Amount");
+    const providerCost = normalizeAmount(input.providerCost ?? amountCharged, "Provider amount");
+    const wallet = this.ensureWallet(user.id, "NGN");
+    if (compare(wallet.availableBalance, amountCharged) < 0) {
+      const error = new Error("Insufficient NGN balance.");
+      error.code = "INSUFFICIENT_BALANCE";
+      throw error;
+    }
+
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = subtract(wallet.availableBalance, amountCharged);
+    wallet.lockedBalance = add(wallet.lockedBalance, amountCharged);
+    wallet.updatedAt = this.clock();
+
+    const transaction = {
+      id: this.idGenerator(12),
+      userId: user.id,
+      requestId,
+      provider: "vtu_ng",
+      productType,
+      phone: String(input.phone || "").trim(),
+      network: String(input.network || "").trim().toLowerCase(),
+      variationId: String(input.variationId || "").trim(),
+      planName: String(input.planName || "").trim(),
+      faceValue: String(input.faceValue || providerCost),
+      providerCost,
+      amountCharged,
+      markupAmount: String(input.markupAmount || "0"),
+      status: "processing",
+      providerOrderId: "",
+      providerStatus: "queued",
+      providerResponse: null,
+      failureReason: "",
+      walletReservedAmount: amountCharged,
+      balanceReserved: true,
+      createdAt: this.clock(),
+      updatedAt: this.clock(),
+      completedAt: null,
+      refundedAt: null,
+    };
+    this.db.vtuTransactions.unshift(transaction);
+    this.db.transactions.unshift({
+      id: this.idGenerator(12),
+      userId: user.id,
+      type: productType === "data" ? "VTU_DATA" : "VTU_AIRTIME",
+      currency: "NGN",
+      amount: `-${amountCharged}`,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      reference: requestId,
+      status: "PROCESSING",
+      description: productType === "data" ? `Data purchase ${transaction.planName}` : "Airtime purchase",
+      createdBy: user.id,
+      createdAt: this.clock(),
+      metadata: {
+        productType,
+        phone: transaction.phone,
+        network: transaction.network,
+        displayAmounts: this.getDisplayAmounts(amountCharged, "NGN"),
+      },
+    });
+    this.createNotification({
+      userId: user.id,
+      type: "VTU",
+      title: productType === "data" ? "Data order" : "Airtime order",
+      message: "Your order is processing.",
+      entityType: "VTU",
+      entityId: transaction.id,
+    });
+    this.audit(user, "VTU_PURCHASE_CREATED", "VtuTransaction", transaction.id, {
+      productType,
+      amountCharged,
+      requestId,
+    }, requestMeta);
+    this.persist();
+    return clone(transaction);
+  }
+
+  updateVtuLedgerStatus(requestId, status, balanceAfter = null) {
+    const normalized = String(requestId || "").trim();
+    const ledger = this.db.transactions.find((item) => VTU_LEDGER_TYPES.includes(item.type) && item.reference === normalized);
+    if (ledger) {
+      ledger.status = status;
+      if (balanceAfter !== null) {
+        ledger.balanceAfter = balanceAfter;
+      }
+    }
+  }
+
+  applyVtuProviderResult(requestId, payload = {}, actor = { id: "vtu", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const normalizedRequestId = String(requestId || "").trim();
+    const transaction = this.db.vtuTransactions.find((item) => item.requestId === normalizedRequestId || item.id === normalizedRequestId);
+    if (!transaction) {
+      throw new Error("VTU transaction not found.");
+    }
+    const providerData = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const mappedStatus = payload.mappedStatus || mapVtuProviderStatus(providerData.status, payload.code);
+    if (VTU_FINAL_STATUSES.includes(transaction.status) && !transaction.balanceReserved) {
+      return clone(transaction);
+    }
+    transaction.providerStatus = String(providerData.status || transaction.providerStatus || "").trim();
+    transaction.providerOrderId = String(providerData.order_id || providerData.orderId || providerData.id || transaction.providerOrderId || "").trim();
+    transaction.providerResponse = clone(payload || {});
+    if (providerData.amount_charged !== undefined && providerData.amount_charged !== null && providerData.amount_charged !== "") {
+      transaction.providerCost = normalizeAmount(providerData.amount_charged, "Provider amount");
+      transaction.markupAmount = subtract(transaction.amountCharged, transaction.providerCost);
+    }
+    transaction.updatedAt = this.clock();
+
+    const wallet = this.ensureWallet(transaction.userId, "NGN");
+    if (mappedStatus === "successful") {
+      if (transaction.balanceReserved) {
+        wallet.lockedBalance = subtract(wallet.lockedBalance, transaction.walletReservedAmount);
+        wallet.updatedAt = this.clock();
+        transaction.balanceReserved = false;
+      }
+      transaction.status = "successful";
+      transaction.completedAt = transaction.completedAt || this.clock();
+      this.updateVtuLedgerStatus(transaction.requestId, "SUCCESSFUL", wallet.availableBalance);
+      this.createNotification({
+        userId: transaction.userId,
+        type: "VTU",
+        title: "Order successful",
+        message: transaction.productType === "data" ? "Your data purchase is complete." : "Your airtime purchase is complete.",
+        entityType: "VTU",
+        entityId: transaction.id,
+      });
+    } else if (mappedStatus === "failed" || mappedStatus === "refunded") {
+      if (transaction.balanceReserved) {
+        const balanceBefore = wallet.availableBalance;
+        wallet.availableBalance = add(wallet.availableBalance, transaction.walletReservedAmount);
+        wallet.lockedBalance = subtract(wallet.lockedBalance, transaction.walletReservedAmount);
+        wallet.updatedAt = this.clock();
+        this.db.transactions.unshift({
+          id: this.idGenerator(12),
+          userId: transaction.userId,
+          type: "VTU_REFUND",
+          currency: "NGN",
+          amount: transaction.walletReservedAmount,
+          balanceBefore,
+          balanceAfter: wallet.availableBalance,
+          reference: transaction.requestId,
+          status: "SUCCESSFUL",
+          description: "VTU refund",
+          createdBy: actor?.id || "vtu",
+          createdAt: this.clock(),
+          metadata: {
+            vtuTransactionId: transaction.id,
+            productType: transaction.productType,
+            displayAmounts: this.getDisplayAmounts(transaction.walletReservedAmount, "NGN"),
+          },
+        });
+        transaction.balanceReserved = false;
+      }
+      transaction.status = mappedStatus;
+      transaction.refundedAt = mappedStatus === "refunded" ? (transaction.refundedAt || this.clock()) : transaction.refundedAt;
+      transaction.completedAt = transaction.completedAt || this.clock();
+      transaction.failureReason = String(providerData.message || payload.message || providerData.reason || transaction.failureReason || "").trim();
+      this.updateVtuLedgerStatus(transaction.requestId, mappedStatus === "refunded" ? "REFUNDED" : "FAILED", wallet.availableBalance);
+      this.createNotification({
+        userId: transaction.userId,
+        type: "VTU",
+        title: mappedStatus === "refunded" ? "Order refunded" : "Order failed",
+        message: "Your wallet has been updated.",
+        entityType: "VTU",
+        entityId: transaction.id,
+      });
+    } else {
+      transaction.status = "processing";
+      this.updateVtuLedgerStatus(transaction.requestId, "PROCESSING");
+    }
+
+    this.audit(actor, "VTU_PROVIDER_RESULT_APPLIED", "VtuTransaction", transaction.id, {
+      requestId: transaction.requestId,
+      status: transaction.status,
+    }, requestMeta);
+    this.persist();
+    return clone(transaction);
+  }
+
+  listVtuTransactions(user, { limit = 100, offset = 0, status = "" } = {}) {
+    this.ensureState();
+    const normalizedStatus = String(status || "").trim().toLowerCase();
+    return this.db.vtuTransactions
+      .filter((item) => (user.role === "admin" || item.userId === user.id) && (!normalizedStatus || item.status === normalizedStatus))
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      .slice(offset, offset + limit)
+      .map((item) => this.enrichUserRecord(item));
+  }
+
+  getVtuTransaction(user, idOrRequestId) {
+    this.ensureState();
+    const lookup = String(idOrRequestId || "").trim();
+    const transaction = this.db.vtuTransactions.find((item) => item.id === lookup || item.requestId === lookup);
+    if (!transaction || (user.role !== "admin" && transaction.userId !== user.id)) {
+      throw new Error("VTU transaction not found.");
+    }
+    return clone(transaction);
+  }
+
+  getVtuAdminSummary() {
+    this.ensureState();
+    const summary = {
+      totalSales: "0",
+      successfulSales: "0",
+      processingSales: "0",
+      refundedSales: "0",
+      estimatedProfit: "0",
+      totalCount: this.db.vtuTransactions.length,
+      successfulCount: 0,
+      processingCount: 0,
+      failedCount: 0,
+      settings: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
+    };
+    for (const transaction of this.db.vtuTransactions) {
+      if (transaction.status === "successful") {
+        summary.successfulCount += 1;
+        summary.totalSales = add(summary.totalSales, transaction.amountCharged || "0");
+        summary.successfulSales = add(summary.successfulSales, transaction.amountCharged || "0");
+        summary.estimatedProfit = add(summary.estimatedProfit, transaction.markupAmount || "0");
+      } else if (VTU_ACTIVE_STATUSES.includes(transaction.status)) {
+        summary.processingCount += 1;
+        summary.processingSales = add(summary.processingSales, transaction.amountCharged || "0");
+      } else {
+        summary.failedCount += 1;
+        summary.refundedSales = add(summary.refundedSales, transaction.amountCharged || "0");
+      }
+    }
+    return summary;
   }
 
   listNotifications(user, { limit = 20, includeRead = true } = {}) {
@@ -2589,7 +3039,9 @@ class FinancialService {
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
         telegram: clone(this.db.systemSettings.telegram),
+        vtu: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
       },
+      vtu: this.getVtuAdminSummary(),
       todayPnl: this.getTodayPnl(),
       totalPnl: this.db.transactions
         .filter((transaction) => ["TRADING_PROFIT", "TRADING_LOSS"].includes(transaction.type))
@@ -2619,8 +3071,9 @@ class FinancialService {
     const transactionIds = new Set((input.transactionIds || []).map((id) => String(id || "").trim()).filter(Boolean));
     const depositIds = new Set((input.depositIds || []).map((id) => String(id || "").trim()).filter(Boolean));
     const withdrawalIds = new Set((input.withdrawalIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+    const vtuTransactionIds = new Set((input.vtuTransactionIds || []).map((id) => String(id || "").trim()).filter(Boolean));
 
-    if (!transactionIds.size && !depositIds.size && !withdrawalIds.size) {
+    if (!transactionIds.size && !depositIds.size && !withdrawalIds.size && !vtuTransactionIds.size) {
       throw new Error("Select at least one history item.");
     }
 
@@ -2628,17 +3081,20 @@ class FinancialService {
       transactions: this.db.transactions.length,
       deposits: this.db.deposits.length,
       withdrawals: this.db.withdrawals.length,
+      vtuTransactions: this.db.vtuTransactions.length,
     };
     this.db.transactions = this.db.transactions.filter((item) => !transactionIds.has(item.id));
     this.db.deposits = this.db.deposits.filter((item) => !depositIds.has(item.id));
     this.db.withdrawals = this.db.withdrawals.filter((item) => !withdrawalIds.has(item.id));
+    this.db.vtuTransactions = this.db.vtuTransactions.filter((item) => !vtuTransactionIds.has(item.id));
 
     const deleted = {
       transactions: before.transactions - this.db.transactions.length,
       deposits: before.deposits - this.db.deposits.length,
       withdrawals: before.withdrawals - this.db.withdrawals.length,
+      vtuTransactions: before.vtuTransactions - this.db.vtuTransactions.length,
     };
-    const deletedCount = deleted.transactions + deleted.deposits + deleted.withdrawals;
+    const deletedCount = deleted.transactions + deleted.deposits + deleted.withdrawals + deleted.vtuTransactions;
     if (!deletedCount) {
       throw new Error("Selected history was not found.");
     }
@@ -2700,6 +3156,31 @@ class FinancialService {
       provider: "paystack",
       eventType: String(eventType || "").trim(),
       reference: String(reference || "").trim(),
+      payloadHash: normalizedHash,
+      processed: false,
+      createdAt: this.clock(),
+      processedAt: null,
+    };
+    this.db.webhookEvents.unshift(event);
+    this.persist();
+    return { duplicate: false, event };
+  }
+
+  recordVtuWebhookEvent({ requestId, payloadHash, status = "" } = {}) {
+    this.ensureState();
+    const normalizedHash = String(payloadHash || "").trim();
+    const normalizedRequestId = String(requestId || "").trim();
+    const existing = this.db.webhookEvents.find(
+      (item) => item.provider === "vtu_ng" && (item.payloadHash === normalizedHash || (normalizedRequestId && item.reference === normalizedRequestId && item.eventType === status))
+    );
+    if (existing) {
+      return { duplicate: !!existing.processed, event: clone(existing) };
+    }
+    const event = {
+      id: this.idGenerator(12),
+      provider: "vtu_ng",
+      eventType: String(status || "").trim(),
+      reference: normalizedRequestId,
       payloadHash: normalizedHash,
       processed: false,
       createdAt: this.clock(),
