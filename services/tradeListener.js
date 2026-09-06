@@ -256,31 +256,37 @@ function buildPublicTradeClosedMessage({ exchange, trade, exitOrder, profitPerce
 }
 
 function buildTargetMessage(exchange) {
-  if (normalizeExchange(exchange) === "bybit") {
-    return [
-      "📊 Bybit Update",
-      "",
-      "🎯 Daily Profit Target Reached: 2%",
-      "",
-      "For bybit mirrored user, wawooo! 💃",
-      "You have hit the daily target of 2% today 🎉",
-    ].join("\n");
-  }
-
   return [
-    "📊 Binance Update",
+    `📊 ${getExchangeLabel(exchange)} Update`,
     "",
-    "🎯 Daily Profit Target Reached: 2%",
+    `🎯 Daily Profit Target Reached: ${DAILY_PROFIT_TARGET_PERCENT}%`,
+    "",
+    "Congratulations 🎉",
+    `You have hit the daily target of ${DAILY_PROFIT_TARGET_PERCENT}% today.`,
   ].join("\n");
 }
 
-function buildDailyTargetMessage(exchange) {
+function buildDailyTargetMessage(exchange, totalPercent = DAILY_PROFIT_TARGET_PERCENT) {
   return [
-    `${getExchangeLabel(exchange)} Update`,
+    "🎉 Daily Target Hit",
+    `${getExchangeLabel(exchange)} Profit Update`,
     "",
-    `Daily ${DAILY_PROFIT_TARGET_PERCENT}% Target Reached`,
+    `✅ Daily ${DAILY_PROFIT_TARGET_PERCENT}% target accomplished today`,
     "",
-    `Congratulations. The daily ${DAILY_PROFIT_TARGET_PERCENT}% target has been reached.`,
+    "Total profit today",
+    formatSignedPercent(totalPercent),
+  ].join("\n");
+}
+
+function buildDailyAdditionalProfitMessage(exchange, additionalPercent, totalPercent) {
+  return [
+    "🎉 Profit Update",
+    `${getExchangeLabel(exchange)} Daily Progress`,
+    "",
+    `Congratulations! You have ${formatSignedPercent(additionalPercent)} profit in addition to the daily ${DAILY_PROFIT_TARGET_PERCENT}% accomplished today.`,
+    "",
+    "Total profit today",
+    formatSignedPercent(totalPercent),
   ].join("\n");
 }
 
@@ -587,14 +593,27 @@ class TradeListener {
       this.bybitDailyProfit += numericProfit;
     }
 
-    if (this.getDailyProfit(normalizedExchange) >= DAILY_PROFIT_TARGET_PERCENT && !this.hasTargetHit(normalizedExchange)) {
+    const dailyProfit = this.getDailyProfit(normalizedExchange);
+    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && !this.hasTargetHit(normalizedExchange)) {
       this.markTargetHit(normalizedExchange);
-      const message = buildDailyTargetMessage(normalizedExchange);
+      const message = buildDailyTargetMessage(normalizedExchange, dailyProfit);
       await this.broadcast(message, "dailyProfit", {
         exchange: normalizedExchange,
       });
       await this.sendChannel(message, {
         type: "DAILY_TARGET",
+        exchange: normalizedExchange,
+      });
+      return;
+    }
+
+    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && this.hasTargetHit(normalizedExchange) && numericProfit > 0) {
+      const message = buildDailyAdditionalProfitMessage(normalizedExchange, numericProfit, dailyProfit);
+      await this.broadcast(message, "dailyProfit", {
+        exchange: normalizedExchange,
+      });
+      await this.sendChannel(message, {
+        type: "DAILY_EXTRA_PROFIT",
         exchange: normalizedExchange,
       });
     }
