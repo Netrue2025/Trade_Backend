@@ -493,14 +493,6 @@ async function getTickerPrice(symbol, testnet, exchange = "bybit") {
   return getExchangeClient(exchange).getTickerPrice(symbol, testnet);
 }
 
-async function getBookTicker(symbol, testnet, exchange = "bybit") {
-  const client = getExchangeClient(exchange);
-  if (typeof client.getBookTicker === "function") {
-    return client.getBookTicker(symbol, testnet);
-  }
-  return null;
-}
-
 async function getTickerPrices(testnet, exchange = "bybit") {
   return getExchangeClient(exchange).getTickerPrices(testnet);
 }
@@ -3439,10 +3431,7 @@ function normalizeOrderInput(body) {
   const symbol = String(body.symbol || "").trim().toUpperCase();
   const side = String(body.side || "").trim().toUpperCase();
   const type = String(body.type || "").trim().toUpperCase();
-  const rawTimeInForce = String(body.timeInForce || (type === "LIMIT" ? "POST_ONLY" : "GTC")).trim().toUpperCase();
-  const timeInForce = ["POSTONLY", "POST_ONLY", "MAKER_ONLY", "LIMIT_MAKER"].includes(rawTimeInForce)
-    ? "POST_ONLY"
-    : rawTimeInForce;
+  const timeInForce = String(body.timeInForce || "GTC").trim().toUpperCase();
   const quantity = body.quantity ? String(body.quantity).trim() : "";
   const quoteOrderQty = type === "LIMIT" ? "" : body.quoteOrderQty ? String(body.quoteOrderQty).trim() : "";
   const price = body.price ? String(body.price).trim() : "";
@@ -3789,40 +3778,6 @@ async function validateNotionalRule(account, orderInput, exchangeInfoOverride = 
   }
 }
 
-async function assertLimitOrderWillRest(account, orderInput) {
-  if (orderInput.type !== "LIMIT") {
-    return;
-  }
-
-  const exchange = getAccountExchange(account);
-  const [bookTicker, ticker] = await Promise.all([
-    getBookTicker(orderInput.symbol, account.testnet, exchange).catch(() => null),
-    getTickerPrice(orderInput.symbol, account.testnet, exchange).catch(() => null),
-  ]);
-  const bestAsk = Number(bookTicker?.askPrice || 0);
-  const bestBid = Number(bookTicker?.bidPrice || 0);
-  const fallbackLivePrice = Number(ticker?.price || 0);
-  const limitPrice = Number(orderInput.price || 0);
-
-  if (!limitPrice) {
-    return;
-  }
-
-  const buyCrossPrice = bestAsk || fallbackLivePrice;
-  if (orderInput.side === "BUY" && buyCrossPrice && limitPrice >= buyCrossPrice) {
-    throw new Error(
-      `Limit buy for ${orderInput.symbol} would fill immediately at ${buyCrossPrice}. Set your limit below the best ask or use Market.`
-    );
-  }
-
-  const sellCrossPrice = bestBid || fallbackLivePrice;
-  if (orderInput.side === "SELL" && sellCrossPrice && limitPrice <= sellCrossPrice) {
-    throw new Error(
-      `Limit sell for ${orderInput.symbol} would fill immediately at ${sellCrossPrice}. Set your limit above the best bid or use Market.`
-    );
-  }
-}
-
 async function constrainBuyQuantityToAvailableBalance(account, orderInput, exchangeInfoOverride = null) {
   if (orderInput.side !== "BUY" || !orderInput.quantity || orderInput.quoteOrderQty) {
     return orderInput;
@@ -4046,7 +4001,6 @@ async function executeOrderForUser(user, orderInput, purpose, exchange) {
       exchangeInfo
     );
     await validateNotionalRule({ ...account, exchange: normalizedExchange }, balanceSafeOrderInput, exchangeInfo);
-    await assertLimitOrderWillRest({ ...account, exchange: normalizedExchange }, balanceSafeOrderInput);
     const order = await placeSpotOrder({ ...account, exchange: normalizedExchange }, balanceSafeOrderInput, normalizedExchange);
     account.lastValidatedAt = nowIso();
     persist();
@@ -4166,7 +4120,6 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, resolvedOrderInput, exchangeInfo);
   const balanceSafeOrderInput = await constrainBuyQuantityToAvailableBalance({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
   await validateNotionalRule({ ...adminAccount, exchange }, balanceSafeOrderInput, exchangeInfo);
-  await assertLimitOrderWillRest({ ...adminAccount, exchange }, balanceSafeOrderInput);
   const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, balanceSafeOrderInput, exchange);
   const trade = {
     id: randomId(12),
