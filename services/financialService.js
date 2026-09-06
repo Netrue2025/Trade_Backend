@@ -20,9 +20,15 @@ const MIN_WITHDRAWAL_AMOUNTS = {
   NGN: "500",
   USDT: "50",
 };
+const MESSAGE_NOTIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function addMillisecondsToIso(isoValue, durationMs) {
+  const timestamp = Date.parse(isoValue || "");
+  return new Date((Number.isFinite(timestamp) ? timestamp : Date.now()) + durationMs).toISOString();
 }
 
 function normalizeCurrency(value, fallback = "USDT") {
@@ -664,6 +670,7 @@ class FinancialService {
 
   listNotifications(user, { limit = 20, includeRead = true } = {}) {
     this.ensureState();
+    this.pruneExpiredMessageNotifications();
     return this.db.notifications
       .filter((item) => item.userId === user.id && (includeRead || !item.readAt))
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
@@ -673,6 +680,7 @@ class FinancialService {
 
   markNotificationRead(user, notificationId) {
     this.ensureState();
+    this.pruneExpiredMessageNotifications();
     const notification = this.db.notifications.find((item) => item.id === notificationId && item.userId === user.id);
     if (!notification) {
       throw new Error("Notification not found.");
@@ -683,6 +691,7 @@ class FinancialService {
   }
 
   createNotification(input = {}) {
+    const createdAt = this.clock();
     const notification = {
       id: this.idGenerator(12),
       userId: input.userId || "",
@@ -691,11 +700,28 @@ class FinancialService {
       message: String(input.message || "").trim(),
       entityType: String(input.entityType || "").trim(),
       entityId: String(input.entityId || "").trim(),
+      expiresAt: input.expiresAt || null,
       readAt: null,
-      createdAt: this.clock(),
+      createdAt,
     };
     this.db.notifications.unshift(notification);
     return notification;
+  }
+
+  pruneExpiredMessageNotifications() {
+    this.ensureState();
+    const before = this.db.notifications.length;
+    const now = Date.parse(this.clock());
+    this.db.notifications = this.db.notifications.filter((item) => {
+      if (String(item.type || "").toUpperCase() !== "MESSAGE") {
+        return true;
+      }
+      const expiresAt = Date.parse(item.expiresAt || "");
+      return !Number.isFinite(expiresAt) || expiresAt > now;
+    });
+    if (this.db.notifications.length !== before) {
+      this.persist();
+    }
   }
 
   notifyAdmins(input = {}) {
@@ -1566,6 +1592,7 @@ class FinancialService {
       message,
       entityType: "User",
       entityId: targetUser.id,
+      expiresAt: addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS),
     });
     this.audit(admin, "ADMIN_MESSAGE_SENT", "User", targetUser.id, { notificationId: notification.id }, requestMeta);
     this.persist();
@@ -1591,6 +1618,7 @@ class FinancialService {
         message: `${user.name || user.email || "User"}: ${message}`,
         entityType: "User",
         entityId: user.id,
+        expiresAt: addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS),
       }));
     }
     this.audit(user, "SUPPORT_MESSAGE_SENT", "User", user.id, { count: notifications.length }, requestMeta);

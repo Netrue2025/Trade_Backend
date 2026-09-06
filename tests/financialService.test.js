@@ -892,6 +892,30 @@ test("user support message creates admin notification", () => {
   assert.match(service.listNotifications(admin)[0].message, /withdrawal/);
 });
 
+test("chat notifications expire after 24 hours", () => {
+  const { admin, service, user } = createHarness();
+
+  const messages = service.sendSupportMessage(user, {
+    message: "Short lived chat.",
+  });
+  service.createNotification({
+    userId: admin.id,
+    type: "DEPOSIT",
+    title: "Deposit",
+    message: "Persistent finance notice.",
+  });
+
+  assert.ok(messages[0].expiresAt);
+  assert.equal(service.listNotifications(admin).filter((item) => item.type === "MESSAGE").length, 1);
+
+  service.clock = () => "2026-08-31T10:00:01.000Z";
+  const remaining = service.listNotifications(admin);
+
+  assert.equal(remaining.some((item) => item.type === "MESSAGE"), false);
+  assert.equal(remaining.some((item) => item.type === "DEPOSIT"), true);
+  assert.equal(service.db.notifications.some((item) => item.type === "MESSAGE"), false);
+});
+
 test("admin can delete selected finance history records", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
