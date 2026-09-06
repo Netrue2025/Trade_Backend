@@ -6656,14 +6656,14 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const notification = financialService.sendAdminMessage(
+      const result = financialService.sendAdminMessage(
         admin,
         decodeURIComponent(adminUserMessageMatch[1] || "").trim(),
         await readBody(req),
         getRequestMeta(req)
       );
       scheduleSettingsUsersBroadcast("admin_message_sent");
-      sendJson(res, 201, { notification });
+      sendJson(res, 201, result.notification ? result : { notification: result });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }

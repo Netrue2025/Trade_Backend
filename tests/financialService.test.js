@@ -937,7 +937,26 @@ test("user support message creates admin notification", () => {
   assert.equal(notifications[0].userId, admin.id);
   assert.equal(notifications[0].type, "MESSAGE");
   assert.match(notifications[0].message, /Ada User/);
+  assert.equal(notifications[0].entityType, "ChatMessage");
+  assert.equal(notifications[0].metadata.conversationUserId, user.id);
+  assert.equal(service.db.chatMessages.length, 1);
+  assert.equal(service.db.chatMessages[0].conversationUserId, user.id);
   assert.match(service.listNotifications(admin)[0].message, /withdrawal/);
+});
+
+test("admin reply creates a temporary user chat message", () => {
+  const { admin, service, user } = createHarness();
+
+  const result = service.sendAdminMessage(admin, user.id, {
+    message: "Your withdrawal has been reviewed.",
+  });
+
+  assert.equal(result.notification.userId, user.id);
+  assert.equal(result.notification.entityType, "ChatMessage");
+  assert.equal(result.notification.metadata.conversationUserId, user.id);
+  assert.equal(result.message.conversationUserId, user.id);
+  assert.equal(result.message.senderRole, "admin");
+  assert.equal(service.db.chatMessages.length, 1);
 });
 
 test("chat notifications expire after 24 hours", () => {
@@ -954,6 +973,7 @@ test("chat notifications expire after 24 hours", () => {
   });
 
   assert.ok(messages[0].expiresAt);
+  assert.equal(service.db.chatMessages.length, 1);
   assert.equal(service.listNotifications(admin).filter((item) => item.type === "MESSAGE").length, 1);
 
   service.clock = () => "2026-08-31T10:00:01.000Z";
@@ -962,6 +982,7 @@ test("chat notifications expire after 24 hours", () => {
   assert.equal(remaining.some((item) => item.type === "MESSAGE"), false);
   assert.equal(remaining.some((item) => item.type === "DEPOSIT"), true);
   assert.equal(service.db.notifications.some((item) => item.type === "MESSAGE"), false);
+  assert.equal(service.db.chatMessages.length, 0);
 });
 
 test("admin can delete selected finance history records", () => {

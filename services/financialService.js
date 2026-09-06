@@ -239,6 +239,7 @@ class FinancialService {
     this.db.giftCards = Array.isArray(this.db.giftCards) ? this.db.giftCards : [];
     this.db.tradeInvestments = Array.isArray(this.db.tradeInvestments) ? this.db.tradeInvestments : [];
     this.db.notifications = Array.isArray(this.db.notifications) ? this.db.notifications : [];
+    this.db.chatMessages = Array.isArray(this.db.chatMessages) ? this.db.chatMessages : [];
     this.db.dailyPerformances = Array.isArray(this.db.dailyPerformances) ? this.db.dailyPerformances : [];
     this.db.auditLogs = Array.isArray(this.db.auditLogs) ? this.db.auditLogs : [];
     this.db.idempotencyKeys = Array.isArray(this.db.idempotencyKeys) ? this.db.idempotencyKeys : [];
@@ -724,6 +725,7 @@ class FinancialService {
       message: String(input.message || "").trim(),
       entityType: String(input.entityType || "").trim(),
       entityId: String(input.entityId || "").trim(),
+      metadata: input.metadata && typeof input.metadata === "object" ? clone(input.metadata) : {},
       expiresAt: input.expiresAt || null,
       readAt: null,
       createdAt,
@@ -734,7 +736,8 @@ class FinancialService {
 
   pruneExpiredMessageNotifications() {
     this.ensureState();
-    const before = this.db.notifications.length;
+    const beforeNotifications = this.db.notifications.length;
+    const beforeChatMessages = this.db.chatMessages.length;
     const now = Date.parse(this.clock());
     this.db.notifications = this.db.notifications.filter((item) => {
       if (String(item.type || "").toUpperCase() !== "MESSAGE") {
@@ -743,9 +746,31 @@ class FinancialService {
       const expiresAt = Date.parse(item.expiresAt || "");
       return !Number.isFinite(expiresAt) || expiresAt > now;
     });
-    if (this.db.notifications.length !== before) {
+    this.db.chatMessages = this.db.chatMessages.filter((item) => {
+      const expiresAt = Date.parse(item.expiresAt || "");
+      return !Number.isFinite(expiresAt) || expiresAt > now;
+    });
+    if (this.db.notifications.length !== beforeNotifications || this.db.chatMessages.length !== beforeChatMessages) {
       this.persist();
     }
+  }
+
+  createChatMessage(input = {}) {
+    const createdAt = this.clock();
+    const message = {
+      id: this.idGenerator(12),
+      conversationUserId: String(input.conversationUserId || "").trim(),
+      senderId: String(input.senderId || "").trim(),
+      senderRole: String(input.senderRole || "").trim().toLowerCase(),
+      recipientId: String(input.recipientId || "").trim(),
+      recipientRole: String(input.recipientRole || "").trim().toLowerCase(),
+      title: String(input.title || "Message").trim(),
+      message: String(input.message || "").trim(),
+      expiresAt: input.expiresAt || addMillisecondsToIso(createdAt, MESSAGE_NOTIFICATION_TTL_MS),
+      createdAt,
+    };
+    this.db.chatMessages.unshift(message);
+    return message;
   }
 
   notifyAdmins(input = {}) {
@@ -1609,18 +1634,38 @@ class FinancialService {
     if (!message) {
       throw new Error("Message is required.");
     }
+    const expiresAt = addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS);
+    const chatMessage = this.createChatMessage({
+      conversationUserId: targetUser.id,
+      senderId: admin.id,
+      senderRole: "admin",
+      recipientId: targetUser.id,
+      recipientRole: "user",
+      title: String(input.title || "Admin message").trim(),
+      message,
+      expiresAt,
+    });
     const notification = this.createNotification({
       userId: targetUser.id,
       type: "MESSAGE",
       title: String(input.title || "Admin message").trim(),
       message,
-      entityType: "User",
-      entityId: targetUser.id,
-      expiresAt: addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS),
+      entityType: "ChatMessage",
+      entityId: chatMessage.id,
+      metadata: {
+        chatMessageId: chatMessage.id,
+        conversationUserId: targetUser.id,
+        senderId: admin.id,
+        senderRole: "admin",
+      },
+      expiresAt,
     });
-    this.audit(admin, "ADMIN_MESSAGE_SENT", "User", targetUser.id, { notificationId: notification.id }, requestMeta);
+    this.audit(admin, "ADMIN_MESSAGE_SENT", "User", targetUser.id, {
+      notificationId: notification.id,
+      chatMessageId: chatMessage.id,
+    }, requestMeta);
     this.persist();
-    return clone(notification);
+    return { notification: clone(notification), message: clone(chatMessage) };
   }
 
   sendSupportMessage(user, input = {}, requestMeta = {}) {
@@ -1635,14 +1680,31 @@ class FinancialService {
     const title = String(input.title || "Support message").trim() || "Support message";
     const notifications = [];
     for (const admin of this.db.users.filter((item) => item.role === "admin")) {
+      const expiresAt = addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS);
+      const chatMessage = this.createChatMessage({
+        conversationUserId: user.id,
+        senderId: user.id,
+        senderRole: "user",
+        recipientId: admin.id,
+        recipientRole: "admin",
+        title,
+        message,
+        expiresAt,
+      });
       notifications.push(this.createNotification({
         userId: admin.id,
         type: "MESSAGE",
         title,
         message: `${user.name || user.email || "User"}: ${message}`,
-        entityType: "User",
-        entityId: user.id,
-        expiresAt: addMillisecondsToIso(this.clock(), MESSAGE_NOTIFICATION_TTL_MS),
+        entityType: "ChatMessage",
+        entityId: chatMessage.id,
+        metadata: {
+          chatMessageId: chatMessage.id,
+          conversationUserId: user.id,
+          senderId: user.id,
+          senderRole: "user",
+        },
+        expiresAt,
       }));
     }
     this.audit(user, "SUPPORT_MESSAGE_SENT", "User", user.id, { count: notifications.length }, requestMeta);
