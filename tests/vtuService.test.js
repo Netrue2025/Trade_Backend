@@ -112,3 +112,45 @@ test("VTU authenticated request refreshes token once after auth failure", async 
     harness.restoreEnv();
   }
 });
+
+test("VTU data plans expose only active variation ids with reseller pricing", async () => {
+  const harness = createHarness(async (url) => {
+    assert.equal(url.includes("/api/v2/variations/data?service_id=mtn"), true);
+    return jsonResponse({
+      code: "success",
+      data: [
+        {
+          variation_id: 2682,
+          service_id: "mtn",
+          service_name: "MTN",
+          data_plan: "1GB - 30 Days",
+          price: "799",
+          reseller_price: "769.00",
+          availability: "Unavailable",
+        },
+        {
+          variation_id: 2676,
+          service_id: "mtn",
+          service_name: "MTN",
+          data_plan: "1GB + 5 mins - 7 Days",
+          price: "819",
+          reseller_price: "799.00",
+          availability: "Available",
+        },
+      ],
+    });
+  });
+
+  try {
+    const plans = await harness.service.getDataPlans({ network: "mtn", markupPercent: 10 });
+
+    assert.equal(plans.length, 1);
+    assert.equal(plans[0].id, "2676");
+    assert.equal(plans[0].variationId, "2676");
+    assert.equal(plans[0].providerCost, "799");
+    assert.equal(plans[0].sellingPrice, "878.9");
+    assert.equal(plans[0].available, true);
+  } finally {
+    harness.restoreEnv();
+  }
+});

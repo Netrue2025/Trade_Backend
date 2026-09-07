@@ -71,13 +71,23 @@ function parseDataPlanName(name) {
   };
 }
 
+function isDataPlanAvailable(plan = {}) {
+  const availability = normalizeProviderStatus(plan.availability || plan.status || "");
+  if (!availability) {
+    return true;
+  }
+  return availability === "available" || availability === "active";
+}
+
 function sanitizeDataPlan(plan, markupPercent = 0) {
-  const providerCost = toNairaAmount(plan.price);
+  const providerCost = toNairaAmount(plan.reseller_price ?? plan.price);
   const markupAmount = Math.round(providerCost * Number(markupPercent || 0)) / 100;
   const sellingPrice = Math.round((providerCost + markupAmount) * 100) / 100;
   const parsed = parseDataPlanName(plan.data_plan || plan.name || "");
+  const availability = String(plan.availability || plan.status || "").trim();
   return {
     id: String(plan.variation_id || plan.id || "").trim(),
+    variationId: String(plan.variation_id || plan.id || "").trim(),
     network: normalizeProviderStatus(plan.service_id || plan.network),
     networkName: String(plan.service_name || "").trim(),
     name: String(plan.data_plan || plan.name || "").trim(),
@@ -85,7 +95,8 @@ function sanitizeDataPlan(plan, markupPercent = 0) {
     validity: parsed.validity,
     providerCost: String(providerCost),
     sellingPrice: String(sellingPrice),
-    availability: String(plan.availability || "").trim(),
+    availability,
+    available: isDataPlanAvailable({ ...plan, availability }),
   };
 }
 
@@ -252,7 +263,7 @@ class VtuService {
     }
     return plans
       .map((plan) => sanitizeDataPlan(plan, markupPercent))
-      .filter((plan) => plan.id && (!normalizedNetwork || plan.network === normalizedNetwork));
+      .filter((plan) => plan.id && plan.available && (!normalizedNetwork || plan.network === normalizedNetwork));
   }
 
   async purchaseAirtime({ requestId, phone, network, amount }) {

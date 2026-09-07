@@ -5170,10 +5170,10 @@ async function handleApi(req, res, url) {
       const phone = normalizePhone(body.phone);
       const network = normalizeNetwork(body.network);
       const variationId = String(body.variationId || "").trim();
-      const plans = await vtuService.getDataPlans({ network, markupPercent: settings.dataMarkupPercent });
+      const plans = await vtuService.getDataPlans({ network, forceRefresh: true, markupPercent: settings.dataMarkupPercent });
       const plan = plans.find((item) => item.id === variationId);
       if (!plan) {
-        throw new Error("Select a valid data plan.");
+        throw new Error("This data plan is not available now. Please select another plan.");
       }
       if (Number(settings.lastKnownBalance || 0) > 0 && compare(settings.lastKnownBalance, plan.providerCost) < 0) {
         throw new Error("Data service balance is low. Please try again later.");
