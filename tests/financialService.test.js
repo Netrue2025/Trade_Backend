@@ -427,6 +427,40 @@ test("admin balance overwrite clears stale mirrored pnl lots", () => {
   assert.equal(mirrored.totalBalance.liveUsdt, "250");
 });
 
+test("admin balance overwrite retires active trade investments", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "USDT", "20", "80");
+  service.db.tradeInvestments.push({
+    id: "investment-1",
+    userId: user.id,
+    tradeId: "trade-1",
+    amountUsdt: "80",
+    fundingSources: [
+      {
+        currency: "USDT",
+        amount: "80",
+      },
+    ],
+    baselinePnlPercent: "0",
+    status: "ACTIVE",
+    joinedAt: "2026-08-30T09:30:00.000Z",
+  });
+
+  const result = service.setUserBalance(admin, user.id, {
+    currency: "USDT",
+    amount: "25",
+    note: "Authoritative correction",
+  });
+
+  const wallet = service.ensureWallet(user.id, "USDT");
+  assert.equal(wallet.availableBalance, "25");
+  assert.equal(wallet.lockedBalance, "0");
+  assert.equal(service.db.tradeInvestments[0].status, "STOPPED");
+  assert.equal(service.db.tradeInvestments[0].stopReason, "ADMIN_BALANCE_OVERWRITE");
+  assert.equal(result.transaction.metadata.clearedActiveInvestments, 1);
+  assert.equal(result.transaction.metadata.releasedInvestmentLocks[0].amount, "80");
+});
+
 test("withdrawal is blocked while user has an active trade investment", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");
@@ -584,6 +618,23 @@ test("admin can set a user balance", () => {
   assert.equal(result.transaction.amount, "27");
   assert.equal(result.transaction.metadata.clearedCurrency, "NGN");
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
+});
+
+test("admin balance overwrite prevents stale legacy balance remigration", () => {
+  const { admin, service, user } = createHarness();
+  user.balance = "75000";
+  setWallet(service, user.id, "NGN", "75000");
+
+  service.setUserBalance(admin, user.id, {
+    currency: "NGN",
+    amount: "0",
+    note: "Reset",
+  });
+  service.ensureState();
+
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "0");
+  assert.equal(service.getAvailableUsdtEquivalent(user.id), "0");
+  assert.equal(user.legacyBalanceMigratedAt, "2026-08-30T10:00:00.000Z");
 });
 
 test("user can transfer wallet funds by registered email", () => {

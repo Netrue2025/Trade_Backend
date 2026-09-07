@@ -1452,6 +1452,56 @@ class FinancialService {
     return hadLots;
   }
 
+  clearUserActiveTradeInvestmentsForBalanceOverwrite(userId, adminId = "") {
+    this.db.tradeInvestments = Array.isArray(this.db.tradeInvestments) ? this.db.tradeInvestments : [];
+    const clearedAt = this.clock();
+    const releasedSources = [];
+    let clearedCount = 0;
+
+    for (const investment of this.db.tradeInvestments) {
+      if (investment.userId !== userId || investment.status !== "ACTIVE") {
+        continue;
+      }
+
+      const fundingSources = Array.isArray(investment.fundingSources) ? investment.fundingSources : [];
+      for (const source of fundingSources) {
+        const currency = normalizeCurrency(source.currency || "USDT");
+        const amount = normalizeNonNegativeAmount(source.amount || "0", "Investment amount");
+        if (compare(amount, "0") <= 0) {
+          continue;
+        }
+
+        const wallet = this.ensureWallet(userId, currency);
+        const lockedBefore = wallet.lockedBalance;
+        const releaseAmount = clampDebit(amount, lockedBefore);
+        if (compare(releaseAmount, "0") <= 0) {
+          continue;
+        }
+
+        wallet.lockedBalance = subtract(wallet.lockedBalance, releaseAmount);
+        wallet.updatedAt = clearedAt;
+        releasedSources.push({
+          investmentId: investment.id,
+          currency,
+          amount: releaseAmount,
+          lockedBefore,
+          lockedAfter: wallet.lockedBalance,
+        });
+      }
+
+      investment.status = "STOPPED";
+      investment.stoppedAt = investment.stoppedAt || clearedAt;
+      investment.stopReason = "ADMIN_BALANCE_OVERWRITE";
+      investment.settledPnlUsdt = investment.settledPnlUsdt || "0";
+      investment.netSettlementUsdt = investment.netSettlementUsdt || "0";
+      investment.adminStoppedBy = adminId || "";
+      investment.updatedAt = clearedAt;
+      clearedCount += 1;
+    }
+
+    return { clearedCount, releasedSources };
+  }
+
   getAvailableUsdtEquivalent(userId, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
     const usdtWallet = this.ensureWallet(userId, "USDT");
     const ngnWallet = this.ensureWallet(userId, "NGN");
@@ -2165,11 +2215,16 @@ class FinancialService {
     const alternateWallet = this.ensureWallet(targetUser.id, alternateCurrency);
     const balanceBefore = wallet.availableBalance;
     const alternateBalanceBefore = alternateWallet.availableBalance;
+    const clearedInvestments = this.clearUserActiveTradeInvestmentsForBalanceOverwrite(targetUser.id, admin.id);
     wallet.availableBalance = amount;
     alternateWallet.availableBalance = "0";
     wallet.updatedAt = this.clock();
     alternateWallet.updatedAt = this.clock();
     this.clearUserPnlLots(targetUser.id);
+    targetUser.legacyBalanceMigratedAt = targetUser.legacyBalanceMigratedAt || this.clock();
+    targetUser.balanceOverrideAt = this.clock();
+    targetUser.balanceOverrideCurrency = currency;
+    targetUser.balanceOverrideAmount = amount;
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
@@ -2187,6 +2242,8 @@ class FinancialService {
         overwriteUnifiedBalance: true,
         clearedCurrency: alternateCurrency,
         clearedBalanceBefore: alternateBalanceBefore,
+        clearedActiveInvestments: clearedInvestments.clearedCount,
+        releasedInvestmentLocks: clearedInvestments.releasedSources,
       },
     };
     this.db.transactions.unshift(transaction);
