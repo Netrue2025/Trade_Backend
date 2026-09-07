@@ -1173,20 +1173,35 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
   if (withdrawal.currency !== "NGN") {
     throw new Error("Only NGN withdrawals can be approved through Paystack.");
   }
-  if (String(withdrawal.fraudReview?.status || "").trim().toUpperCase() === "SUSPICIOUS") {
-    withdrawal = financialService.completeReviewedWithdrawal(admin, withdrawalId, {}, requestMeta);
-    await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Flagged request approved by admin.", "Status: Successful"]);
-    await sendWithdrawalSuccessChannelAlert(withdrawal);
+  if (financialService.isUnpaidReviewedPaystackWithdrawal(withdrawal)) {
+    withdrawal = financialService.restoreReviewedPaystackReservation(withdrawal);
+    persist();
+  }
+  if (withdrawal.status === "SUCCESS") {
     return withdrawal;
   }
-  if (withdrawal.status === "APPROVED" && withdrawal.metadata?.paystackTransferAttemptedAt) {
-    return verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta);
+  if (["APPROVED", "PROCESSING"].includes(withdrawal.status) && (withdrawal.metadata?.paystackTransferAttemptedAt || withdrawal.paystackTransferCode)) {
+    try {
+      return await verifyUnclearPaystackTransfer(withdrawal, admin, requestMeta);
+    } catch (error) {
+      const currentWithdrawal = financialService.getWithdrawal(withdrawal.id);
+      if (!currentWithdrawal.paystackTransferCode) {
+        financialService.markPaystackTransferRetryable(admin, currentWithdrawal.id, error, requestMeta);
+      } else {
+        financialService.markPaystackTransferUnclear(admin, currentWithdrawal.id, error, requestMeta);
+      }
+      throw error;
+    }
   }
-  withdrawal = financialService.approvePaystackWithdrawal(admin, withdrawalId, requestMeta);
-  await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
-  const recipientCode = await ensurePaystackRecipientForWithdrawal(withdrawal);
-  withdrawal = financialService.markPaystackTransferAttempt(admin, withdrawal.id, requestMeta);
+  if (withdrawal.status === "PENDING") {
+    withdrawal = financialService.approvePaystackWithdrawal(admin, withdrawalId, requestMeta);
+    await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
+  } else if (withdrawal.status !== "APPROVED") {
+    throw new Error("Only pending or retryable Paystack withdrawals can be approved.");
+  }
   try {
+    const recipientCode = await ensurePaystackRecipientForWithdrawal(withdrawal);
+    withdrawal = financialService.markPaystackTransferAttempt(admin, withdrawal.id, requestMeta);
     const transfer = await paystackService.initiateTransfer({
       amountKobo: withdrawal.amountKobo,
       recipientCode,
@@ -1209,11 +1224,21 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL APPROVED", ["Payment Status: Processing through Paystack"]);
         return withdrawal;
       } catch (verifyError) {
-        financialService.markPaystackTransferUnclear(admin, withdrawal.id, verifyError, requestMeta);
+        withdrawal = financialService.getWithdrawal(withdrawal.id);
+        if (!withdrawal.paystackTransferCode) {
+          financialService.markPaystackTransferRetryable(admin, withdrawal.id, verifyError, requestMeta);
+        } else {
+          financialService.markPaystackTransferUnclear(admin, withdrawal.id, verifyError, requestMeta);
+        }
         throw verifyError;
       }
     }
-    financialService.markPaystackTransferUnclear(admin, withdrawal.id, error, requestMeta);
+    withdrawal = financialService.getWithdrawal(withdrawal.id);
+    if (!withdrawal.paystackTransferCode) {
+      financialService.markPaystackTransferRetryable(admin, withdrawal.id, error, requestMeta);
+    } else {
+      financialService.markPaystackTransferUnclear(admin, withdrawal.id, error, requestMeta);
+    }
     throw error;
   }
 }

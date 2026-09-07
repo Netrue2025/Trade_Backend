@@ -769,6 +769,41 @@ test("rejected Paystack withdrawal releases reserved balance", () => {
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
 });
 
+test("retryable Paystack setup failure keeps withdrawal pending and reserved", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const approved = service.approvePaystackWithdrawal(admin, withdrawal.id);
+  const retryable = service.markPaystackTransferRetryable(admin, approved.id, new Error("Paystack balance is insufficient."));
+
+  assert.equal(retryable.status, "PENDING");
+  assert.equal(retryable.balanceReserved, true);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "30000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "20000");
+  assert.equal(service.findActiveWithdrawalForUser(user.id).id, withdrawal.id);
+});
+
+test("approved Paystack withdrawal without transfer attempt can be rejected", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const approved = service.approvePaystackWithdrawal(admin, withdrawal.id);
+  const rejected = service.rejectWithdrawal(admin, approved.id, { reason: "Paystack setup failed" });
+
+  assert.equal(rejected.status, "REJECTED");
+  assert.equal(rejected.balanceReserved, false);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "50000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
 test("reversed successful Paystack withdrawal credits user once", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "50000");
@@ -953,6 +988,31 @@ test("flagged NGN withdrawal becomes successful when admin approves review", () 
   assert.equal(approved.fraudReview.status, "APPROVED");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "49000");
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
+test("unpaid reviewed Paystack withdrawal is restored for retry", () => {
+  const { admin, service, user } = createHarness();
+  user.firstName = "Ada";
+  user.lastName = "User";
+  setWallet(service, user.id, "NGN", "50000");
+  service.updateVerifiedBankAccount(user, {
+    bankName: "Test Bank",
+    bankCode: "058",
+    accountNumber: "1234567890",
+    accountName: "OTHER NAME",
+  });
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+  });
+  const reviewed = service.completeReviewedWithdrawal(admin, withdrawal.id);
+  const restored = service.restoreReviewedPaystackReservation(service.getWithdrawal(reviewed.id));
+
+  assert.equal(restored.status, "PENDING");
+  assert.equal(restored.balanceReserved, true);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "49000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
+  assert.equal(service.findActiveWithdrawalForUser(user.id).id, withdrawal.id);
 });
 
 test("duplicate user detail scan flags similar accounts for admin review", () => {
