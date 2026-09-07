@@ -1222,6 +1222,31 @@ function clearFailedLogins(req, email) {
   loginAttemptBuckets.delete(getLoginAttemptKey(req, email));
 }
 
+function clearAllFailedLoginsFor(login) {
+  const normalized = String(login || "").trim().toLowerCase();
+  if (!normalized) {
+    return;
+  }
+  const suffix = `:${normalized}`;
+  for (const key of loginAttemptBuckets.keys()) {
+    if (key.endsWith(suffix)) {
+      loginAttemptBuckets.delete(key);
+    }
+  }
+}
+
+function clearUserFailedLoginAttempts(user, extraAliases = []) {
+  const aliases = new Set([
+    user?.email,
+    user?.name,
+    user?.firstName && user?.lastName ? `${user.firstName} ${user.lastName}` : "",
+    ...extraAliases,
+  ]);
+  for (const alias of aliases) {
+    clearAllFailedLoginsFor(alias);
+  }
+}
+
 function normalizeAuthRole(value, fallback = "user") {
   const role = String(value || fallback).trim().toLowerCase();
   return ["admin", "user"].includes(role) ? role : fallback;
@@ -6992,7 +7017,9 @@ async function handleApi(req, res, url) {
         return true;
       }
 
+      const previousEmail = targetUser.email;
       targetUser.email = email;
+      clearUserFailedLoginAttempts(targetUser, [previousEmail, email]);
       persist();
       scheduleSettingsUsersBroadcast("admin_email_updated");
       sendJson(res, 200, {
@@ -7030,9 +7057,16 @@ async function handleApi(req, res, url) {
         return true;
       }
 
+      const previousName = targetUser.name;
+      const previousFirstName = targetUser.firstName;
+      const previousLastName = targetUser.lastName;
       targetUser.firstName = identity.firstName;
       targetUser.lastName = identity.lastName;
       targetUser.name = identity.name;
+      clearUserFailedLoginAttempts(targetUser, [
+        previousName,
+        previousFirstName && previousLastName ? `${previousFirstName} ${previousLastName}` : "",
+      ]);
       financialService.audit(admin, "USER_NAME_UPDATED", "User", targetUser.id, {
         name: targetUser.name,
       }, getRequestMeta(req));
@@ -7104,7 +7138,7 @@ async function handleApi(req, res, url) {
     }
 
     const body = await readBody(req);
-    const password = String(body.password || "").trim();
+    const password = String(body.password || "");
     if (password.length < 6) {
       sendJson(res, 400, { error: "New password must be at least 6 characters long." });
       return true;
@@ -7113,6 +7147,7 @@ async function handleApi(req, res, url) {
     const { salt, hash } = hashPassword(password);
     targetUser.passwordSalt = salt;
     targetUser.passwordHash = hash;
+    clearUserFailedLoginAttempts(targetUser);
     persist();
     scheduleSettingsUsersBroadcast("admin_password_updated");
     sendJson(res, 200, {
