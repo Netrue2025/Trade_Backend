@@ -5530,7 +5530,14 @@ async function handleApi(req, res, url) {
         getRequestMeta(req)
       );
       await sendDepositSuccessChannelAlert(deposit);
-      sendJson(res, 200, { deposit });
+      const targetUser = db.users.find((item) => item.id === deposit.userId && item.role === "user");
+      const financeSummary = targetUser ? await buildUserTradeInvestmentSummary(targetUser) : null;
+      scheduleSettingsUsersBroadcast("deposit_approved");
+      sendJson(res, 200, {
+        deposit,
+        profile: targetUser ? financialService.getUserFinanceProfile(targetUser.id) : null,
+        financeSummary,
+      });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -6882,8 +6889,10 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      const targetUser = db.users.find((item) => item.id === result.profile?.user?.id && item.role === "user");
+      const financeSummary = targetUser ? await buildUserTradeInvestmentSummary(targetUser) : null;
       scheduleSettingsUsersBroadcast("admin_bonus_added");
-      sendJson(res, 201, result);
+      sendJson(res, 201, { ...result, financeSummary });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -6986,8 +6995,10 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      const targetUser = db.users.find((item) => item.id === result.profile?.user?.id && item.role === "user");
+      const financeSummary = targetUser ? await buildUserTradeInvestmentSummary(targetUser) : null;
       scheduleSettingsUsersBroadcast("admin_balance_updated");
-      sendJson(res, 200, result);
+      sendJson(res, 200, { ...result, financeSummary });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }

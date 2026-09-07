@@ -1439,6 +1439,16 @@ class FinancialService {
     return user.pnlLots;
   }
 
+  clearUserPnlLots(userId) {
+    const user = this.db.users.find((item) => item.id === userId);
+    if (!user) {
+      return false;
+    }
+    const hadLots = Array.isArray(user.pnlLots) && user.pnlLots.length > 0;
+    user.pnlLots = [];
+    return hadLots;
+  }
+
   getAvailableUsdtEquivalent(userId, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
     const usdtWallet = this.ensureWallet(userId, "USDT");
     const ngnWallet = this.ensureWallet(userId, "NGN");
@@ -1705,6 +1715,7 @@ class FinancialService {
       const balanceBefore = wallet.availableBalance;
       wallet.availableBalance = add(wallet.availableBalance, deposit.amount);
       wallet.updatedAt = this.clock();
+      this.clearUserPnlLots(deposit.userId);
       deposit.creditedAt = this.clock();
       deposit.creditedBy = admin.id;
       this.db.transactions.unshift({
@@ -1922,6 +1933,7 @@ class FinancialService {
     const balanceBefore = wallet.availableBalance;
     wallet.availableBalance = add(wallet.availableBalance, amount);
     wallet.updatedAt = this.clock();
+    this.clearUserPnlLots(user.id);
     const transaction = {
       id: this.idGenerator(12),
       userId: user.id,
@@ -1988,6 +2000,7 @@ class FinancialService {
     const balanceBefore = wallet.availableBalance;
     wallet.availableBalance = add(wallet.availableBalance, amount);
     wallet.updatedAt = this.clock();
+    this.clearUserPnlLots(targetUser.id);
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
@@ -2038,6 +2051,7 @@ class FinancialService {
     alternateWallet.availableBalance = "0";
     wallet.updatedAt = this.clock();
     alternateWallet.updatedAt = this.clock();
+    this.clearUserPnlLots(targetUser.id);
     const transaction = {
       id: this.idGenerator(12),
       userId: targetUser.id,
