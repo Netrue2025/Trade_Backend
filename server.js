@@ -5867,6 +5867,30 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const adminWithdrawalManualCompleteMatch = url.pathname.match(/^\/api\/admin\/withdrawals\/([^/]+)\/manual-complete$/);
+  if (req.method === "POST" && adminWithdrawalManualCompleteMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const withdrawal = financialService.completeManualWithdrawal(
+        admin,
+        decodeURIComponent(adminWithdrawalManualCompleteMatch[1]),
+        await readBody(req),
+        getRequestMeta(req)
+      );
+      if (withdrawal.currency === "NGN") {
+        await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL COMPLETED", ["Status: Paid manually by admin"]);
+      }
+      await sendWithdrawalSuccessChannelAlert(withdrawal);
+      sendJson(res, 200, { withdrawal });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   const adminWithdrawalRejectMatch = url.pathname.match(/^\/api\/admin\/withdrawals\/([^/]+)\/reject$/);
   if (req.method === "POST" && adminWithdrawalRejectMatch) {
     const admin = requireAuth(req, res, "admin");

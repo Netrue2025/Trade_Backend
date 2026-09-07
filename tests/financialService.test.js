@@ -804,6 +804,27 @@ test("approved Paystack withdrawal without transfer attempt can be rejected", ()
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
 });
 
+test("manual NGN withdrawal completion consumes reserved balance", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "20000",
+    currency: "NGN",
+  });
+  const completed = service.completeManualWithdrawal(admin, withdrawal.id, {
+    manualReference: "BANK-TRANSFER-001",
+  });
+
+  assert.equal(completed.status, "SUCCESS");
+  assert.equal(completed.balanceReserved, false);
+  assert.equal(completed.metadata.manualPayout, true);
+  assert.equal(completed.externalTransactionReference, "BANK-TRANSFER-001");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "30000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  assert.equal(service.findActiveWithdrawalForUser(user.id), undefined);
+});
+
 test("reversed successful Paystack withdrawal credits user once", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "50000");

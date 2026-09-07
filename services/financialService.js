@@ -2853,6 +2853,70 @@ class FinancialService {
     return clone(withdrawal);
   }
 
+  completeManualWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    if (["SUCCESS", "COMPLETED"].includes(withdrawal.status)) {
+      return clone(withdrawal);
+    }
+    if (!["PENDING", "APPROVED", "PROCESSING"].includes(withdrawal.status)) {
+      throw new Error("Only pending or processing withdrawals can be manually completed.");
+    }
+    if (withdrawal.balanceReserved !== true) {
+      throw new Error("Withdrawal balance was not reserved.");
+    }
+
+    const manualReference = String(
+      input.manualReference ||
+        input.externalTransactionReference ||
+        input.transactionHash ||
+        withdrawal.externalTransactionReference ||
+        `MANUAL-${withdrawal.id}`
+    ).trim();
+    this.consumeWithdrawalReservation(withdrawal, admin, "SUCCESS", "Withdrawal paid manually by admin.");
+    withdrawal.status = "SUCCESS";
+    withdrawal.approvedBy = withdrawal.approvedBy || admin.id;
+    withdrawal.approvedAt = withdrawal.approvedAt || this.clock();
+    withdrawal.completedAt = this.clock();
+    withdrawal.completedBy = admin.id;
+    withdrawal.externalTransactionReference = manualReference;
+    withdrawal.adminNote = String(input.adminNote || withdrawal.adminNote || "Manual payout completed.").trim();
+    withdrawal.failureReason = "";
+    withdrawal.metadata = {
+      ...(withdrawal.metadata || {}),
+      manualPayout: true,
+      manualPayoutAt: this.clock(),
+      manualPayoutBy: admin.id,
+      manualReference,
+      paystackBypassed: withdrawal.currency === "NGN",
+    };
+    if (withdrawal.fraudReview) {
+      withdrawal.fraudReview = {
+        ...withdrawal.fraudReview,
+        status: "APPROVED",
+        reviewedAt: withdrawal.fraudReview.reviewedAt || this.clock(),
+        reviewedBy: withdrawal.fraudReview.reviewedBy || admin.id,
+      };
+      withdrawal.metadata.fraudReviewStatus = "APPROVED";
+    }
+    this.createNotification({
+      userId: withdrawal.userId,
+      type: "WITHDRAWAL",
+      title: "Withdrawal successful",
+      message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+    });
+    this.audit(admin, "WITHDRAWAL_MANUAL_COMPLETED", "Withdrawal", withdrawal.id, {
+      amount: withdrawal.amount,
+      currency: withdrawal.currency,
+      manualReference,
+      paystackReference: withdrawal.paystackReference || "",
+    }, requestMeta);
+    this.persist();
+    return clone(withdrawal);
+  }
+
   isUnpaidReviewedPaystackWithdrawal(withdrawal = {}) {
     return (
       withdrawal.currency === "NGN" &&
