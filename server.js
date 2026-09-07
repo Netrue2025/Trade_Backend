@@ -4920,6 +4920,22 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/user/transfer") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const result = financialService.transferBetweenUsers(user, await readBody(req), getRequestMeta(req));
+      const financeSummary = await buildUserTradeInvestmentSummary(user);
+      scheduleSettingsUsersBroadcast("user_transfer_completed");
+      sendJson(res, 201, { ...result, financeSummary });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/user/transactions") {
     const user = requireAuth(req, res, "user");
     if (!user) {

@@ -586,6 +586,51 @@ test("admin can set a user balance", () => {
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
 });
 
+test("user can transfer wallet funds by registered email", () => {
+  const { db, service, user } = createHarness();
+  const recipient = {
+    id: "user-2",
+    name: "Ben User",
+    email: "ben@example.com",
+    role: "user",
+  };
+  db.users.push(recipient);
+  setWallet(service, user.id, "NGN", "10000");
+  setWallet(service, recipient.id, "NGN", "1500");
+
+  const result = service.transferBetweenUsers(user, {
+    email: "ben@example.com",
+    currency: "NGN",
+    amount: "2500",
+  });
+
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
+  assert.equal(service.ensureWallet(recipient.id, "NGN").availableBalance, "4000");
+  assert.equal(result.transaction.type, "TRANSFER_SENT");
+  assert.equal(service.getTransactions(recipient.id, { limit: 1 })[0].type, "TRANSFER_RECEIVED");
+  assert.equal(service.listNotifications(recipient)[0].type, "TRANSFER");
+});
+
+test("user transfer requires enough selected currency balance", () => {
+  const { db, service, user } = createHarness();
+  db.users.push({
+    id: "user-2",
+    name: "Ben User",
+    email: "ben@example.com",
+    role: "user",
+  });
+  setWallet(service, user.id, "USDT", "4");
+
+  assert.throws(
+    () => service.transferBetweenUsers(user, {
+      email: "ben@example.com",
+      currency: "USDT",
+      amount: "5",
+    }),
+    /insufficient usdt balance/i
+  );
+});
+
 test("legacy wallet balance fields are available for one click trade join", () => {
   const { service, user } = createHarness();
   const usdtWallet = service.ensureWallet(user.id, "USDT");

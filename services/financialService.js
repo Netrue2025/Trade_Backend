@@ -2032,6 +2032,121 @@ class FinancialService {
     };
   }
 
+  transferBetweenUsers(sender, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const idempotent = this.findIdempotent("transfer:create", sender?.id, requestMeta.idempotencyKey);
+    if (idempotent) {
+      return idempotent;
+    }
+    if (!sender || sender.role !== "user") {
+      throw new Error("User not found.");
+    }
+    if (["SUSPENDED", "BLOCKED"].includes(String(sender.status || "").trim().toUpperCase())) {
+      throw new Error("This account cannot send transfers right now.");
+    }
+
+    const email = String(input.email || input.recipientEmail || "").trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new Error("Enter the recipient registered email.");
+    }
+    const recipient = this.db.users.find((user) => user.role === "user" && String(user.email || "").trim().toLowerCase() === email);
+    if (!recipient) {
+      throw new Error("Recipient account was not found.");
+    }
+    if (recipient.id === sender.id) {
+      throw new Error("You cannot transfer to yourself.");
+    }
+    if (["SUSPENDED", "BLOCKED"].includes(String(recipient.status || "").trim().toUpperCase())) {
+      throw new Error("Recipient account cannot receive transfers right now.");
+    }
+
+    const currency = normalizeCurrency(input.currency || "NGN");
+    const amount = normalizeAmount(input.amount, "Transfer amount");
+    const senderWallet = this.ensureWallet(sender.id, currency);
+    const recipientWallet = this.ensureWallet(recipient.id, currency);
+    if (compare(senderWallet.availableBalance, amount) < 0) {
+      throw new Error(`Insufficient ${currency} balance.`);
+    }
+
+    const reference = this.idGenerator(12);
+    const note = String(input.note || "In-app transfer").trim();
+    const senderBalanceBefore = senderWallet.availableBalance;
+    const recipientBalanceBefore = recipientWallet.availableBalance;
+    senderWallet.availableBalance = subtract(senderWallet.availableBalance, amount);
+    recipientWallet.availableBalance = add(recipientWallet.availableBalance, amount);
+    senderWallet.updatedAt = this.clock();
+    recipientWallet.updatedAt = this.clock();
+    this.clearUserPnlLots(sender.id);
+    this.clearUserPnlLots(recipient.id);
+
+    const senderTransaction = {
+      id: this.idGenerator(12),
+      userId: sender.id,
+      type: "TRANSFER_SENT",
+      currency,
+      amount: `-${amount}`,
+      balanceBefore: senderBalanceBefore,
+      balanceAfter: senderWallet.availableBalance,
+      reference,
+      status: "SUCCESS",
+      description: note,
+      createdBy: sender.id,
+      createdAt: this.clock(),
+      metadata: {
+        recipientUserId: recipient.id,
+        recipientEmail: recipient.email,
+        recipientName: recipient.name || "",
+        displayAmounts: this.getDisplayAmounts(amount, currency),
+      },
+    };
+    const recipientTransaction = {
+      id: this.idGenerator(12),
+      userId: recipient.id,
+      type: "TRANSFER_RECEIVED",
+      currency,
+      amount,
+      balanceBefore: recipientBalanceBefore,
+      balanceAfter: recipientWallet.availableBalance,
+      reference,
+      status: "SUCCESS",
+      description: note,
+      createdBy: sender.id,
+      createdAt: this.clock(),
+      metadata: {
+        senderUserId: sender.id,
+        senderEmail: sender.email,
+        senderName: sender.name || "",
+        displayAmounts: this.getDisplayAmounts(amount, currency),
+      },
+    };
+    this.db.transactions.unshift(recipientTransaction, senderTransaction);
+    this.createNotification({
+      userId: sender.id,
+      type: "TRANSFER",
+      title: "Transfer sent",
+      message: `${amount} ${currency} sent to ${recipient.name || recipient.email}.`,
+      entityType: "Transaction",
+      entityId: senderTransaction.id,
+    });
+    this.createNotification({
+      userId: recipient.id,
+      type: "TRANSFER",
+      title: "Transfer received",
+      message: `${amount} ${currency} received from ${sender.name || sender.email}.`,
+      entityType: "Transaction",
+      entityId: recipientTransaction.id,
+    });
+    this.audit(sender, "TRANSFER_SENT", "User", recipient.id, { amount, currency }, requestMeta);
+    const response = {
+      transaction: clone(senderTransaction),
+      recipientTransaction: clone(recipientTransaction),
+      profile: this.getUserFinanceProfile(sender.id),
+    };
+    this.saveIdempotent("transfer:create", sender.id, requestMeta.idempotencyKey, response);
+    this.persist();
+    return response;
+  }
+
   setUserBalance(admin, userId, input = {}, requestMeta = {}) {
     this.ensureState();
     const targetUser = this.db.users.find((user) => user.id === userId && user.role === "user");
