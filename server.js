@@ -3108,6 +3108,73 @@ async function recordTradeForLearning(trade) {
   });
 }
 
+function getTradeClosedAt(trade) {
+  const filledExitExecutions = getFilledExitExecutions(trade);
+  const closeTimes = filledExitExecutions
+    .map((execution) => Number(execution?.transactTime || execution?.updateTime || execution?.time || 0))
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0);
+
+  if (closeTimes.length) {
+    return new Date(Math.max(...closeTimes)).toISOString();
+  }
+
+  if (String(trade?.adminExecution?.status || "").trim().toUpperCase() === "FILLED" && trade?.side === "SELL") {
+    const timestamp = Number(trade.adminExecution.transactTime || trade.adminExecution.updateTime || trade.adminExecution.time || 0);
+    if (Number.isFinite(timestamp) && timestamp > 0) {
+      return new Date(timestamp).toISOString();
+    }
+  }
+
+  return trade?.closedAt || trade?.updatedAt || null;
+}
+
+function getTradeJoinedUsersSummary(trade) {
+  const tradeId = String(trade?.id || "");
+  const byUserId = new Map();
+
+  for (const investment of ensureTradeInvestmentsState()) {
+    if (investment.tradeId !== tradeId || investment.status !== "ACTIVE") {
+      continue;
+    }
+    const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
+    if (!user) {
+      continue;
+    }
+    byUserId.set(user.id, {
+      id: user.id,
+      name: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || "User",
+      email: user.email || "",
+      status: investment.status,
+      amountUsdt: investment.amountUsdt || "0",
+      baselinePnlPercent: investment.baselinePnlPercent || "0",
+      joinedAt: investment.joinedAt || null,
+    });
+  }
+
+  for (const execution of trade?.mirroredExecutions || []) {
+    const userId = execution?.userId;
+    if (!userId || byUserId.has(userId)) {
+      continue;
+    }
+    const user = db.users.find((item) => item.id === userId && item.role === "user");
+    if (!user) {
+      continue;
+    }
+    byUserId.set(user.id, {
+      id: user.id,
+      name: user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || "User",
+      email: user.email || "",
+      status: "MIRRORED",
+      amountUsdt: String(execution.order?.cummulativeQuoteQty || execution.order?.quoteOrderQty || "0"),
+      baselinePnlPercent: "0",
+      joinedAt: execution.order?.transactTime ? new Date(Number(execution.order.transactTime)).toISOString() : null,
+    });
+  }
+
+  const users = [...byUserId.values()].sort((a, b) => Date.parse(b.joinedAt || 0) - Date.parse(a.joinedAt || 0));
+  return { count: users.length, users };
+}
+
 async function syncTradeLearningHistory() {
   if (!tradeLearningService.isEnabled()) {
     return;
@@ -3125,10 +3192,14 @@ async function syncTradeLearningHistory() {
 }
 
 function serializeTradeForAdmin(trade) {
+  const joinedUsers = getTradeJoinedUsersSummary(trade);
   return {
     ...trade,
     exchange: getTradeExchange(trade),
     lifecycleStatus: deriveTradeLifecycle(trade),
+    closedAt: getTradeClosedAt(trade),
+    joinedUsersCount: joinedUsers.count,
+    joinedUsers: joinedUsers.users,
   };
 }
 
@@ -3153,6 +3224,7 @@ function serializeTradeForUser(trade, userId) {
     stopLossTargetPrice: trade.stopLossTargetPrice || null,
     strategyContext: trade.strategyContext || null,
     lifecycleStatus: deriveTradeLifecycle(trade),
+    closedAt: getTradeClosedAt(trade),
     adminExecution: trade.adminExecution,
     mirroredExecution: mirror || null,
     userInvestment: investment ? serializeTradeInvestment(investment) : null,
