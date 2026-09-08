@@ -1062,7 +1062,7 @@ test("flagged NGN withdrawal becomes successful when admin approves review", () 
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
 });
 
-test("unpaid reviewed Paystack withdrawal is restored for retry", () => {
+test("legacy reopened reviewed withdrawal stays successful after startup normalization", () => {
   const { admin, service, user } = createHarness();
   user.firstName = "Ada";
   user.lastName = "User";
@@ -1078,13 +1078,23 @@ test("unpaid reviewed Paystack withdrawal is restored for retry", () => {
     currency: "NGN",
   });
   const reviewed = service.completeReviewedWithdrawal(admin, withdrawal.id);
-  const restored = service.restoreReviewedPaystackReservation(service.getWithdrawal(reviewed.id));
+  const reopened = service.getWithdrawal(reviewed.id);
+  reopened.status = "PENDING";
+  reopened.balanceReserved = true;
+  reopened.completedAt = null;
+  reopened.completedBy = "";
+  reopened.metadata.reviewedPaystackReopenedAt = "2026-09-01T00:00:00.000Z";
+  service.ensureWallet(user.id, "NGN").lockedBalance = "1000";
 
-  assert.equal(restored.status, "PENDING");
-  assert.equal(restored.balanceReserved, true);
+  service.ensureState();
+
+  const finalized = service.getWithdrawal(reviewed.id);
+  assert.equal(finalized.status, "SUCCESS");
+  assert.equal(finalized.balanceReserved, false);
+  assert.equal(finalized.metadata.paystackRetryable, false);
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "49000");
-  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
-  assert.equal(service.findActiveWithdrawalForUser(user.id).id, withdrawal.id);
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  assert.equal(service.findActiveWithdrawalForUser(user.id), undefined);
 });
 
 test("duplicate user detail scan flags similar accounts for admin review", () => {

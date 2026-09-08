@@ -359,8 +359,8 @@ class FinancialService {
     for (const withdrawal of this.db.withdrawals) {
       withdrawal.status = String(withdrawal.status || "PENDING").trim().toUpperCase();
       withdrawal.currency = normalizeCurrency(withdrawal.currency || "NGN");
-      if (this.isUnpaidReviewedPaystackWithdrawal(withdrawal)) {
-        this.restoreReviewedPaystackReservation(withdrawal);
+      if (this.isLegacyReviewedPaystackReopen(withdrawal)) {
+        this.finalizeLegacyReviewedPaystackReopen(withdrawal);
       }
       withdrawal.balanceReserved = withdrawal.balanceReserved !== false && ACTIVE_WITHDRAWAL_STATUSES.includes(withdrawal.status);
       if (withdrawal.currency === "NGN") {
@@ -3026,37 +3026,40 @@ class FinancialService {
     return clone(withdrawal);
   }
 
-  isUnpaidReviewedPaystackWithdrawal(withdrawal = {}) {
+  isLegacyReviewedPaystackReopen(withdrawal = {}) {
     return (
       withdrawal.currency === "NGN" &&
-      withdrawal.status === "SUCCESS" &&
+      ACTIVE_WITHDRAWAL_STATUSES.includes(String(withdrawal.status || "").trim().toUpperCase()) &&
       withdrawal.metadata?.reviewedApprovalAt &&
-      !withdrawal.metadata?.paystackStatus &&
-      !withdrawal.paystackTransferCode
+      withdrawal.metadata?.reviewedPaystackReopenedAt &&
+      !withdrawal.metadata?.manualPayout &&
+      !withdrawal.metadata?.paystackStatus
     );
   }
 
-  restoreReviewedPaystackReservation(withdrawal) {
-    if (!this.isUnpaidReviewedPaystackWithdrawal(withdrawal) || withdrawal.metadata?.reviewedPaystackReopenedAt) {
+  finalizeLegacyReviewedPaystackReopen(withdrawal) {
+    if (!this.isLegacyReviewedPaystackReopen(withdrawal)) {
       return withdrawal;
     }
     const fundingSources = this.getWithdrawalFundingSources(withdrawal);
     for (const source of fundingSources) {
       const wallet = this.ensureWallet(withdrawal.userId, source.currency);
-      wallet.lockedBalance = add(wallet.lockedBalance || "0", source.amount);
+      const releaseAmount = clampDebit(source.amount, wallet.lockedBalance || "0");
+      if (compare(releaseAmount, "0") > 0) {
+        wallet.lockedBalance = subtract(wallet.lockedBalance || "0", releaseAmount);
+      }
       wallet.updatedAt = this.clock();
     }
-    withdrawal.status = "PENDING";
-    withdrawal.balanceReserved = true;
-    withdrawal.completedAt = null;
-    withdrawal.completedBy = "";
+    withdrawal.status = "SUCCESS";
+    withdrawal.balanceReserved = false;
+    withdrawal.completedAt = withdrawal.completedAt || withdrawal.metadata.reviewedApprovalAt || this.clock();
+    withdrawal.completedBy = withdrawal.completedBy || withdrawal.approvedBy || "admin";
     withdrawal.metadata = {
       ...(withdrawal.metadata || {}),
-      reviewedPaystackReopenedAt: this.clock(),
-      paystackRetryable: true,
-      paystackApprovalFailureReason: "Reviewed withdrawal was marked successful before Paystack payment confirmation.",
+      legacyReviewedPaystackReopenFinalizedAt: this.clock(),
+      paystackRetryable: false,
     };
-    this.markWithdrawalReservationTransactions(withdrawal, "PENDING", "Withdrawal amount reserved for Paystack payment retry.");
+    this.markWithdrawalReservationTransactions(withdrawal, "SUCCESS", "Reviewed withdrawal finalized by admin.");
     this.persist();
     return withdrawal;
   }
