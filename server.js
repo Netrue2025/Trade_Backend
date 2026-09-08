@@ -55,6 +55,7 @@ const { FinancialService } = require("./services/financialService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
+const { PushNotificationService } = require("./services/pushNotificationService");
 const {
   VtuService,
   VTU_BASE_URL,
@@ -131,6 +132,7 @@ let db = null;
 let financialService = null;
 let questService = null;
 let vtuService = null;
+let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
@@ -193,6 +195,11 @@ orderEvents.on("orderExecuted", (orderEvent) => {
 });
 signalEngine.on("snapshot", () => {
   persistSignalState();
+});
+signalBus.on(SIGNAL_EVENTS.SIGNAL_GENERATED, (signal) => {
+  void publishTradingSignalNotification(signal).catch((error) => {
+    console.warn("Trading signal push notification failed:", error.message || error);
+  });
 });
 
 const fiatRateCache = {
@@ -505,6 +512,27 @@ async function getTicker24hr(symbolsOrTestnet = false, maybeTestnet = false, exc
 
 async function getTickerPrice(symbol, testnet, exchange = "bybit") {
   return getExchangeClient(exchange).getTickerPrice(symbol, testnet);
+}
+
+async function publishTradingSignalNotification(signal = {}) {
+  if (!financialService || !signal?.id) {
+    return;
+  }
+  const pair = String(signal.pair || signal.symbol || "").trim().toUpperCase();
+  for (const user of db.users.filter((item) => item.role === "user")) {
+    financialService.createNotification({
+      userId: user.id,
+      type: "SIGNAL",
+      category: "tradingSignals",
+      title: pair ? `${pair.replace(/USDT$/, "/USDT")} Signal` : "New trading signal",
+      message: "New trading signal available.",
+      entityType: "Signal",
+      entityId: signal.id,
+      route: "/?tab=signals",
+      dedupeKey: `signal:${signal.id}:generated`,
+    });
+  }
+  await persist();
 }
 
 async function getTickerPrices(testnet, exchange = "bybit") {
@@ -4899,6 +4927,11 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/push/public-key") {
+    sendJson(res, 200, pushNotificationService?.getPublicConfig?.() || { enabled: false, publicKey: "" });
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { user: user ? sanitizeUser(user) : null, exchanges: listExchanges() });
@@ -5154,6 +5187,63 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, { notification });
     } catch (error) {
       sendJson(res, 404, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/push/preferences") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    sendJson(res, 200, {
+      preferences: pushNotificationService.getPreferences(user),
+      subscriptions: pushNotificationService.listUserSubscriptions(user),
+      config: pushNotificationService.getPublicConfig(),
+    });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/push/preferences") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    try {
+      const preferences = pushNotificationService.updatePreferences(user, await readBody(req));
+      sendJson(res, 200, { preferences });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/push/subscribe") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const subscription = pushNotificationService.subscribeUser(user, body.subscription || body, getRequestMeta(req));
+      sendJson(res, 201, { subscription, preferences: pushNotificationService.getPreferences(user) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/push/unsubscribe") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const result = pushNotificationService.unsubscribeUser(user, body.endpoint || "");
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
     }
     return true;
   }
@@ -7976,8 +8066,14 @@ async function startServer() {
   paystackService.validateProductionEnvironment();
   db = await loadDb();
   ensureAdminUser(db);
-  financialService = new FinancialService({ db, persist });
+  pushNotificationService = new PushNotificationService({ db, persist, logger: console });
+  financialService = new FinancialService({
+    db,
+    persist,
+    notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
+  });
   financialService.ensureState();
+  pushNotificationService.ensureState();
   financialService.scanDuplicateUserReviews({ persistChanges: false });
   vtuService = new VtuService({ financialService, logger: console });
   questService = new QuestService({ db, financialService, persist });

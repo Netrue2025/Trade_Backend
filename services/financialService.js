@@ -279,11 +279,12 @@ function toDecimalText(value, fallback = "0") {
 }
 
 class FinancialService {
-  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso } = {}) {
+  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso, notificationPublisher = null } = {}) {
     this.db = db;
     this.persist = persist;
     this.idGenerator = idGenerator;
     this.clock = clock;
+    this.notificationPublisher = notificationPublisher;
   }
 
   ensureState() {
@@ -299,6 +300,8 @@ class FinancialService {
     this.db.auditLogs = Array.isArray(this.db.auditLogs) ? this.db.auditLogs : [];
     this.db.idempotencyKeys = Array.isArray(this.db.idempotencyKeys) ? this.db.idempotencyKeys : [];
     this.db.webhookEvents = Array.isArray(this.db.webhookEvents) ? this.db.webhookEvents : [];
+    this.db.pushSubscriptions = Array.isArray(this.db.pushSubscriptions) ? this.db.pushSubscriptions : [];
+    this.db.pushNotificationEvents = Array.isArray(this.db.pushNotificationEvents) ? this.db.pushNotificationEvents : [];
     this.db.vtuTransactions = Array.isArray(this.db.vtuTransactions) ? this.db.vtuTransactions : [];
     this.db.systemSettings = {
       ...defaultSettings(),
@@ -1170,6 +1173,13 @@ class FinancialService {
 
   createNotification(input = {}) {
     const createdAt = this.clock();
+    const dedupeKey = String(input.dedupeKey || input.metadata?.dedupeKey || "").trim();
+    if (dedupeKey) {
+      const existing = this.db.notifications.find((item) => item.userId === input.userId && item.dedupeKey === dedupeKey);
+      if (existing) {
+        return existing;
+      }
+    }
     const notification = {
       id: this.idGenerator(12),
       userId: input.userId || "",
@@ -1178,12 +1188,22 @@ class FinancialService {
       message: String(input.message || "").trim(),
       entityType: String(input.entityType || "").trim(),
       entityId: String(input.entityId || "").trim(),
+      category: String(input.category || input.metadata?.category || "").trim(),
+      route: String(input.route || input.metadata?.route || "").trim(),
+      dedupeKey,
       metadata: input.metadata && typeof input.metadata === "object" ? clone(input.metadata) : {},
       expiresAt: input.expiresAt || null,
       readAt: null,
       createdAt,
     };
     this.db.notifications.unshift(notification);
+    if (this.notificationPublisher) {
+      Promise.resolve()
+        .then(() => this.notificationPublisher(clone(notification)))
+        .catch((error) => {
+          console.warn("Push notification delivery failed:", error.message || error);
+        });
+    }
     return notification;
   }
 
@@ -1358,6 +1378,37 @@ class FinancialService {
     return clone(targetUser.fraudReview);
   }
 
+  syncLowBalanceNotification(user, totalNgnEquivalent) {
+    const threshold = normalizeNonNegativeAmount(
+      user.lowBalanceThresholdNgn || this.db.systemSettings.vtu?.lowBalanceThreshold || "5000",
+      "Low balance threshold"
+    );
+    const balance = normalizeNonNegativeAmount(totalNgnEquivalent || "0", "Balance");
+    user.notificationState = user.notificationState && typeof user.notificationState === "object" ? user.notificationState : {};
+    const wasBelow = !!user.notificationState.lowBalanceNgnBelowThreshold;
+    const isBelow = compare(balance, threshold) < 0;
+
+    if (isBelow && !wasBelow) {
+      this.createNotification({
+        userId: user.id,
+        type: "LOW_BALANCE",
+        category: "lowBalance",
+        title: "Low balance",
+        message: `Your NetrueFi NGN balance is below NGN ${threshold}.`,
+        entityType: "Wallet",
+        entityId: user.id,
+        route: "/?tab=home",
+        dedupeKey: `low-balance:${user.id}:${this.clock().slice(0, 10)}:${threshold}`,
+      });
+    }
+
+    if (user.notificationState.lowBalanceNgnBelowThreshold !== isBelow) {
+      user.notificationState.lowBalanceNgnBelowThreshold = isBelow;
+      user.notificationState.lowBalanceNgnCheckedAt = this.clock();
+      this.persist();
+    }
+  }
+
   getDashboard(user) {
     this.ensureState();
     const wallets = this.getWallets(user.id);
@@ -1381,6 +1432,7 @@ class FinancialService {
     const todayMirroredPercentage = todayTransactions
       .find((transaction) => transaction.metadata?.profitLossPercentage)
       ?.metadata?.profitLossPercentage || "0";
+    this.syncLowBalanceNotification(user, totalNgnEquivalent);
 
     return {
       user: {
