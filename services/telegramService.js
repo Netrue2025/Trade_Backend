@@ -57,7 +57,7 @@ function shouldEnableTradeBotPolling() {
 }
 
 class TelegramService {
-  constructor({ token = getEnvValue("TELEGRAM_TRADE_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"), subscriberModel, logger = console } = {}) {
+  constructor({ token = getEnvValue("TELEGRAM_TRADE_BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_SIGNAL_BOT_TOKEN"), subscriberModel, logger = console } = {}) {
     this.token = normalizeEnvValue(token);
     this.subscriberModel = subscriberModel;
     this.logger = logger;

@@ -12,7 +12,12 @@ const rootDir = fs.existsSync(path.join(workspaceRootDir, ".env")) && !fs.exists
 const frontendDir = fs.existsSync(path.join(workspaceRootDir, "frontend", "public", "index.html"))
   ? path.join(workspaceRootDir, "frontend", "public")
   : path.join(rootDir, "public");
-const DEFAULT_FRONTEND_ORIGIN = "https://trade-frontend-rg2z.onrender.com";
+const DEFAULT_FRONTEND_ORIGIN = "https://netruefi.org";
+const DEFAULT_FRONTEND_ORIGINS = [
+  DEFAULT_FRONTEND_ORIGIN,
+  "https://www.netruefi.org",
+  "https://trade-frontend-rg2z.onrender.com",
+];
 const DEFAULT_BACKEND_ORIGIN = "https://trade-backend-0bdr.onrender.com";
 const RENDER_FRONTEND_ORIGIN_PATTERN = /^https:\/\/trade-frontend-[a-z0-9-]+\.onrender\.com$/i;
 
@@ -96,7 +101,7 @@ const BYBIT_USDT_NGN_URL = getEnvValue("BYBIT_USDT_NGN_URL") || "https://www.byb
 const FIAT_RATE_CACHE_TTL_MS = 1000 * 60 * 15;
 const MARKET_WATCHLIST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "PEPEUSDT"];
 const WATCHLIST_CACHE_TTL_MS = 1000 * 10;
-const SESSION_TTL_MS = 1000 * 60 * 60 * 24;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const SESSION_TTL_SECONDS = Math.round(SESSION_TTL_MS / 1000);
 const SIGNAL_STREAM_KEEPALIVE_MS = 20_000;
 const SIGNAL_EXPIRY_SWEEP_MS = 60_000;
@@ -721,7 +726,7 @@ function normalizeOrigin(value) {
 
 function getAllowedCorsOrigins() {
   const origins = [
-    DEFAULT_FRONTEND_ORIGIN,
+    ...DEFAULT_FRONTEND_ORIGINS,
     ...getEnvValue("FRONTEND_ORIGIN", "FRONTEND_URL", "CORS_ORIGIN", "CORS_ORIGINS", "ALLOWED_ORIGINS").split(","),
   ]
     .map(normalizeOrigin)
@@ -836,11 +841,21 @@ function getFrontendUrl() {
 }
 
 function getBackendUrl() {
-  return normalizeOrigin(getEnvValue("BACKEND_URL", "RENDER_EXTERNAL_URL") || DEFAULT_BACKEND_ORIGIN);
+  const explicit = normalizeOrigin(getEnvValue("BACKEND_URL", "RENDER_EXTERNAL_URL") || "");
+  if (explicit) {
+    return explicit;
+  }
+
+  const railwayDomain = String(getEnvValue("RAILWAY_PUBLIC_DOMAIN") || "").trim().replace(/^https?:\/\//i, "");
+  if (railwayDomain) {
+    return normalizeOrigin(`https://${railwayDomain}`);
+  }
+
+  return DEFAULT_BACKEND_ORIGIN;
 }
 
 function getTelegramAdminChatId() {
-  return String(getEnvValue("TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID") || "").trim();
+  return String(getEnvValue("TELEGRAM_ADMIN_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_SIGNAL_CHAT_ID") || "").trim();
 }
 
 function normalizeTelegramChannelUsername(value) {
@@ -856,9 +871,36 @@ function normalizeTelegramChannelUsername(value) {
   return `@${username}`;
 }
 
+function normalizeTelegramChatTarget(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (/^-?\d+$/.test(raw)) {
+    return raw;
+  }
+  return normalizeTelegramChannelUsername(raw);
+}
+
 function getTelegramSignalChannelChatId() {
   const configured = financialService?.getSettings?.().telegram?.channelUsername;
-  return normalizeTelegramChannelUsername(configured || getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME") || "netruesignal");
+  return normalizeTelegramChatTarget(
+    configured || getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME", "TELEGRAM_CHANNEL_CHAT_ID") || "netruesignal"
+  );
+}
+
+function getDeploymentDiagnostics() {
+  return {
+    frontendUrl: getFrontendUrl(),
+    backendUrl: getBackendUrl(),
+    allowedCorsOrigins: getAllowedCorsOrigins(),
+    sessionTtlHours: Math.round(SESSION_TTL_MS / (1000 * 60 * 60)),
+    telegram: {
+      adminChatIdLoaded: !!getTelegramAdminChatId(),
+      channelTarget: getTelegramSignalChannelChatId(),
+      channelConfigured: !!getTelegramSignalChannelChatId(),
+    },
+  };
 }
 
 function buildTradeDeepLink(trade) {
@@ -4632,7 +4674,7 @@ function buildSessionCookie(req, value, maxAgeSeconds = null) {
 }
 
 function sendSessionCookie(req, res, sessionId, { remember = false } = {}) {
-  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, remember ? SESSION_TTL_SECONDS : null));
+  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, SESSION_TTL_SECONDS));
 }
 
 function clearSessionCookie(req, res) {
@@ -6409,6 +6451,7 @@ async function handleApi(req, res, url) {
 
     const scope = String(url.searchParams.get("scope") || "signal").trim().toLowerCase();
     const diagnostics = {
+      deployment: getDeploymentDiagnostics(),
       signalBot: getSignalBotDiagnostics(),
       tradeBot: telegramTradeService.getDiagnostics ? telegramTradeService.getDiagnostics() : {},
       subscriberStoreEnabled: !!subscriberModel?.isEnabled?.(),
@@ -6424,6 +6467,24 @@ async function handleApi(req, res, url) {
           {
             telegramOptions: {
               disable_web_page_preview: true,
+            },
+          }
+        );
+      } else if (scope === "channel") {
+        await ensureTradeListenerRunning();
+        result = await sendTelegramChannelAlert(
+          `NetrueFi channel test\nTime: ${new Date().toISOString()}\nDashboard: ${getFrontendUrl()}`,
+          {
+            telegramOptions: {
+              disable_web_page_preview: true,
+              reply_markup: {
+                inline_keyboard: [[
+                  {
+                    text: "Open NetrueFi",
+                    url: getFrontendUrl(),
+                  },
+                ]],
+              },
             },
           }
         );

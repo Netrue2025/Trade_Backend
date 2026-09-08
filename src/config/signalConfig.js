@@ -38,7 +38,7 @@ function createSignalConfig(overrides = {}) {
     signalTtlMs: 24 * 60 * 60 * 1000,
     telegram: {
       token: getEnvValue("TELEGRAM_SIGNAL_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
-      chatId: getEnvValue("TELEGRAM_SIGNAL_CHAT_ID", "TELEGRAM_CHAT_ID"),
+      chatId: getEnvValue("TELEGRAM_SIGNAL_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_ADMIN_CHAT_ID"),
       retryAttempts: parseNumber(getEnvValue("TELEGRAM_SIGNAL_RETRY_ATTEMPTS"), 3),
       retryDelayMs: parseNumber(getEnvValue("TELEGRAM_SIGNAL_RETRY_DELAY_MS"), 1200),
     },
