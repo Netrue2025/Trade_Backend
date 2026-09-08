@@ -883,10 +883,15 @@ function normalizeTelegramChatTarget(value) {
 }
 
 function getTelegramSignalChannelChatId() {
-  const configured = financialService?.getSettings?.().telegram?.channelUsername;
-  return normalizeTelegramChatTarget(
-    configured || getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME", "TELEGRAM_CHANNEL_CHAT_ID") || "netruesignal"
+  const envChannel = normalizeTelegramChatTarget(
+    getEnvValue("TELEGRAM_SIGNAL_CHANNEL", "TELEGRAM_CHANNEL_USERNAME", "TELEGRAM_CHANNEL_CHAT_ID")
   );
+  if (envChannel) {
+    return envChannel;
+  }
+
+  const savedChannel = normalizeTelegramChatTarget(financialService?.getSettings?.().telegram?.channelUsername);
+  return savedChannel || "@netruesignal";
 }
 
 function getDeploymentDiagnostics() {
@@ -918,12 +923,50 @@ function buildTradeDeepLink(trade) {
 
 async function sendTelegramChannelAlert(message, options = {}) {
   const chatId = getTelegramSignalChannelChatId();
-  if (!chatId || !telegramTradeService?.bot) {
+  if (!telegramTradeService?.bot) {
     return { sent: 0, skipped: 1, disabled: true };
   }
 
-  await telegramTradeService.sendMessage(chatId, String(message || "").trim(), options.telegramOptions || {});
-  return { sent: 1, skipped: 0, failed: 0, disabled: false };
+  const text = String(message || "").trim();
+  const telegramOptions = options.telegramOptions || {};
+  if (!chatId) {
+    const adminChatId = getTelegramAdminChatId();
+    if (!adminChatId) {
+      return { sent: 0, skipped: 1, disabled: true };
+    }
+    await telegramTradeService.sendMessage(adminChatId, text, telegramOptions);
+    return { sent: 1, skipped: 0, failed: 0, disabled: false, fallback: "admin_chat" };
+  }
+
+  try {
+    await telegramTradeService.sendMessage(chatId, text, telegramOptions);
+    return { sent: 1, skipped: 0, failed: 0, disabled: false, target: chatId };
+  } catch (error) {
+    const adminChatId = getTelegramAdminChatId();
+    if (!adminChatId || adminChatId === chatId) {
+      throw error;
+    }
+    await telegramTradeService.sendMessage(
+      adminChatId,
+      [
+        "Telegram channel delivery failed.",
+        `Channel: ${chatId}`,
+        `Error: ${error.message || error}`,
+        "",
+        text,
+      ].join("\n"),
+      telegramOptions
+    );
+    return {
+      sent: 1,
+      skipped: 0,
+      failed: 1,
+      disabled: false,
+      target: adminChatId,
+      fallback: "admin_chat",
+      channelError: error.message || String(error),
+    };
+  }
 }
 
 function formatNgnAmount(value) {
@@ -4674,7 +4717,7 @@ function buildSessionCookie(req, value, maxAgeSeconds = null) {
 }
 
 function sendSessionCookie(req, res, sessionId, { remember = false } = {}) {
-  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, SESSION_TTL_SECONDS));
+  res.setHeader("Set-Cookie", buildSessionCookie(req, sessionId, remember ? SESSION_TTL_SECONDS : null));
 }
 
 function clearSessionCookie(req, res) {
