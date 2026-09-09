@@ -257,9 +257,50 @@ test("NGN withdrawal accepts account aliases and formatted account number", () =
   assert.equal(withdrawal.destination.bankName, "Test Bank");
   assert.equal(withdrawal.destination.accountName, "ADA USER");
   assert.equal(withdrawal.destination.accountNumber, "1234567890");
-  assert.equal(withdrawal.amountKobo, 1200000);
+  assert.equal(withdrawal.amountKobo, 1190000);
   assert.equal(withdrawal.status, "PENDING");
   assert.equal(withdrawal.balanceReserved, true);
+});
+
+test("NGN withdrawal reserves requested amount and pays net after fee", () => {
+  const { service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "25000");
+  const bankAccount = setVerifiedBank(service, user);
+
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "1000",
+    currency: "NGN",
+    bankAccountId: bankAccount.id,
+  });
+
+  assert.equal(withdrawal.amount, "1000");
+  assert.equal(withdrawal.requestedAmount, "1000");
+  assert.equal(withdrawal.fee, "100");
+  assert.equal(withdrawal.feeCurrency, "NGN");
+  assert.equal(withdrawal.netAmount, "900");
+  assert.equal(withdrawal.amountKobo, 90000);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "24000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
+});
+
+test("admin can set minimum trade join, withdrawal amounts, and NGN fee", () => {
+  const { admin, service } = createHarness();
+
+  const settings = service.updateSettings(admin, {
+    withdrawal: {
+      minNgn: "1500",
+      minUsdt: "75",
+      ngnFee: "100",
+    },
+    trading: {
+      minJoinUsdt: "25",
+    },
+  });
+
+  assert.equal(settings.withdrawal.minNgn, "1500");
+  assert.equal(settings.withdrawal.minUsdt, "75");
+  assert.equal(settings.withdrawal.ngnFee, "100");
+  assert.equal(settings.trading.minJoinUsdt, "25");
 });
 
 test("NGN withdrawal accepts a verified one-time bank account", () => {

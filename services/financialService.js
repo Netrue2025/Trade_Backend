@@ -21,6 +21,8 @@ const MIN_WITHDRAWAL_AMOUNTS = {
   NGN: "500",
   USDT: "50",
 };
+const DEFAULT_NGN_WITHDRAWAL_FEE = "100";
+const DEFAULT_MIN_TRADE_JOIN_USDT = "1";
 const MESSAGE_NOTIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
 const VTU_FINAL_STATUSES = ["successful", "failed", "refunded"];
 const VTU_ACTIVE_STATUSES = ["initiated", "processing"];
@@ -224,7 +226,7 @@ function defaultSettings() {
       maxDailyCount: 0,
       maxDailyNgn: getEnvValue("MAX_DAILY_WITHDRAWAL_NGN") || "10000000",
       usdtFee: getEnvValue("WITHDRAWAL_USDT_FEE") || "0",
-      ngnFee: getEnvValue("WITHDRAWAL_NGN_FEE") || "0",
+      ngnFee: getEnvValue("WITHDRAWAL_NGN_FEE") || DEFAULT_NGN_WITHDRAWAL_FEE,
     },
     exchangeRate: {
       usdtToNgn: configuredRate,
@@ -262,6 +264,7 @@ function defaultSettings() {
       tradingEnabled: true,
       dailyPerformanceMode: "manual",
       supportedExchanges: ["bybit", "binance"],
+      minJoinUsdt: getEnvValue("MIN_TRADE_JOIN_USDT") || DEFAULT_MIN_TRADE_JOIN_USDT,
     },
   };
 }
@@ -359,12 +362,19 @@ class FinancialService {
     for (const withdrawal of this.db.withdrawals) {
       withdrawal.status = String(withdrawal.status || "PENDING").trim().toUpperCase();
       withdrawal.currency = normalizeCurrency(withdrawal.currency || "NGN");
+      withdrawal.fee = normalizeNonNegativeAmount(
+        withdrawal.fee ?? (withdrawal.currency === "NGN" ? this.db.systemSettings.withdrawal.ngnFee : this.db.systemSettings.withdrawal.usdtFee),
+        "Withdrawal fee"
+      );
+      withdrawal.feeCurrency = withdrawal.feeCurrency || withdrawal.currency;
+      withdrawal.requestedAmount = withdrawal.requestedAmount || withdrawal.amount;
+      withdrawal.netAmount = withdrawal.netAmount || withdrawal.amount;
       if (this.isLegacyReviewedPaystackReopen(withdrawal)) {
         this.finalizeLegacyReviewedPaystackReopen(withdrawal);
       }
       withdrawal.balanceReserved = withdrawal.balanceReserved !== false && ACTIVE_WITHDRAWAL_STATUSES.includes(withdrawal.status);
       if (withdrawal.currency === "NGN") {
-        withdrawal.amountKobo = Number(withdrawal.amountKobo || toKobo(withdrawal.amount || "0"));
+        withdrawal.amountKobo = Number(withdrawal.amountKobo || toKobo(withdrawal.netAmount || withdrawal.amount || "0"));
         withdrawal.paystackReference = withdrawal.paystackReference || withdrawal.externalTransactionReference || this.createPaystackReference();
         withdrawal.bank = withdrawal.bank || withdrawal.destination || {};
       }
@@ -591,6 +601,17 @@ class FinancialService {
       next.telegram.channelUsername = String(patch.telegram.channelUsername || "").trim();
     }
 
+    next.deposit.minUsdt = normalizeAmount(next.deposit.minUsdt || "1", "Minimum USDT deposit");
+    next.deposit.maxUsdt = normalizeAmount(next.deposit.maxUsdt || "1000000", "Maximum USDT deposit");
+    next.deposit.minNgn = normalizeAmount(next.deposit.minNgn || "1000", "Minimum NGN deposit");
+    next.deposit.maxNgn = normalizeAmount(next.deposit.maxNgn || "1000000000", "Maximum NGN deposit");
+    next.withdrawal.minUsdt = normalizeAmount(next.withdrawal.minUsdt || MIN_WITHDRAWAL_AMOUNTS.USDT, "Minimum USDT withdrawal");
+    next.withdrawal.maxUsdt = normalizeAmount(next.withdrawal.maxUsdt || "1000000", "Maximum USDT withdrawal");
+    next.withdrawal.minNgn = normalizeAmount(next.withdrawal.minNgn || MIN_WITHDRAWAL_AMOUNTS.NGN, "Minimum NGN withdrawal");
+    next.withdrawal.maxNgn = normalizeAmount(next.withdrawal.maxNgn || "1000000000", "Maximum NGN withdrawal");
+    next.withdrawal.usdtFee = normalizeNonNegativeAmount(next.withdrawal.usdtFee || "0", "USDT withdrawal fee");
+    next.withdrawal.ngnFee = normalizeNonNegativeAmount(next.withdrawal.ngnFee || DEFAULT_NGN_WITHDRAWAL_FEE, "NGN withdrawal fee");
+    next.trading.minJoinUsdt = normalizeAmount(next.trading.minJoinUsdt || DEFAULT_MIN_TRADE_JOIN_USDT, "Minimum trade join amount");
     next.withdrawal.maxDailyCount = 0;
     next.withdrawal.maxDailyNgn = normalizeAmount(next.withdrawal.maxDailyNgn || "10000000", "Daily withdrawal limit");
     this.db.systemSettings = next;
@@ -1465,6 +1486,7 @@ class FinancialService {
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
         telegram: clone(this.db.systemSettings.telegram),
+        trading: clone(this.db.systemSettings.trading),
       },
     };
   }
@@ -2525,6 +2547,13 @@ class FinancialService {
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Withdrawal amount");
     this.validateWithdrawalSettings(currency, amount);
+    const fee = currency === "NGN"
+      ? normalizeNonNegativeAmount(this.db.systemSettings.withdrawal.ngnFee || DEFAULT_NGN_WITHDRAWAL_FEE, "NGN withdrawal fee")
+      : normalizeNonNegativeAmount(this.db.systemSettings.withdrawal.usdtFee || "0", "USDT withdrawal fee");
+    const netAmount = currency === "NGN" && compare(fee, "0") > 0 ? subtract(amount, fee) : amount;
+    if (compare(netAmount, "0") <= 0) {
+      throw new Error(`Withdrawal amount must be greater than the ${fee} ${currency} fee.`);
+    }
     const activeInvestments = this.db.tradeInvestments.filter((item) => item.userId === user.id && item.status === "ACTIVE");
     if (activeInvestments.length) {
       throw new Error("Stop active trades before requesting a withdrawal.");
@@ -2569,7 +2598,9 @@ class FinancialService {
       id: this.idGenerator(12),
       userId: user.id,
       amount,
-      amountKobo: currency === "NGN" ? toKobo(amount) : 0,
+      requestedAmount: amount,
+      netAmount,
+      amountKobo: currency === "NGN" ? toKobo(netAmount) : 0,
       currency,
       status: "PENDING",
       exchangeRate: this.db.systemSettings.exchangeRate.usdtToNgn,
@@ -2579,7 +2610,8 @@ class FinancialService {
       paystackRecipientCode: bank?.paystackRecipientCode || "",
       paystackTransferCode: "",
       paystackReference,
-      fee: currency === "USDT" ? this.db.systemSettings.withdrawal.usdtFee : this.db.systemSettings.withdrawal.ngnFee,
+      fee,
+      feeCurrency: currency,
       submittedAt: this.clock(),
       approvedAt: null,
       approvedBy: null,
@@ -2633,12 +2665,15 @@ class FinancialService {
       });
     }
     this.db.withdrawals.unshift(withdrawal);
+    const withdrawalSplitMessage = currency === "NGN" && compare(fee, "0") > 0
+      ? ` Fee: ${fee} ${currency}. Payout: ${netAmount} ${currency}.`
+      : "";
     this.notifyAdmins({
       type: fraudReview.status === "SUSPICIOUS" ? "WITHDRAWAL_FRAUD_REVIEW" : "WITHDRAWAL_REQUEST",
       title: fraudReview.status === "SUSPICIOUS" ? "Suspicious Withdrawal" : "New Withdrawal Request",
       message: fraudReview.status === "SUSPICIOUS"
-        ? `${user.name || "User"} requested ${amount} ${currency} with a bank name mismatch.`
-        : `${user.name || "User"} requested ${amount} ${currency}.`,
+        ? `${user.name || "User"} requested ${amount} ${currency} with a bank name mismatch.${withdrawalSplitMessage}`
+        : `${user.name || "User"} requested ${amount} ${currency}.${withdrawalSplitMessage}`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
@@ -2646,7 +2681,9 @@ class FinancialService {
       userId: user.id,
       type: "WITHDRAWAL",
       title: "Withdrawal submitted",
-      message: `Your withdrawal request of ${amount} ${currency} is awaiting approval.`,
+      message: withdrawalSplitMessage
+        ? `Your withdrawal request of ${amount} ${currency} is awaiting approval.${withdrawalSplitMessage}`
+        : `Your withdrawal request of ${amount} ${currency} is awaiting approval.`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
@@ -3234,7 +3271,7 @@ class FinancialService {
       userId: withdrawal.userId,
       type: "WITHDRAWAL",
       title: "Withdrawal paid",
-      message: `Your withdrawal of ${withdrawal.amount} NGN has been successfully paid to your bank account.`,
+      message: `Your withdrawal payout of ${withdrawal.netAmount || withdrawal.amount} NGN has been successfully paid to your bank account.`,
       entityType: "Withdrawal",
       entityId: withdrawal.id,
     });
@@ -3424,6 +3461,7 @@ class FinancialService {
         withdrawal: clone(this.db.systemSettings.withdrawal),
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
         telegram: clone(this.db.systemSettings.telegram),
+        trading: clone(this.db.systemSettings.trading),
         vtu: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
       },
       vtu: this.getVtuAdminSummary(),

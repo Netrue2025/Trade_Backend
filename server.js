@@ -1078,11 +1078,12 @@ async function sendWithdrawalSuccessChannelAlert(withdrawal) {
   }
   const user = getWithdrawalUser(record);
   const bank = record.bank || record.destination || {};
-  const displayAmounts = record.displayAmounts || financialService.getDisplayAmounts(record.amount, record.currency, record.exchangeRate);
+  const payoutAmount = record.netAmount || record.amount;
+  const displayAmounts = financialService.getDisplayAmounts(payoutAmount, record.currency, record.exchangeRate);
   const lines = [
     "WITHDRAWAL SUCCESSFUL",
     `User: ${maskPublicText(user.name || user.email || user.id)}`,
-    `Amount: ${record.currency === "NGN" ? formatNgnAmount(record.amount) : formatUsdtAmount(record.amount)}`,
+    `Amount: ${record.currency === "NGN" ? formatNgnAmount(payoutAmount) : formatUsdtAmount(payoutAmount)}`,
     `USDT: ${formatUsdtAmount(displayAmounts.USDT)}`,
     `NGN: ${formatNgnAmount(displayAmounts.NGN)}`,
     bank.bankName ? `Bank: ${maskPublicText(bank.bankName, 3)}` : null,
@@ -1100,6 +1101,20 @@ async function sendWithdrawalSuccessChannelAlert(withdrawal) {
   return sent;
 }
 
+function buildWithdrawalAmountLines(withdrawal) {
+  if (withdrawal.currency !== "NGN") {
+    return [`Amount: ${withdrawal.amount} ${withdrawal.currency}`];
+  }
+  const debitedAmount = withdrawal.requestedAmount || withdrawal.amount;
+  const netAmount = withdrawal.netAmount || withdrawal.amount;
+  const fee = withdrawal.fee || "0";
+  return [
+    `Amount Debited: ${formatNgnAmount(debitedAmount)}`,
+    `Withdrawal Fee: ${formatNgnAmount(fee)}`,
+    `Pay User: ${formatNgnAmount(netAmount)}`,
+  ];
+}
+
 async function sendWithdrawalTelegramMessage(withdrawal, title, extraLines = []) {
   const chatId = getTelegramAdminChatId();
   if (!chatId || !telegramTradeService?.bot) {
@@ -1111,7 +1126,7 @@ async function sendWithdrawalTelegramMessage(withdrawal, title, extraLines = [])
     title,
     "",
     `User: ${user.name || "User"}`,
-    `Amount: ${formatNgnAmount(withdrawal.amount)}`,
+    ...buildWithdrawalAmountLines(withdrawal),
     `Bank: ${bank.bankName || "Bank"}`,
     `Account Name: ${bank.accountName || ""}`,
     `Account: ${bank.maskedAccountNumber || maskAccountNumber(bank.accountNumber)}`,
@@ -1147,7 +1162,7 @@ async function editWithdrawalTelegramMessage(withdrawal, title, extraLines = [])
     title,
     "",
     `${user.name || "User"}`,
-    `${formatNgnAmount(withdrawal.amount)}`,
+    ...buildWithdrawalAmountLines(withdrawal),
     "",
     ...extraLines,
   ].filter(Boolean).join("\n");
@@ -2954,6 +2969,7 @@ async function reconcileTradeStatuses() {
         String(previousTrade?.adminExecution?.status || "").trim().toUpperCase() !== "FILLED"
         && String(trade?.adminExecution?.status || "").trim().toUpperCase() === "FILLED"
       ) {
+        notifyUsersTradeOpenToJoin(trade);
         emitOrderExecuted({
           eventKey: `${trade.id}:${trade.adminExecution?.orderId || trade.adminExecution?.clientOrderId || trade.adminExecution?.transactTime || "entry"}`,
           exchange,
@@ -3233,7 +3249,8 @@ function serializeTradeForAdmin(trade) {
 
 function serializeTradeForUser(trade, userId) {
   const mirror = (trade.mirroredExecutions || []).find((item) => item.userId === userId);
-  const investment = getUserTradeInvestment(trade.id, userId);
+  const investment = getUserTradeInvestmentRecord(trade.id, userId);
+  const lifecycleStatus = investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
   const exits = (trade.exitOrders || []).map((item) => ({
     ...item,
     mirroredExecution: (item.mirroredExecutions || []).find((row) => row.userId === userId) || null,
@@ -3251,7 +3268,8 @@ function serializeTradeForUser(trade, userId) {
     takeProfitTargetPrice: trade.takeProfitTargetPrice,
     stopLossTargetPrice: trade.stopLossTargetPrice || null,
     strategyContext: trade.strategyContext || null,
-    lifecycleStatus: deriveTradeLifecycle(trade),
+    lifecycleStatus,
+    actualLifecycleStatus: deriveTradeLifecycle(trade),
     closedAt: getTradeClosedAt(trade),
     adminExecution: trade.adminExecution,
     mirroredExecution: mirror || null,
@@ -3270,6 +3288,11 @@ function getUserTradeInvestment(tradeId, userId) {
     .find((item) => item.tradeId === tradeId && item.userId === userId && item.status === "ACTIVE") || null;
 }
 
+function getUserTradeInvestmentRecord(tradeId, userId) {
+  return ensureTradeInvestmentsState()
+    .find((item) => item.tradeId === tradeId && item.userId === userId) || null;
+}
+
 function getActiveUserTradeInvestments(userId) {
   return ensureTradeInvestmentsState().filter((item) => item.userId === userId && item.status === "ACTIVE");
 }
@@ -3285,6 +3308,7 @@ function serializeTradeInvestment(investment) {
     status: investment.status,
     joinedAt: investment.joinedAt,
     stoppedAt: investment.stoppedAt || null,
+    hiddenAt: investment.hiddenAt || null,
     settledPnlUsdt: investment.settledPnlUsdt || "0",
     fundingSources: getInvestmentFundingSources(investment),
   };
@@ -3340,6 +3364,50 @@ function getFreeTradeJoinBalanceUsdt(userId) {
 function resolveTradeInvestmentAmount(userId) {
   const freeUsdt = getFreeTradeJoinBalanceUsdt(userId);
   return { amountUsdt: freeUsdt, freeUsdt };
+}
+
+function getMinimumTradeJoinUsdt() {
+  const settings = db.systemSettings?.trading || {};
+  const configured = String(settings.minJoinUsdt || "1").trim();
+  return compare(configured || "0", "0") > 0 ? configured : "1";
+}
+
+function validateTradeJoinAmount(amountUsdt, freeUsdt) {
+  const minimum = getMinimumTradeJoinUsdt();
+  if (compare(freeUsdt, minimum) < 0) {
+    throw new Error(`Your available balance is below the minimum trade joining amount of ${minimum} USDT.`);
+  }
+  if (compare(amountUsdt, minimum) < 0) {
+    throw new Error(`Minimum trade joining amount is ${minimum} USDT.`);
+  }
+  if (compare(amountUsdt, freeUsdt) > 0) {
+    throw new Error("Investment amount is higher than your free balance.");
+  }
+}
+
+function notifyUsersTradeOpenToJoin(trade) {
+  if (!trade || trade.userJoinOpenNotifiedAt || deriveTradeLifecycle(trade) !== "OPEN") {
+    return false;
+  }
+  for (const user of db.users || []) {
+    if (user.role !== "user" || ["SUSPENDED", "BLOCKED"].includes(String(user.status || "").trim().toUpperCase())) {
+      continue;
+    }
+    financialService.createNotification({
+      userId: user.id,
+      type: "TRADE",
+      title: "Trade open to join",
+      message: `${trade.symbol} is open to join now.`,
+      entityType: "Trade",
+      entityId: trade.id,
+      category: "tradingSignals",
+      route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
+      dedupeKey: `trade-open:${trade.id}:${user.id}`,
+    });
+  }
+  trade.userJoinOpenNotifiedAt = nowIso();
+  persist();
+  return true;
 }
 
 async function assertTradeCanAcceptInvestment(trade) {
@@ -4419,6 +4487,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     console.error(`Trade listener create event failed for trade ${trade.id}:`, error.message);
   });
   if (String(trade.adminExecution?.status || "").trim().toUpperCase() === "FILLED") {
+    notifyUsersTradeOpenToJoin(trade);
     emitOrderExecuted({
       eventKey: `${trade.id}:${trade.adminExecution?.orderId || trade.adminExecution?.clientOrderId || "entry"}`,
       exchange,
@@ -7254,19 +7323,16 @@ async function handleApi(req, res, url) {
         return true;
       }
       await assertTradeCanAcceptInvestment(trade);
-      if (getUserTradeInvestment(trade.id, targetUser.id)) {
-        sendJson(res, 400, { error: "User already joined this trade." });
+      if (getUserTradeInvestmentRecord(trade.id, targetUser.id)) {
+        sendJson(res, 400, { error: "User already joined this trade and cannot join it again." });
         return true;
       }
 
       const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id);
-      if (compare(amountUsdt, "0") <= 0) {
-        sendJson(res, 400, { error: "No available balance to join this trade." });
-        return true;
-      }
-      if (compare(amountUsdt, freeUsdt) > 0) {
-        sendJson(res, 400, { error: "Investment amount is higher than this user's free balance." });
-        return true;
+      try {
+        validateTradeJoinAmount(amountUsdt, freeUsdt);
+      } catch (error) {
+        throw new Error(error.message.replace("your free balance", "this user's free balance"));
       }
 
       const investmentId = randomId(12);
@@ -7296,6 +7362,8 @@ async function handleApi(req, res, url) {
         message: `Admin added you to ${trade.symbol}.`,
         entityType: "Trade",
         entityId: trade.id,
+        category: "tradingSignals",
+        route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
       });
       persist();
       scheduleSettingsUsersBroadcast("admin_user_trade_joined");
@@ -7563,6 +7631,13 @@ async function handleApi(req, res, url) {
         : db.tradeIntents
             .filter(
               (trade) => {
+                const investment = getUserTradeInvestmentRecord(trade.id, user.id);
+                if (investment?.status === "STOPPED") {
+                  return !investment.hiddenAt;
+                }
+                if (investment) {
+                  return true;
+                }
                 if (trade.mirroredExecutions.some((row) => row.userId === user.id)) {
                   return true;
                 }
@@ -7592,20 +7667,13 @@ async function handleApi(req, res, url) {
         return true;
       }
       await assertTradeCanAcceptInvestment(trade);
-      if (getUserTradeInvestment(trade.id, user.id)) {
-        sendJson(res, 400, { error: "You already joined this trade." });
+      if (getUserTradeInvestmentRecord(trade.id, user.id)) {
+        sendJson(res, 400, { error: "You already joined this trade and cannot join it again." });
         return true;
       }
 
       const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
-      if (compare(amountUsdt, "0") <= 0) {
-        sendJson(res, 400, { error: "No available balance to join this trade." });
-        return true;
-      }
-      if (compare(amountUsdt, freeUsdt) > 0) {
-        sendJson(res, 400, { error: "Investment amount is higher than your free balance." });
-        return true;
-      }
+      validateTradeJoinAmount(amountUsdt, freeUsdt);
 
       const investmentId = randomId(12);
       const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
@@ -7626,6 +7694,16 @@ async function handleApi(req, res, url) {
         settledPnlUsdt: "0",
       };
       ensureTradeInvestmentsState().unshift(investment);
+      financialService.createNotification({
+        userId: user.id,
+        type: "TRADE",
+        title: "Trade joined",
+        message: `You joined ${trade.symbol}.`,
+        entityType: "Trade",
+        entityId: trade.id,
+        category: "tradingSignals",
+        route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
+      });
       persist();
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
     } catch (error) {
@@ -7663,6 +7741,7 @@ async function handleApi(req, res, url) {
       investment.stopPnlPercent = String(Number(currentPnlPercent.toFixed(8)));
       investment.settledPnlUsdt = settledPnlUsdt;
       investment.netSettlementUsdt = settlement.netSettlementUsdt;
+      investment.stopReason = "USER_STOPPED";
       db.transactions.unshift({
         id: randomId(12),
         userId: user.id,
@@ -7685,8 +7764,44 @@ async function handleApi(req, res, url) {
           releasedSources: settlement.releasedSources,
         },
       });
+      financialService.createNotification({
+        userId: user.id,
+        type: "TRADE_CANCELED",
+        title: "Trade canceled",
+        message: `You stopped ${trade.symbol}. It remains active for other connected users.`,
+        entityType: "Trade",
+        entityId: trade.id,
+        category: "tradingSignals",
+        route: `/?tab=history&trade=${encodeURIComponent(trade.id)}`,
+      });
       persist();
       sendJson(res, 200, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const hideTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/hide$/);
+  if (req.method === "POST" && hideTradeMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const tradeId = decodeURIComponent(hideTradeMatch[1] || "").trim();
+      const investment = getUserTradeInvestmentRecord(tradeId, user.id);
+      if (!investment || investment.status !== "STOPPED") {
+        sendJson(res, 400, { error: "Only stopped trades can be removed from your view." });
+        return true;
+      }
+      investment.hiddenAt = investment.hiddenAt || nowIso();
+      persist();
+      const trade = db.tradeIntents.find((item) => item.id === tradeId);
+      sendJson(res, 200, {
+        investment: serializeTradeInvestment(investment),
+        trade: trade ? serializeTradeForUser(trade, user.id) : null,
+      });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
