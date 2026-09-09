@@ -1,19 +1,34 @@
 const { MongoClient } = require("mongodb");
-const { getMongoCollectionByName } = require("../lib/db");
+const { getMongoCollectionByName, getMongoUri: getAppSelectedMongoUri } = require("../lib/db");
 const { assertValidMongoConnectionString, getEnvValue, getMongoDbNameFromUri, isMongoConnectionString } = require("../lib/env");
 
 const DEFAULT_COLLECTION_NAME = "telegram_subscribers";
 const DEFAULT_OPERATION_TIMEOUT_MS = 8000;
+const MONGO_URI_ENV_KEYS = ["MONGODB_URI", "MONGO_URI", "MONGO_URL", "DATABASE_URL"];
 
 function getMongoUri() {
-  return assertValidMongoConnectionString(
-    getEnvValue("MONGO_URI", "MONGODB_URI"),
-    "Telegram subscriber MongoDB connection string"
-  );
+  return getMongoUriCandidates()[0]?.value || "";
+}
+
+function getMongoUriCandidates() {
+  const seen = new Set();
+  const candidates = [];
+  for (const key of MONGO_URI_ENV_KEYS) {
+    if (process.env[key] === undefined) {
+      continue;
+    }
+    const value = assertValidMongoConnectionString(process.env[key], key);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    candidates.push({ key, value });
+  }
+  return candidates;
 }
 
 function getMongoDbName(uri) {
-  return getEnvValue("MONGO_DB_NAME", "MONGODB_DB_NAME")
+  return getEnvValue("MONGO_DB_NAME", "MONGODB_DB_NAME", "DATABASE_NAME")
     || getMongoDbNameFromUri(uri, "trade_mvp")
     || "trade_mvp";
 }
@@ -23,7 +38,7 @@ function getCollectionName() {
 }
 
 function getAppMongoUri() {
-  const mongoUri = getEnvValue("MONGODB_URI");
+  const mongoUri = getAppSelectedMongoUri() || getEnvValue(MONGO_URI_ENV_KEYS);
   return isMongoConnectionString(mongoUri) ? mongoUri : "";
 }
 
@@ -65,6 +80,7 @@ function withTimeout(promise, label, timeoutMs = DEFAULT_OPERATION_TIMEOUT_MS) {
 
 class SubscriberModel {
   constructor({ mongoUri, dbName, collectionName, logger = console } = {}) {
+    this.mongoUriCandidates = mongoUri ? [{ key: "constructor", value: mongoUri }] : getMongoUriCandidates();
     this.mongoUri = mongoUri || getMongoUri();
     this.dbName = dbName || (this.mongoUri ? getMongoDbName(this.mongoUri) : "");
     this.collectionName = collectionName || getCollectionName();
@@ -78,7 +94,8 @@ class SubscriberModel {
   }
 
   shouldUseSharedAppMongo() {
-    return !!this.mongoUri && this.mongoUri === getAppMongoUri();
+    const appMongoUri = getAppMongoUri();
+    return !!appMongoUri && this.mongoUriCandidates.some((candidate) => candidate.value === appMongoUri);
   }
 
   resetConnectionState() {
@@ -96,15 +113,28 @@ class SubscriberModel {
         if (this.shouldUseSharedAppMongo()) {
           const collection = await getMongoCollectionByName(this.collectionName);
           if (collection) {
+            this.mongoUri = getAppMongoUri();
+            this.dbName = getMongoDbName(this.mongoUri);
             return collection;
           }
         }
 
-        if (!this.clientPromise) {
-          this.clientPromise = MongoClient.connect(this.mongoUri, getMongoClientOptions());
+        let lastError = null;
+        const candidates = this.mongoUriCandidates.length ? this.mongoUriCandidates : getMongoUriCandidates();
+        for (const candidate of candidates) {
+          try {
+            this.clientPromise = MongoClient.connect(candidate.value, getMongoClientOptions());
+            const client = await this.clientPromise;
+            this.mongoUri = candidate.value;
+            this.dbName = getMongoDbName(this.mongoUri);
+            return client.db(this.dbName).collection(this.collectionName);
+          } catch (error) {
+            lastError = { key: candidate.key, error };
+            this.clientPromise = null;
+          }
         }
-        const client = await this.clientPromise;
-        return client.db(this.dbName).collection(this.collectionName);
+
+        throw new Error(`Unable to connect Telegram subscriber MongoDB. Last error from ${lastError?.key || "MongoDB"}: ${lastError?.error?.message || "Unknown MongoDB connection error."}`);
       })().catch((error) => {
         this.resetConnectionState();
         throw error;

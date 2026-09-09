@@ -1,11 +1,12 @@
 const { MongoClient } = require("mongodb");
 
-const { getMongoCollectionByName } = require("../lib/db");
+const { getMongoCollectionByName, getMongoUri: getAppSelectedMongoUri } = require("../lib/db");
 const { assertValidMongoConnectionString, getEnvValue, getMongoDbNameFromUri, isMongoConnectionString } = require("../lib/env");
 
 const DEFAULT_COLLECTION_NAME = "trade_learning_trades";
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MIN_SAMPLE_SIZE = 8;
+const MONGO_URI_ENV_KEYS = ["MONGODB_URI", "MONGO_URI", "MONGO_URL", "DATABASE_URL"];
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
@@ -65,19 +66,33 @@ function roundNumber(value, digits = 4) {
 }
 
 function getMongoUri() {
-  return assertValidMongoConnectionString(
-    getEnvValue("MONGODB_URI", "MONGO_URI"),
-    "Trade learning MongoDB connection string"
-  );
+  return getMongoUriCandidates()[0]?.value || "";
+}
+
+function getMongoUriCandidates() {
+  const seen = new Set();
+  const candidates = [];
+  for (const key of MONGO_URI_ENV_KEYS) {
+    if (process.env[key] === undefined) {
+      continue;
+    }
+    const value = assertValidMongoConnectionString(process.env[key], key);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    candidates.push({ key, value });
+  }
+  return candidates;
 }
 
 function getAppMongoUri() {
-  const mongoUri = getEnvValue("MONGODB_URI");
+  const mongoUri = getAppSelectedMongoUri() || getEnvValue(MONGO_URI_ENV_KEYS);
   return isMongoConnectionString(mongoUri) ? mongoUri : "";
 }
 
 function getMongoDbName(uri) {
-  return getEnvValue("MONGODB_DB_NAME", "MONGO_DB_NAME")
+  return getEnvValue("MONGODB_DB_NAME", "MONGO_DB_NAME", "DATABASE_NAME")
     || getMongoDbNameFromUri(uri, "trade_mvp")
     || "trade_mvp";
 }
@@ -121,6 +136,7 @@ class TradeLearningService {
       || DEFAULT_COLLECTION_NAME;
     this.logger = logger;
     this.ttlMs = ttlMs;
+    this.mongoUriCandidates = getMongoUriCandidates();
     this.mongoUri = getMongoUri();
     this.clientPromise = null;
     this.collectionPromise = null;
@@ -132,7 +148,8 @@ class TradeLearningService {
   }
 
   shouldUseSharedAppMongo() {
-    return !!this.mongoUri && this.mongoUri === getAppMongoUri();
+    const appMongoUri = getAppMongoUri();
+    return !!appMongoUri && this.mongoUriCandidates.some((candidate) => candidate.value === appMongoUri);
   }
 
   invalidateCache(strategyType = "") {
@@ -154,15 +171,26 @@ class TradeLearningService {
         if (this.shouldUseSharedAppMongo()) {
           const sharedCollection = await getMongoCollectionByName(this.collectionName);
           if (sharedCollection) {
+            this.mongoUri = getAppMongoUri();
             return sharedCollection;
           }
         }
 
-        if (!this.clientPromise) {
-          this.clientPromise = MongoClient.connect(this.mongoUri, getMongoClientOptions());
+        let lastError = null;
+        const candidates = this.mongoUriCandidates.length ? this.mongoUriCandidates : getMongoUriCandidates();
+        for (const candidate of candidates) {
+          try {
+            this.clientPromise = MongoClient.connect(candidate.value, getMongoClientOptions());
+            const client = await this.clientPromise;
+            this.mongoUri = candidate.value;
+            return client.db(getMongoDbName(this.mongoUri)).collection(this.collectionName);
+          } catch (error) {
+            lastError = { key: candidate.key, error };
+            this.clientPromise = null;
+          }
         }
-        const client = await this.clientPromise;
-        return client.db(getMongoDbName(this.mongoUri)).collection(this.collectionName);
+
+        throw new Error(`Unable to connect trade learning MongoDB. Last error from ${lastError?.key || "MongoDB"}: ${lastError?.error?.message || "Unknown MongoDB connection error."}`);
       })();
     }
 

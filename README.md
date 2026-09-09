@@ -10,7 +10,7 @@ cp .env.example .env
 npm start
 ```
 
-Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment.
+Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment. On Railway, the backend also accepts `MONGO_URI`, `MONGO_URL`, or `DATABASE_URL` for MongoDB.
 If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact frontend URL, for example `https://trade-frontend-rg2z.onrender.com`.
 
 ## Scripts
@@ -24,4 +24,4 @@ If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact 
 
 This backend exposes normal HTTP API routes plus websocket endpoints. If you deploy the frontend separately, set `FRONTEND_ORIGIN` here and set `TRADE_API_BASE_URL` on the frontend service.
 
-Render does not upload local `.env` files. Use `render.yaml` as the Blueprint or add the same keys listed there in the service's **Environment** tab.
+Railway does not upload local `.env` files automatically. Add the variables in the service's **Variables** tab, and make sure the MongoDB connection URL is reachable from the backend service.

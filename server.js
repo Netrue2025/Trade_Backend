@@ -8267,7 +8267,20 @@ async function listenOnAvailablePort(targetServer, preferredPort) {
   throw new Error(`Unable to find a free port between ${preferredPort} and ${preferredPort + MAX_PORT_RETRIES}.`);
 }
 
+function describeStartupError(error) {
+  const message = String(error?.message || error || "");
+  if (/mongo|mongodb|27017|server selection|timed out|econnrefused|enotfound/i.test(message)) {
+    return [
+      `MongoDB connection failed: ${message}`,
+      "Set a reachable Mongo connection string in Railway using MONGODB_URI, MONGO_URI, MONGO_URL, or DATABASE_URL.",
+      "If you use MongoDB Atlas, allow Railway's outbound access in Atlas Network Access or temporarily allow 0.0.0.0/0.",
+      "If you use Railway MongoDB, use the service's private Mongo connection URL from the same Railway project/environment.",
+    ].join(" ");
+  }
+  return message;
+}
+
 startServer().catch((error) => {
-  console.error("Failed to start Trade MVP:", error.message);
+  console.error("Failed to start Trade MVP:", describeStartupError(error));
   process.exit(1);
 });
