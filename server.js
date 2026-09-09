@@ -18,7 +18,7 @@ const DEFAULT_FRONTEND_ORIGINS = [
   "https://www.netruefi.org",
   "https://trade-frontend-rg2z.onrender.com",
 ];
-const DEFAULT_BACKEND_ORIGIN = "https://trade-backend-0bdr.onrender.com";
+const DEFAULT_BACKEND_ORIGIN = "https://tradebackend-production-8530.up.railway.app";
 const RENDER_FRONTEND_ORIGIN_PATTERN = /^https:\/\/trade-frontend-[a-z0-9-]+\.onrender\.com$/i;
 
 function loadEnvFile() {

@@ -27,7 +27,7 @@ services:
       - key: FRONTEND_URL
         value: https://trade-frontend-rg2z.onrender.com
       - key: BACKEND_URL
-        value: https://trade-backend-0bdr.onrender.com
+        value: https://tradebackend-production-8530.up.railway.app
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: PAYSTACK_PUBLIC_KEY
