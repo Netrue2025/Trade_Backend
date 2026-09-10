@@ -1587,6 +1587,133 @@ test("VTU purchase reserves wallet and success consumes reserve once", () => {
   assert.equal(service.getWalletHistory(user).some((item) => item.kind === "VTU" && item.reference === "airtime_test_1"), true);
 });
 
+test("digital service product pricing hides supplier cost from users", () => {
+  const { admin, service } = createHarness();
+  service.updateSettings(admin, {
+    exchangeRate: { usdtToNgn: "1500" },
+    digitalServices: {
+      enabled: true,
+      globalMarkupPercent: "10",
+    },
+  });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "55",
+      supplierProductId: "55",
+      provider: "akunding",
+      name: "Design Tool",
+      category: "Design",
+      currency: "USD",
+      providerCost: "2",
+      stock: 5,
+      available: true,
+      imageUrl: "https://akunding.shop/image.png",
+      syncedAt: "2026-08-30T10:00:00.000Z",
+    },
+  ]);
+
+  const [userProduct] = service.listDigitalServiceProducts();
+  const [adminProduct] = service.listDigitalServiceProducts({ admin: true });
+
+  assert.equal(userProduct.sellingPrice, "3300");
+  assert.equal(userProduct.providerCost, undefined);
+  assert.equal(adminProduct.providerCostNgn, "3000");
+  assert.equal(adminProduct.markupAmount, "300");
+});
+
+test("digital service order reserves wallet and delivery consumes reserve once", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, {
+      digitalServices: {
+        enabled: true,
+        globalMarkupPercent: "0",
+      },
+    });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "77",
+        supplierProductId: "77",
+        provider: "akunding",
+        name: "AI Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "2500",
+        stock: 10,
+        available: true,
+      },
+    ]);
+
+    const product = service.getDigitalServiceProduct("77", { admin: true });
+    const order = service.createDigitalServiceOrder(user, { product, quantity: 2 });
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "5000");
+
+    const delivered = service.applyDigitalServiceOrderResult(order.id, {
+      status: "delivered",
+      supplierStatus: "delivered",
+      supplierOrderId: "9001",
+      delivery: { pin: "SECRET-PIN" },
+    }, user);
+    assert.equal(delivered.delivery.pin, "SECRET-PIN");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+
+    service.applyDigitalServiceOrderResult(order.id, { status: "delivered" }, user);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("digital service supplier failure refunds reserved wallet once", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "6000");
+  service.updateSettings(admin, {
+    digitalServices: {
+      enabled: true,
+      globalMarkupPercent: "0",
+    },
+  });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "88",
+      supplierProductId: "88",
+      provider: "akunding",
+      name: "Streaming Slot",
+      category: "Streaming",
+      currency: "NGN",
+      providerCost: "3000",
+      stock: 1,
+      available: true,
+    },
+  ]);
+
+  const product = service.getDigitalServiceProduct("88", { admin: true });
+  const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "3000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "3000");
+
+  service.applyDigitalServiceOrderResult(order.id, {
+    status: "failed",
+    message: "Out of stock",
+  }, admin);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+
+  service.applyDigitalServiceOrderResult(order.id, { status: "failed" }, admin);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+});
+
 test("VTU refund releases reserved wallet exactly once", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "NGN", "2500");

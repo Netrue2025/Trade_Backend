@@ -56,6 +56,8 @@ const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
 const { PushNotificationService } = require("./services/pushNotificationService");
+const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
+const { DigitalServicesService } = require("./services/digitalServices.service");
 const {
   VtuService,
   VTU_BASE_URL,
@@ -132,6 +134,8 @@ let db = null;
 let financialService = null;
 let questService = null;
 let vtuService = null;
+let akundingService = null;
+let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
 const paymentAttemptBuckets = new Map();
@@ -5646,6 +5650,114 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/digital-services/status") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    const status = digitalServicesService.getStatus();
+    sendJson(res, 200, {
+      settings: {
+        enabled: status.settings.enabled,
+        configured: status.configured,
+        productCount: status.settings.productCount,
+        lastSyncAt: status.settings.lastSyncAt,
+        lastSyncStatus: status.settings.lastSyncStatus,
+      },
+    });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/digital-services/products") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const products = await digitalServicesService.listProducts({
+        query: url.searchParams.get("q") || "",
+        category: url.searchParams.get("category") || "",
+        force: url.searchParams.get("refresh") === "1",
+      });
+      const categories = [...new Set(financialService.listDigitalServiceProducts().map((product) => product.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      const status = digitalServicesService.getStatus();
+      sendJson(res, 200, {
+        products,
+        categories,
+        status: {
+          settings: {
+            enabled: status.settings.enabled,
+            configured: status.configured,
+            productCount: status.settings.productCount,
+            lastSyncAt: status.settings.lastSyncAt,
+            lastSyncStatus: status.settings.lastSyncStatus,
+          },
+        },
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, products: [], categories: [] });
+    }
+    return true;
+  }
+
+  const digitalProductMatch = url.pathname.match(/^\/api\/digital-services\/products\/([^/]+)$/);
+  if (req.method === "GET" && digitalProductMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      if (!digitalServicesService.getStatus().settings.enabled) {
+        throw new Error("Digital Services is not available now.");
+      }
+      const product = financialService.getDigitalServiceProduct(decodeURIComponent(digitalProductMatch[1] || ""));
+      sendJson(res, 200, { product });
+    } catch (error) {
+      sendJson(res, 404, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/digital-services/orders") {
+    const user = requireAuth(req, res);
+    if (!user) {
+      return true;
+    }
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 300);
+    sendJson(res, 200, { orders: financialService.listDigitalServiceOrders(user, { limit }) });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/digital-services/orders") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    if (isPaymentRateLimited(req, user.id, "digital-services")) {
+      sendJson(res, 429, { error: "Too many service requests. Please try again shortly." });
+      return true;
+    }
+    const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    const cachedResponse = financialService.findIdempotent("digital-service:order", user.id, idempotencyKey);
+    if (cachedResponse) {
+      sendJson(res, 200, cachedResponse);
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const order = await digitalServicesService.purchase(user, {
+        productId: body.productId,
+        quantity: body.quantity || 1,
+      }, getRequestMeta(req));
+      const responsePayload = { order };
+      financialService.saveIdempotent("digital-service:order", user.id, idempotencyKey, responsePayload);
+      sendJson(res, order.status === "delivered" ? 201 : 202, responsePayload);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/deposits") {
     const user = requireAuth(req, res, "user");
     if (!user) {
@@ -6433,6 +6545,115 @@ async function handleApi(req, res, url) {
       const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
       const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, admin, getRequestMeta(req));
       sendJson(res, 200, { transaction: settled });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/integrations/digital-services") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    sendJson(res, 200, {
+      settings: financialService.getDigitalServiceSettings(),
+      supplier: akundingService.getPublicStatus(),
+      summary: financialService.getDigitalServiceAdminSummary(),
+      products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
+      orders: financialService.listDigitalServiceOrders(admin, { limit: 100 }),
+      apiBaseUrl: DEFAULT_AKUNDING_BASE_URL,
+    });
+    return true;
+  }
+
+  if (req.method === "PUT" && url.pathname === "/api/admin/integrations/digital-services/settings") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const settings = financialService.updateDigitalServiceSettings(admin, await readBody(req), getRequestMeta(req));
+      sendJson(res, 200, { settings, supplier: akundingService.getPublicStatus() });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/digital-services/sync") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const products = await digitalServicesService.syncProducts({ force: true });
+      let supplierAccount = null;
+      try {
+        supplierAccount = await akundingService.getAccount();
+        const balance = supplierAccount?.balance ?? supplierAccount?.wallet_balance ?? supplierAccount?.data?.balance ?? null;
+        const currency = supplierAccount?.currency ?? supplierAccount?.data?.currency ?? "";
+        if (balance !== null && balance !== undefined) {
+          financialService.updateDigitalServiceSyncStatus({ status: "connected", supplierBalance: balance, supplierBalanceCurrency: currency });
+        }
+      } catch {
+        supplierAccount = null;
+      }
+      sendJson(res, 200, {
+        products,
+        supplierAccount: supplierAccount ? { connected: true } : null,
+        summary: financialService.getDigitalServiceAdminSummary(),
+      });
+    } catch (error) {
+      financialService.updateDigitalServiceSyncStatus({ status: "failed", error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message, settings: financialService.getDigitalServiceSettings() });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/integrations/digital-services/orders") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 250), 1), 500);
+    const status = url.searchParams.get("status") || "";
+    sendJson(res, 200, {
+      orders: financialService.listDigitalServiceOrders(admin, { limit, status }),
+      summary: financialService.getDigitalServiceAdminSummary(),
+    });
+    return true;
+  }
+
+  const adminDigitalProductOverrideMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/products\/([^/]+)\/override$/);
+  if (req.method === "PATCH" && adminDigitalProductOverrideMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const product = financialService.updateDigitalServiceProductOverride(
+        admin,
+        decodeURIComponent(adminDigitalProductOverrideMatch[1] || ""),
+        await readBody(req),
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, { product, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalOrderRequeryMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/requery$/);
+  if (req.method === "POST" && adminDigitalOrderRequeryMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const order = await digitalServicesService.requeryOrder(admin, decodeURIComponent(adminDigitalOrderRequeryMatch[1] || ""), getRequestMeta(req));
+      sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message });
     }
@@ -8262,6 +8483,8 @@ async function startServer() {
   pushNotificationService.ensureState();
   financialService.scanDuplicateUserReviews({ persistChanges: false });
   vtuService = new VtuService({ financialService, logger: console });
+  akundingService = new AkundingService({ logger: console });
+  digitalServicesService = new DigitalServicesService({ financialService, akundingService });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

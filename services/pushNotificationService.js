@@ -24,6 +24,8 @@ const CATEGORY_BY_TYPE = {
   VTU: "vtuPurchases",
   AIRTIME: "vtuPurchases",
   DATA: "vtuPurchases",
+  DIGITAL_SERVICE: "transactions",
+  DIGITAL_SERVICES: "transactions",
   SIGNAL: "tradingSignals",
   TRADE: "tradingSignals",
   LOW_BALANCE: "lowBalance",
@@ -93,6 +95,9 @@ function inferRoute(notification = {}) {
     return "/?tab=signals";
   }
   if (type === "VTU") {
+    return "/?tab=services";
+  }
+  if (type === "DIGITAL_SERVICE" || entityType === "DIGITAL_SERVICE") {
     return "/?tab=services";
   }
   if (type === "REFERRAL") {

@@ -33,6 +33,11 @@ const MESSAGE_NOTIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
 const VTU_FINAL_STATUSES = ["successful", "failed", "refunded"];
 const VTU_ACTIVE_STATUSES = ["initiated", "processing"];
 const VTU_LEDGER_TYPES = ["VTU_AIRTIME", "VTU_DATA", "VTU_REFUND"];
+const DIGITAL_SERVICE_FINAL_STATUSES = ["delivered", "failed", "refunded"];
+const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "payment_reserved", "submitted", "processing"];
+const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND"];
+const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "20";
+const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
 
 function nowIso() {
   return new Date().toISOString();
@@ -93,6 +98,24 @@ function normalizePercent(value, label = "Percent") {
     throw new Error(`${label} cannot be more than 100%.`);
   }
   return percent;
+}
+
+function normalizeMarkupMode(value) {
+  const mode = String(value || "percentage").trim().toLowerCase();
+  return ["percentage", "fixed", "custom"].includes(mode) ? mode : "percentage";
+}
+
+function normalizeOptionalUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  try {
+    const url = new URL(raw);
+    return ["http:", "https:"].includes(url.protocol) ? url.toString() : "";
+  } catch {
+    return "";
+  }
 }
 
 function normalizeWholeNumber(value, fallback, label = "Value") {
@@ -279,6 +302,23 @@ function defaultSettings() {
       createdAt: nowIso(),
       updatedAt: nowIso(),
     },
+    digitalServices: {
+      provider: "akunding",
+      enabled: false,
+      globalMarkupPercent: getEnvValue("AKUNDING_GLOBAL_MARKUP_PERCENT") || DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT,
+      fallbackImageUrl: DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
+      allowedImageDomains: ["akunding.shop"],
+      productOverrides: {},
+      lastSyncAt: null,
+      lastSyncStatus: "",
+      lastSyncError: "",
+      supplierBalance: null,
+      supplierBalanceCurrency: "",
+      lastBalanceCheckedAt: null,
+      updatedBy: "",
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    },
     trading: {
       tradingEnabled: true,
       dailyPerformanceMode: "manual",
@@ -337,6 +377,8 @@ class FinancialService {
     this.db.pushSubscriptions = Array.isArray(this.db.pushSubscriptions) ? this.db.pushSubscriptions : [];
     this.db.pushNotificationEvents = Array.isArray(this.db.pushNotificationEvents) ? this.db.pushNotificationEvents : [];
     this.db.vtuTransactions = Array.isArray(this.db.vtuTransactions) ? this.db.vtuTransactions : [];
+    this.db.digitalServiceProducts = Array.isArray(this.db.digitalServiceProducts) ? this.db.digitalServiceProducts : [];
+    this.db.digitalServiceOrders = Array.isArray(this.db.digitalServiceOrders) ? this.db.digitalServiceOrders : [];
     this.db.systemSettings = {
       ...defaultSettings(),
       ...(this.db.systemSettings || {}),
@@ -364,6 +406,10 @@ class FinancialService {
         ...defaultSettings().vtu,
         ...(this.db.systemSettings?.vtu || {}),
       },
+      digitalServices: {
+        ...defaultSettings().digitalServices,
+        ...(this.db.systemSettings?.digitalServices || {}),
+      },
       trading: {
         ...defaultSettings().trading,
         ...(this.db.systemSettings?.trading || {}),
@@ -380,6 +426,7 @@ class FinancialService {
       this.db.systemSettings.withdrawal.minNgn = MIN_WITHDRAWAL_AMOUNTS.NGN;
     }
     this.db.systemSettings.referral = this.normalizeReferralSettings(this.db.systemSettings.referral);
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings(this.db.systemSettings.digitalServices);
 
     for (const user of this.db.users || []) {
       if (user.role === "user") {
@@ -422,7 +469,85 @@ class FinancialService {
     this.ensureState();
     const settings = clone(this.db.systemSettings);
     settings.vtu = this.sanitizeVtuSettings(settings.vtu);
+    settings.digitalServices = this.sanitizeDigitalServiceSettings(settings.digitalServices, { admin: true });
     return settings;
+  }
+
+  normalizeDigitalServiceSettings(settings = {}) {
+    const allowedImageDomains = Array.isArray(settings.allowedImageDomains)
+      ? settings.allowedImageDomains
+      : String(settings.allowedImageDomains || "akunding.shop")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+    const rawOverrides = settings.productOverrides && typeof settings.productOverrides === "object" && !Array.isArray(settings.productOverrides)
+      ? settings.productOverrides
+      : {};
+    const productOverrides = {};
+    for (const [id, override] of Object.entries(rawOverrides)) {
+      const normalizedId = String(id || "").trim();
+      if (!normalizedId || !override || typeof override !== "object" || Array.isArray(override)) {
+        continue;
+      }
+      productOverrides[normalizedId] = {
+        enabled: override.enabled !== undefined ? normalizeBoolean(override.enabled) : true,
+        featured: normalizeBoolean(override.featured, false),
+        order: normalizeWholeNumber(override.order, 0, "Product order"),
+        displayName: String(override.displayName || "").trim(),
+        displayCategory: String(override.displayCategory || "").trim(),
+        customImageUrl: normalizeOptionalUrl(override.customImageUrl),
+        markupMode: normalizeMarkupMode(override.markupMode),
+        markupValue: normalizeNonNegativeAmount(override.markupValue ?? "0", "Product markup"),
+        customPriceNgn: normalizeNonNegativeAmount(override.customPriceNgn ?? "0", "Custom product price"),
+      };
+    }
+    return {
+      provider: "akunding",
+      enabled: settings.enabled !== undefined ? normalizeBoolean(settings.enabled) : false,
+      globalMarkupPercent: normalizePercent(settings.globalMarkupPercent ?? DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT, "Digital Services markup"),
+      fallbackImageUrl: settings.fallbackImageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
+      allowedImageDomains: allowedImageDomains.length ? allowedImageDomains : ["akunding.shop"],
+      productOverrides,
+      lastSyncAt: settings.lastSyncAt || null,
+      lastSyncStatus: settings.lastSyncStatus || "",
+      lastSyncError: settings.lastSyncError || "",
+      supplierBalance: settings.supplierBalance ?? null,
+      supplierBalanceCurrency: settings.supplierBalanceCurrency || "",
+      lastBalanceCheckedAt: settings.lastBalanceCheckedAt || null,
+      updatedBy: settings.updatedBy || "system",
+      createdAt: settings.createdAt || this.clock(),
+      updatedAt: settings.updatedAt || this.clock(),
+    };
+  }
+
+  sanitizeDigitalServiceSettings(settings = this.db.systemSettings?.digitalServices || {}, { admin = false } = {}) {
+    const normalized = this.normalizeDigitalServiceSettings(settings);
+    const summary = {
+      provider: "akunding",
+      enabled: normalized.enabled,
+      configured: !!normalized.enabled,
+      globalMarkupPercent: normalized.globalMarkupPercent,
+      fallbackImageUrl: normalized.fallbackImageUrl,
+      lastSyncAt: normalized.lastSyncAt,
+      lastSyncStatus: normalized.lastSyncStatus,
+      lastSyncError: admin ? normalized.lastSyncError : "",
+      productCount: this.db.digitalServiceProducts?.length || 0,
+      updatedAt: normalized.updatedAt,
+    };
+    if (admin) {
+      summary.allowedImageDomains = normalized.allowedImageDomains;
+      summary.productOverrides = clone(normalized.productOverrides);
+      summary.supplierBalance = normalized.supplierBalance;
+      summary.supplierBalanceCurrency = normalized.supplierBalanceCurrency;
+      summary.lastBalanceCheckedAt = normalized.lastBalanceCheckedAt;
+      summary.updatedBy = normalized.updatedBy;
+    }
+    return summary;
+  }
+
+  getDigitalServiceSettings() {
+    this.ensureState();
+    return this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true });
   }
 
   normalizeReferralSettings(settings = {}) {
@@ -1003,6 +1128,10 @@ class FinancialService {
         ...before.referral,
         ...(patch.referral || {}),
       },
+      digitalServices: {
+        ...before.digitalServices,
+        ...(patch.digitalServices || {}),
+      },
     };
 
     if (patch.exchangeRate?.usdtToNgn !== undefined) {
@@ -1031,12 +1160,56 @@ class FinancialService {
       updatedBy: patch.referral ? admin.id : next.referral.updatedBy,
       updatedAt: patch.referral ? this.clock() : next.referral.updatedAt,
     });
+    next.digitalServices = this.normalizeDigitalServiceSettings({
+      ...next.digitalServices,
+      updatedBy: patch.digitalServices ? admin.id : next.digitalServices.updatedBy,
+      updatedAt: patch.digitalServices ? this.clock() : next.digitalServices.updatedAt,
+    });
     next.withdrawal.maxDailyCount = 0;
     next.withdrawal.maxDailyNgn = normalizeAmount(next.withdrawal.maxDailyNgn || "10000000", "Daily withdrawal limit");
     this.db.systemSettings = next;
     this.audit(admin, "SETTINGS_UPDATED", "SystemSettings", "current", { sections: Object.keys(patch) }, requestMeta);
     this.persist();
     return this.getSettings();
+  }
+
+  updateDigitalServiceSettings(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const before = this.db.systemSettings.digitalServices || defaultSettings().digitalServices;
+    const next = this.normalizeDigitalServiceSettings({
+      ...before,
+      enabled: input.enabled !== undefined ? input.enabled : before.enabled,
+      globalMarkupPercent: input.globalMarkupPercent ?? before.globalMarkupPercent,
+      fallbackImageUrl: input.fallbackImageUrl || before.fallbackImageUrl,
+      allowedImageDomains: input.allowedImageDomains ?? before.allowedImageDomains,
+      productOverrides: input.productOverrides ?? before.productOverrides,
+      updatedBy: admin?.id || "admin",
+      updatedAt: this.clock(),
+    });
+    this.db.systemSettings.digitalServices = next;
+    this.audit(admin, "DIGITAL_SERVICES_SETTINGS_UPDATED", "SystemSettings", "digitalServices", {
+      enabled: next.enabled,
+      globalMarkupPercent: next.globalMarkupPercent,
+    }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceSettings(next, { admin: true });
+  }
+
+  updateDigitalServiceSyncStatus({ status = "", error = "", supplierBalance = null, supplierBalanceCurrency = "" } = {}) {
+    this.ensureState();
+    const current = this.db.systemSettings.digitalServices || defaultSettings().digitalServices;
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...current,
+      lastSyncAt: this.clock(),
+      lastSyncStatus: status,
+      lastSyncError: error,
+      supplierBalance: supplierBalance === null ? current.supplierBalance : String(supplierBalance),
+      supplierBalanceCurrency: supplierBalanceCurrency || current.supplierBalanceCurrency || "",
+      lastBalanceCheckedAt: supplierBalance === null ? current.lastBalanceCheckedAt : this.clock(),
+      updatedAt: this.clock(),
+    });
+    this.persist();
+    return this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true });
   }
 
   convertAmount(amount, fromCurrency, toCurrency, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
@@ -1333,15 +1506,37 @@ class FinancialService {
           providerStatus: transaction.providerStatus,
         },
       }));
+    const digitalPurchases = this.db.digitalServiceOrders
+      .filter(canSee)
+      .map((order) => ({
+        id: order.id,
+        kind: "DIGITAL_SERVICE",
+        type: "DIGITAL_SERVICE",
+        status: String(order.status || "processing").toUpperCase(),
+        currency: "NGN",
+        amount: `-${order.amountCharged}`,
+        displayAmounts: this.getDisplayAmounts(order.amountCharged, "NGN"),
+        reference: order.requestId,
+        description: `Digital service ${order.productName || ""}`.trim(),
+        createdAt: order.createdAt,
+        userId: order.userId,
+        metadata: {
+          productId: order.productId,
+          productName: order.productName,
+          category: order.category,
+          quantity: order.quantity,
+          supplierStatus: order.supplierStatus,
+        },
+      }));
     const ledgerTransactions = this.db.transactions
-      .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL", ...VTU_LEDGER_TYPES].includes(transaction.type))
+      .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL", ...VTU_LEDGER_TYPES, ...DIGITAL_SERVICE_LEDGER_TYPES].includes(transaction.type))
       .map((transaction) => ({
         ...clone(transaction),
         kind: "LEDGER",
         displayAmounts: transaction.metadata?.displayAmounts || this.getDisplayAmounts(transaction.amount, transaction.currency),
       }));
 
-    return [...deposits, ...withdrawals, ...vtuPurchases, ...ledgerTransactions]
+    return [...deposits, ...withdrawals, ...vtuPurchases, ...digitalPurchases, ...ledgerTransactions]
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(0, limit)
       .map((item) => this.enrichUserRecord(item));
@@ -3889,9 +4084,11 @@ class FinancialService {
         trading: clone(this.db.systemSettings.trading),
         referral: clone(this.db.systemSettings.referral),
         vtu: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
+        digitalServices: this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true }),
       },
       referral: this.getAdminReferralSummary({ limit: 5 }),
       vtu: this.getVtuAdminSummary(),
+      digitalServices: this.getDigitalServiceAdminSummary(),
       todayPnl: this.getTodayPnl(),
       totalPnl: this.db.transactions
         .filter((transaction) => ["TRADING_PROFIT", "TRADING_LOSS"].includes(transaction.type))
@@ -4184,6 +4381,494 @@ class FinancialService {
       userAgent: requestMeta.userAgent || "",
       createdAt: this.clock(),
     });
+  }
+
+  createDigitalServiceRequestId() {
+    return `digital_${Date.now().toString(36)}_${this.idGenerator(10).toLowerCase().replace(/[^a-z0-9]/g, "")}`.slice(0, 50);
+  }
+
+  getDigitalServiceOverride(productId) {
+    this.ensureState();
+    const id = String(productId || "").trim();
+    return this.db.systemSettings.digitalServices.productOverrides?.[id] || {};
+  }
+
+  isSafeDigitalServiceImageUrl(value = "") {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return false;
+    }
+    if (raw.startsWith("/")) {
+      return true;
+    }
+    try {
+      const parsed = new URL(raw);
+      const allowed = this.db.systemSettings.digitalServices.allowedImageDomains || [];
+      return ["http:", "https:"].includes(parsed.protocol)
+        && allowed.some((domain) => parsed.hostname === domain || parsed.hostname.endsWith(`.${domain}`));
+    } catch {
+      return false;
+    }
+  }
+
+  getDigitalServiceImageUrl(product = {}, override = this.getDigitalServiceOverride(product.id)) {
+    const custom = override.customImageUrl || "";
+    if (this.isSafeDigitalServiceImageUrl(custom)) {
+      return custom;
+    }
+    if (this.isSafeDigitalServiceImageUrl(product.imageUrl)) {
+      return product.imageUrl;
+    }
+    return this.db.systemSettings.digitalServices.fallbackImageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE;
+  }
+
+  getDigitalServiceProviderCostNgn(product = {}) {
+    const amount = normalizeNonNegativeAmount(product.providerCost || "0", "Supplier cost");
+    const currency = String(product.currency || "NGN").trim().toUpperCase();
+    if (currency === "NGN") {
+      return amount;
+    }
+    if (currency === "USDT" || currency === "USD") {
+      return multiplyRatio(amount, this.db.systemSettings.exchangeRate.usdtToNgn, "1");
+    }
+    return amount;
+  }
+
+  priceDigitalServiceProduct(product = {}) {
+    this.ensureState();
+    const override = this.getDigitalServiceOverride(product.id);
+    const providerCostNgn = this.getDigitalServiceProviderCostNgn(product);
+    let markupAmount = multiplyRatio(providerCostNgn, this.db.systemSettings.digitalServices.globalMarkupPercent || "0", "100");
+    let sellingPrice = add(providerCostNgn, markupAmount);
+    const mode = normalizeMarkupMode(override.markupMode);
+    if (mode === "fixed") {
+      markupAmount = normalizeNonNegativeAmount(override.markupValue || "0", "Product fixed markup");
+      sellingPrice = add(providerCostNgn, markupAmount);
+    } else if (mode === "custom" && compare(override.customPriceNgn || "0", "0") > 0) {
+      sellingPrice = normalizeAmount(override.customPriceNgn, "Custom product price");
+      markupAmount = compare(sellingPrice, providerCostNgn) > 0 ? subtract(sellingPrice, providerCostNgn) : "0";
+    } else if (override.markupValue !== undefined && compare(override.markupValue || "0", "0") > 0) {
+      markupAmount = multiplyRatio(providerCostNgn, normalizePercent(override.markupValue, "Product markup"), "100");
+      sellingPrice = add(providerCostNgn, markupAmount);
+    }
+    return {
+      providerCostNgn,
+      markupAmount,
+      sellingPrice,
+    };
+  }
+
+  sanitizeDigitalServiceProduct(product = {}, { admin = false } = {}) {
+    const override = this.getDigitalServiceOverride(product.id);
+    const pricing = this.priceDigitalServiceProduct(product);
+    const enabled = override.enabled !== undefined ? !!override.enabled : product.available !== false;
+    const response = {
+      id: String(product.id || product.supplierProductId || "").trim(),
+      name: override.displayName || product.name || "Digital Service",
+      description: product.description || "",
+      category: override.displayCategory || product.category || "Digital",
+      currency: "NGN",
+      price: pricing.sellingPrice,
+      sellingPrice: pricing.sellingPrice,
+      stock: Number(product.stock || 0),
+      available: enabled && product.available !== false && compare(pricing.sellingPrice, "0") > 0,
+      featured: !!override.featured,
+      order: Number(override.order || 0),
+      imageUrl: this.getDigitalServiceImageUrl(product, override),
+      deliveryLabel: product.deliveryLabel || "After purchase",
+      planLabel: product.planLabel || "",
+      providerStatus: product.providerStatus || "",
+      syncedAt: product.syncedAt || null,
+    };
+    if (admin) {
+      response.supplierProductId = product.supplierProductId || product.id || "";
+      response.provider = product.provider || "akunding";
+      response.providerCost = product.providerCost || "0";
+      response.providerCostNgn = pricing.providerCostNgn;
+      response.markupAmount = pricing.markupAmount;
+      response.override = override;
+    }
+    return response;
+  }
+
+  listDigitalServiceProducts({ query = "", category = "", includeInactive = false, admin = false } = {}) {
+    this.ensureState();
+    const normalizedQuery = String(query || "").trim().toLowerCase();
+    const normalizedCategory = String(category || "").trim().toLowerCase();
+    return this.db.digitalServiceProducts
+      .map((product) => this.sanitizeDigitalServiceProduct(product, { admin }))
+      .filter((product) => includeInactive || product.available)
+      .filter((product) => !normalizedCategory || String(product.category || "").toLowerCase() === normalizedCategory)
+      .filter((product) => {
+        if (!normalizedQuery) {
+          return true;
+        }
+        return `${product.name} ${product.description} ${product.category}`.toLowerCase().includes(normalizedQuery);
+      })
+      .sort((a, b) => Number(b.featured) - Number(a.featured) || Number(a.order || 0) - Number(b.order || 0) || a.name.localeCompare(b.name));
+  }
+
+  getDigitalServiceProduct(productId, { admin = false } = {}) {
+    this.ensureState();
+    const id = String(productId || "").trim();
+    const product = this.db.digitalServiceProducts.find((item) => String(item.id || item.supplierProductId || "") === id);
+    if (!product) {
+      throw new Error("Digital service not found.");
+    }
+    const sanitized = this.sanitizeDigitalServiceProduct(product, { admin });
+    if (!admin && !sanitized.available) {
+      throw new Error("This digital service is not available now.");
+    }
+    return sanitized;
+  }
+
+  replaceDigitalServiceProducts(products = [], { provider = "akunding" } = {}) {
+    this.ensureState();
+    const normalizedProducts = products
+      .map((product) => ({
+        ...product,
+        id: String(product.id || product.supplierProductId || "").trim(),
+        supplierProductId: String(product.supplierProductId || product.id || "").trim(),
+        provider,
+        syncedAt: product.syncedAt || this.clock(),
+      }))
+      .filter((product) => product.id && product.supplierProductId);
+    const nextById = new Map(normalizedProducts.map((product) => [product.id, product]));
+    for (const existing of this.db.digitalServiceProducts) {
+      if (!nextById.has(existing.id)) {
+        nextById.set(existing.id, {
+          ...existing,
+          available: false,
+          providerStatus: "unavailable",
+          syncedAt: this.clock(),
+        });
+      }
+    }
+    this.db.digitalServiceProducts = [...nextById.values()];
+    this.updateDigitalServiceSyncStatus({ status: "connected", error: "" });
+    return this.listDigitalServiceProducts({ includeInactive: true, admin: true });
+  }
+
+  updateDigitalServiceProductOverride(admin, productId, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const product = this.getDigitalServiceProduct(productId, { admin: true });
+    const current = this.db.systemSettings.digitalServices.productOverrides[product.id] || {};
+    const next = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      productOverrides: {
+        ...this.db.systemSettings.digitalServices.productOverrides,
+        [product.id]: {
+          ...current,
+          ...input,
+        },
+      },
+      updatedBy: admin?.id || "admin",
+      updatedAt: this.clock(),
+    });
+    this.db.systemSettings.digitalServices = next;
+    this.audit(admin, "DIGITAL_SERVICE_PRODUCT_OVERRIDE_UPDATED", "DigitalServiceProduct", product.id, {
+      productId: product.id,
+    }, requestMeta);
+    this.persist();
+    return this.getDigitalServiceProduct(product.id, { admin: true });
+  }
+
+  encryptDigitalServiceDelivery(delivery) {
+    if (!delivery || typeof delivery !== "object" || !Object.keys(delivery).length) {
+      return "";
+    }
+    return encryptSetting(JSON.stringify(delivery));
+  }
+
+  decryptDigitalServiceDelivery(order = {}) {
+    if (!order.deliveryEncrypted) {
+      return null;
+    }
+    try {
+      return JSON.parse(decryptSetting(order.deliveryEncrypted));
+    } catch {
+      return null;
+    }
+  }
+
+  sanitizeDigitalServiceOrder(order = {}, { admin = false } = {}) {
+    const response = {
+      id: order.id,
+      userId: order.userId,
+      requestId: order.requestId,
+      provider: order.provider || "akunding",
+      productId: order.productId,
+      productName: order.productName,
+      category: order.category,
+      imageUrl: order.imageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
+      quantity: order.quantity,
+      currency: "NGN",
+      amountCharged: order.amountCharged,
+      status: order.status,
+      supplierStatus: order.supplierStatus || "",
+      supplierOrderId: admin ? order.supplierOrderId || "" : "",
+      failureReason: order.failureReason || "",
+      createdAt: order.createdAt,
+      updatedAt: order.updatedAt,
+      completedAt: order.completedAt || null,
+      refundedAt: order.refundedAt || null,
+      user: admin ? this.enrichUserRecord(order).user : undefined,
+      delivery: ["delivered", "refunded"].includes(order.status) || admin ? this.decryptDigitalServiceDelivery(order) : null,
+    };
+    if (admin) {
+      response.providerCost = order.providerCost;
+      response.providerCostNgn = order.providerCostNgn;
+      response.markupAmount = order.markupAmount;
+      response.balanceReserved = !!order.balanceReserved;
+    }
+    return response;
+  }
+
+  listDigitalServiceOrders(user, { limit = 100, offset = 0, status = "" } = {}) {
+    this.ensureState();
+    const normalizedStatus = String(status || "").trim().toLowerCase();
+    return this.db.digitalServiceOrders
+      .filter((order) => (user.role === "admin" || order.userId === user.id) && (!normalizedStatus || order.status === normalizedStatus))
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      .slice(offset, offset + limit)
+      .map((order) => this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" }));
+  }
+
+  getDigitalServiceOrder(user, orderId) {
+    this.ensureState();
+    const id = String(orderId || "").trim();
+    const order = this.db.digitalServiceOrders.find((item) => item.id === id || item.requestId === id || item.supplierOrderId === id);
+    if (!order || (user.role !== "admin" && order.userId !== user.id)) {
+      throw new Error("Digital service order not found.");
+    }
+    return this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" });
+  }
+
+  updateDigitalServiceLedgerStatus(requestId, status, balanceAfter = null) {
+    const ledger = this.db.transactions.find((item) => DIGITAL_SERVICE_LEDGER_TYPES.includes(item.type) && item.reference === requestId);
+    if (ledger) {
+      ledger.status = status;
+      if (balanceAfter !== null) {
+        ledger.balanceAfter = balanceAfter;
+      }
+    }
+  }
+
+  createDigitalServiceOrder(user, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (!user || user.role !== "user") {
+      throw new Error("User not found.");
+    }
+    const product = input.product || this.getDigitalServiceProduct(input.productId);
+    if (!product.available) {
+      throw new Error("This digital service is not available now.");
+    }
+    const quantity = Math.max(1, Math.min(Math.floor(Number(input.quantity || 1)), 1000));
+    const unitPrice = normalizeAmount(product.sellingPrice || product.price, "Digital service price");
+    const amountCharged = multiplyRatio(unitPrice, String(quantity), "1");
+    const providerCostNgn = multiplyRatio(product.providerCostNgn || "0", String(quantity), "1");
+    const markupAmount = compare(amountCharged, providerCostNgn) > 0 ? subtract(amountCharged, providerCostNgn) : "0";
+    const wallet = this.ensureWallet(user.id, "NGN");
+    if (compare(wallet.availableBalance, amountCharged) < 0) {
+      const error = new Error("Insufficient NGN balance.");
+      error.code = "INSUFFICIENT_BALANCE";
+      throw error;
+    }
+    const requestId = this.createDigitalServiceRequestId();
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = subtract(wallet.availableBalance, amountCharged);
+    wallet.lockedBalance = add(wallet.lockedBalance, amountCharged);
+    wallet.updatedAt = this.clock();
+    const order = {
+      id: this.idGenerator(12),
+      userId: user.id,
+      requestId,
+      provider: "akunding",
+      productId: product.id,
+      supplierProductId: product.supplierProductId || product.id,
+      productName: product.name,
+      category: product.category,
+      imageUrl: product.imageUrl,
+      quantity,
+      currency: "NGN",
+      unitPrice,
+      amountCharged,
+      providerCost: product.providerCost || product.providerCostNgn || "0",
+      providerCostNgn,
+      markupAmount,
+      status: "payment_reserved",
+      supplierStatus: "queued",
+      supplierOrderId: "",
+      supplierResponse: null,
+      deliveryEncrypted: "",
+      failureReason: "",
+      walletReservedAmount: amountCharged,
+      balanceReserved: true,
+      createdAt: this.clock(),
+      updatedAt: this.clock(),
+      completedAt: null,
+      refundedAt: null,
+    };
+    this.db.digitalServiceOrders.unshift(order);
+    this.db.transactions.unshift({
+      id: this.idGenerator(12),
+      userId: user.id,
+      type: "DIGITAL_SERVICE",
+      currency: "NGN",
+      amount: `-${amountCharged}`,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      reference: requestId,
+      status: "PROCESSING",
+      description: `Digital service ${order.productName}`,
+      createdBy: user.id,
+      createdAt: this.clock(),
+      metadata: {
+        productId: order.productId,
+        quantity,
+        displayAmounts: this.getDisplayAmounts(amountCharged, "NGN"),
+      },
+    });
+    this.createNotification({
+      userId: user.id,
+      type: "DIGITAL_SERVICE",
+      title: "Digital service order",
+      message: "Your order is processing.",
+      entityType: "DIGITAL_SERVICE",
+      entityId: order.id,
+      route: "/?tab=services",
+    });
+    this.audit(user, "DIGITAL_SERVICE_ORDER_CREATED", "DigitalServiceOrder", order.id, {
+      productId: order.productId,
+      quantity,
+      amountCharged,
+      requestId,
+    }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: false });
+  }
+
+  applyDigitalServiceOrderResult(orderId, payload = {}, actor = { id: "digital-services", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const order = this.db.digitalServiceOrders.find((item) => item.id === orderId || item.requestId === orderId || item.supplierOrderId === orderId);
+    if (!order) {
+      throw new Error("Digital service order not found.");
+    }
+    if (DIGITAL_SERVICE_FINAL_STATUSES.includes(order.status) && !order.balanceReserved) {
+      return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+    }
+    const nextStatus = String(payload.status || "processing").trim().toLowerCase();
+    const supplierStatus = String(payload.supplierStatus || payload.status || order.supplierStatus || "processing").trim();
+    order.supplierStatus = supplierStatus;
+    order.supplierOrderId = String(payload.supplierOrderId || order.supplierOrderId || "").trim();
+    order.supplierResponse = payload.providerResponse ? clone(payload.providerResponse) : order.supplierResponse;
+    order.updatedAt = this.clock();
+    if (payload.delivery) {
+      order.deliveryEncrypted = this.encryptDigitalServiceDelivery(payload.delivery);
+    }
+    const wallet = this.ensureWallet(order.userId, "NGN");
+    if (nextStatus === "delivered") {
+      if (order.balanceReserved) {
+        wallet.lockedBalance = subtract(wallet.lockedBalance, order.walletReservedAmount);
+        wallet.updatedAt = this.clock();
+        order.balanceReserved = false;
+      }
+      order.status = "delivered";
+      order.completedAt = order.completedAt || this.clock();
+      this.updateDigitalServiceLedgerStatus(order.requestId, "SUCCESSFUL", wallet.availableBalance);
+      this.createNotification({
+        userId: order.userId,
+        type: "DIGITAL_SERVICE",
+        title: "Order delivered",
+        message: `${order.productName} is ready.`,
+        entityType: "DIGITAL_SERVICE",
+        entityId: order.id,
+        route: "/?tab=services",
+      });
+    } else if (nextStatus === "failed" || nextStatus === "refunded") {
+      if (order.balanceReserved) {
+        const balanceBefore = wallet.availableBalance;
+        wallet.availableBalance = add(wallet.availableBalance, order.walletReservedAmount);
+        wallet.lockedBalance = subtract(wallet.lockedBalance, order.walletReservedAmount);
+        wallet.updatedAt = this.clock();
+        this.db.transactions.unshift({
+          id: this.idGenerator(12),
+          userId: order.userId,
+          type: "DIGITAL_SERVICE_REFUND",
+          currency: "NGN",
+          amount: order.walletReservedAmount,
+          balanceBefore,
+          balanceAfter: wallet.availableBalance,
+          reference: order.requestId,
+          status: "SUCCESSFUL",
+          description: "Digital service refund",
+          createdBy: actor?.id || "digital-services",
+          createdAt: this.clock(),
+          metadata: {
+            digitalServiceOrderId: order.id,
+            productId: order.productId,
+            displayAmounts: this.getDisplayAmounts(order.walletReservedAmount, "NGN"),
+          },
+        });
+        order.balanceReserved = false;
+      }
+      order.status = nextStatus === "refunded" ? "refunded" : "failed";
+      order.refundedAt = order.refundedAt || this.clock();
+      order.completedAt = order.completedAt || this.clock();
+      order.failureReason = String(payload.message || order.failureReason || "").trim();
+      this.updateDigitalServiceLedgerStatus(order.requestId, order.status === "refunded" ? "REFUNDED" : "FAILED", wallet.availableBalance);
+      this.createNotification({
+        userId: order.userId,
+        type: "DIGITAL_SERVICE",
+        title: order.status === "refunded" ? "Order refunded" : "Order failed",
+        message: "Your NGN wallet has been updated.",
+        entityType: "DIGITAL_SERVICE",
+        entityId: order.id,
+        route: "/?tab=services",
+      });
+    } else {
+      order.status = DIGITAL_SERVICE_ACTIVE_STATUSES.includes(nextStatus) ? nextStatus : "processing";
+      this.updateDigitalServiceLedgerStatus(order.requestId, "PROCESSING");
+    }
+    this.audit(actor, "DIGITAL_SERVICE_PROVIDER_RESULT_APPLIED", "DigitalServiceOrder", order.id, {
+      requestId: order.requestId,
+      status: order.status,
+      supplierStatus: order.supplierStatus,
+    }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+  }
+
+  getDigitalServiceAdminSummary() {
+    this.ensureState();
+    const today = this.clock().slice(0, 10);
+    const summary = {
+      settings: this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true }),
+      productCount: this.db.digitalServiceProducts.length,
+      ordersToday: 0,
+      successCount: 0,
+      pendingCount: 0,
+      failedCount: 0,
+      revenue: "0",
+      cost: "0",
+      profit: "0",
+    };
+    for (const order of this.db.digitalServiceOrders) {
+      if (String(order.createdAt || "").startsWith(today)) {
+        summary.ordersToday += 1;
+      }
+      if (order.status === "delivered") {
+        summary.successCount += 1;
+        summary.revenue = add(summary.revenue, order.amountCharged || "0");
+        summary.cost = add(summary.cost, order.providerCostNgn || "0");
+        summary.profit = add(summary.profit, order.markupAmount || "0");
+      } else if (DIGITAL_SERVICE_ACTIVE_STATUSES.includes(order.status)) {
+        summary.pendingCount += 1;
+      } else {
+        summary.failedCount += 1;
+      }
+    }
+    return summary;
   }
 
   findIdempotent(scope, userId, key) {
