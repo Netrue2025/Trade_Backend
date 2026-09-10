@@ -23,6 +23,12 @@ const MIN_WITHDRAWAL_AMOUNTS = {
 };
 const DEFAULT_NGN_WITHDRAWAL_FEE = "100";
 const DEFAULT_MIN_TRADE_JOIN_USDT = "1";
+const DEFAULT_REFERRAL_BONUS_NGN = "500";
+const DEFAULT_REFERRAL_MIN_DEPOSIT_NGN = "2000";
+const DEFAULT_REFERRAL_MIN_SPEND_NGN = "2000";
+const DEFAULT_REFERRAL_MIN_TRADES = 2;
+const DEFAULT_REFERRAL_MAX_EARNINGS_NGN = "100000";
+const REFERRAL_CODE_PREFIX = "NTR";
 const MESSAGE_NOTIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
 const VTU_FINAL_STATUSES = ["successful", "failed", "refunded"];
 const VTU_ACTIVE_STATUSES = ["initiated", "processing"];
@@ -87,6 +93,19 @@ function normalizePercent(value, label = "Percent") {
     throw new Error(`${label} cannot be more than 100%.`);
   }
   return percent;
+}
+
+function normalizeWholeNumber(value, fallback, label = "Value") {
+  const source = value === undefined || value === null || String(value).trim() === "" ? fallback : value;
+  const numeric = Number(source);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    throw new Error(`${label} cannot be negative.`);
+  }
+  return Math.floor(numeric);
+}
+
+function minAmount(a, b) {
+  return compare(a, b) <= 0 ? String(a) : String(b);
 }
 
 function mapVtuProviderStatus(status, fallbackCode = "") {
@@ -266,6 +285,17 @@ function defaultSettings() {
       supportedExchanges: ["bybit", "binance"],
       minJoinUsdt: getEnvValue("MIN_TRADE_JOIN_USDT") || DEFAULT_MIN_TRADE_JOIN_USDT,
     },
+    referral: {
+      enabled: true,
+      bonusAmountNgn: getEnvValue("REFERRAL_BONUS_NGN") || DEFAULT_REFERRAL_BONUS_NGN,
+      minimumDepositNgn: getEnvValue("REFERRAL_MIN_DEPOSIT_NGN") || DEFAULT_REFERRAL_MIN_DEPOSIT_NGN,
+      minimumSpendNgn: getEnvValue("REFERRAL_MIN_SPEND_NGN") || DEFAULT_REFERRAL_MIN_SPEND_NGN,
+      minimumTrades: normalizeWholeNumber(getEnvValue("REFERRAL_MIN_TRADES"), DEFAULT_REFERRAL_MIN_TRADES, "Referral minimum trades"),
+      maximumEarningsNgn: getEnvValue("REFERRAL_MAX_EARNINGS_NGN") || DEFAULT_REFERRAL_MAX_EARNINGS_NGN,
+      campaignMaximumNgn: getEnvValue("REFERRAL_CAMPAIGN_MAXIMUM_NGN") || DEFAULT_REFERRAL_MAX_EARNINGS_NGN,
+      updatedAt: nowIso(),
+      updatedBy: "system",
+    },
   };
 }
 
@@ -297,6 +327,7 @@ class FinancialService {
     this.db.withdrawals = Array.isArray(this.db.withdrawals) ? this.db.withdrawals : [];
     this.db.giftCards = Array.isArray(this.db.giftCards) ? this.db.giftCards : [];
     this.db.tradeInvestments = Array.isArray(this.db.tradeInvestments) ? this.db.tradeInvestments : [];
+    this.db.referrals = Array.isArray(this.db.referrals) ? this.db.referrals : [];
     this.db.notifications = Array.isArray(this.db.notifications) ? this.db.notifications : [];
     this.db.chatMessages = Array.isArray(this.db.chatMessages) ? this.db.chatMessages : [];
     this.db.dailyPerformances = Array.isArray(this.db.dailyPerformances) ? this.db.dailyPerformances : [];
@@ -337,6 +368,10 @@ class FinancialService {
         ...defaultSettings().trading,
         ...(this.db.systemSettings?.trading || {}),
       },
+      referral: {
+        ...defaultSettings().referral,
+        ...(this.db.systemSettings?.referral || {}),
+      },
     };
     if (compare(this.db.systemSettings.withdrawal.minUsdt || "0", MIN_WITHDRAWAL_AMOUNTS.USDT) < 0) {
       this.db.systemSettings.withdrawal.minUsdt = MIN_WITHDRAWAL_AMOUNTS.USDT;
@@ -344,9 +379,11 @@ class FinancialService {
     if (compare(this.db.systemSettings.withdrawal.minNgn || "0", MIN_WITHDRAWAL_AMOUNTS.NGN) < 0) {
       this.db.systemSettings.withdrawal.minNgn = MIN_WITHDRAWAL_AMOUNTS.NGN;
     }
+    this.db.systemSettings.referral = this.normalizeReferralSettings(this.db.systemSettings.referral);
 
     for (const user of this.db.users || []) {
       if (user.role === "user") {
+        this.ensureReferralCode(user);
         user.pnlLots = Array.isArray(user.pnlLots) ? user.pnlLots : [];
         user.bankAccounts = Array.isArray(user.bankAccounts) ? user.bankAccounts : [];
         if (user.bankAccount && !user.bankAccount.id) {
@@ -386,6 +423,379 @@ class FinancialService {
     const settings = clone(this.db.systemSettings);
     settings.vtu = this.sanitizeVtuSettings(settings.vtu);
     return settings;
+  }
+
+  normalizeReferralSettings(settings = {}) {
+    return {
+      enabled: settings.enabled !== undefined ? normalizeBoolean(settings.enabled) : true,
+      bonusAmountNgn: normalizeNonNegativeAmount(settings.bonusAmountNgn ?? DEFAULT_REFERRAL_BONUS_NGN, "Referral bonus"),
+      minimumDepositNgn: normalizeNonNegativeAmount(settings.minimumDepositNgn ?? DEFAULT_REFERRAL_MIN_DEPOSIT_NGN, "Referral minimum deposit"),
+      minimumSpendNgn: normalizeNonNegativeAmount(settings.minimumSpendNgn ?? DEFAULT_REFERRAL_MIN_SPEND_NGN, "Referral minimum spend"),
+      minimumTrades: normalizeWholeNumber(settings.minimumTrades, DEFAULT_REFERRAL_MIN_TRADES, "Referral minimum trades"),
+      maximumEarningsNgn: normalizeNonNegativeAmount(settings.maximumEarningsNgn ?? DEFAULT_REFERRAL_MAX_EARNINGS_NGN, "Maximum referral earnings"),
+      campaignMaximumNgn: normalizeNonNegativeAmount(
+        settings.campaignMaximumNgn ?? settings.maximumEarningsNgn ?? DEFAULT_REFERRAL_MAX_EARNINGS_NGN,
+        "Referral campaign maximum"
+      ),
+      updatedAt: settings.updatedAt || this.clock(),
+      updatedBy: settings.updatedBy || "system",
+    };
+  }
+
+  generateReferralCode() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      let suffix = "";
+      for (let index = 0; index < 6; index += 1) {
+        suffix += alphabet[crypto.randomInt(0, alphabet.length)];
+      }
+      const code = `${REFERRAL_CODE_PREFIX}-${suffix}`;
+      if (!this.db.users.some((user) => String(user.referralCode || "").toUpperCase() === code)) {
+        return code;
+      }
+    }
+    return `${REFERRAL_CODE_PREFIX}-${this.idGenerator(12).replace(/[^a-z0-9]/gi, "").slice(0, 8).toUpperCase()}`;
+  }
+
+  ensureReferralCode(user) {
+    if (!user || user.role !== "user") {
+      return "";
+    }
+    const current = String(user.referralCode || "").trim().toUpperCase();
+    const duplicate = current && this.db.users.some((item) => item.id !== user.id && String(item.referralCode || "").trim().toUpperCase() === current);
+    if (current && !duplicate) {
+      user.referralCode = current;
+      return current;
+    }
+    user.referralCode = this.generateReferralCode();
+    user.referralCodeCreatedAt = user.referralCodeCreatedAt || this.clock();
+    return user.referralCode;
+  }
+
+  getReferralSettings() {
+    this.ensureState();
+    return clone(this.db.systemSettings.referral);
+  }
+
+  findUserByReferralCode(code) {
+    const normalized = String(code || "").trim().toUpperCase();
+    if (!normalized) {
+      return null;
+    }
+    this.ensureState();
+    return this.db.users.find((user) => user.role === "user" && String(user.referralCode || "").trim().toUpperCase() === normalized) || null;
+  }
+
+  registerReferralForSignup(referredUser, referralCode = "", requestMeta = {}) {
+    this.ensureState();
+    if (!referredUser || referredUser.role !== "user") {
+      return null;
+    }
+    this.ensureReferralCode(referredUser);
+    const code = String(referralCode || "").trim().toUpperCase();
+    if (!code) {
+      return null;
+    }
+    const referrer = this.findUserByReferralCode(code);
+    if (!referrer || referrer.id === referredUser.id || referrer.referredByUserId === referredUser.id) {
+      return null;
+    }
+    const existing = this.db.referrals.find((item) => item.referredUserId === referredUser.id);
+    if (existing) {
+      return clone(existing);
+    }
+    const referral = {
+      id: this.idGenerator(12),
+      referrerUserId: referrer.id,
+      referredUserId: referredUser.id,
+      referralCode: referrer.referralCode,
+      status: "registered",
+      depositQualified: false,
+      spendQualified: false,
+      tradeQualified: false,
+      qualifiedDepositAmount: "0",
+      qualifiedSpendAmount: "0",
+      qualifiedTradeCount: 0,
+      depositQualifiedAt: null,
+      activityQualifiedAt: null,
+      qualifiedAt: null,
+      rewardAmount: "0",
+      rewardAmountSnapshot: "0",
+      rewardedAt: null,
+      rewardTransactionId: "",
+      rewardReference: `referral:${referredUser.id}`,
+      createdAt: this.clock(),
+      updatedAt: this.clock(),
+    };
+    referredUser.referredByUserId = referrer.id;
+    referredUser.referredByReferralCode = referrer.referralCode;
+    this.db.referrals.unshift(referral);
+    this.audit(referredUser, "REFERRAL_REGISTERED", "Referral", referral.id, {
+      referrerUserId: referrer.id,
+    }, requestMeta);
+    this.persist();
+    return clone(referral);
+  }
+
+  getReferralDepositTotalNgn(userId) {
+    return this.db.deposits
+      .filter((deposit) => deposit.userId === userId && String(deposit.status || "").toUpperCase() === "APPROVED")
+      .reduce((sum, deposit) => {
+        const amount = deposit.currency === "NGN"
+          ? String(deposit.amount || "0")
+          : String(deposit.displayAmounts?.NGN || this.convertAmount(deposit.amount || "0", deposit.currency || "USDT", "NGN", deposit.exchangeRate));
+        return add(sum, normalizeNonNegativeAmount(amount, "Referral deposit amount"));
+      }, "0");
+  }
+
+  getReferralSpendTotalNgn(userId) {
+    return this.db.vtuTransactions
+      .filter((transaction) =>
+        transaction.userId === userId &&
+        ["airtime", "data"].includes(String(transaction.productType || "").toLowerCase()) &&
+        String(transaction.status || "").toLowerCase() === "successful"
+      )
+      .reduce((sum, transaction) => add(sum, normalizeNonNegativeAmount(transaction.amountCharged || "0", "Referral spend amount")), "0");
+  }
+
+  getReferralTradeCount(userId) {
+    return this.db.tradeInvestments
+      .filter((investment) => investment.userId === userId && String(investment.status || "").toUpperCase() === "ACTIVE")
+      .length;
+  }
+
+  getReferralPaidTotalNgn(referrerUserId) {
+    return this.db.referrals
+      .filter((referral) => referral.referrerUserId === referrerUserId && referral.rewardedAt)
+      .reduce((sum, referral) => add(sum, referral.rewardAmount || "0"), "0");
+  }
+
+  maskReferralUser(user = {}) {
+    const source = String(user.id || user.email || "");
+    const suffix = source.replace(/[^a-z0-9]/gi, "").slice(-4).padStart(4, "*");
+    return `User ****${suffix}`;
+  }
+
+  serializeReferral(referral, { admin = false } = {}) {
+    const referrer = this.db.users.find((user) => user.id === referral.referrerUserId) || {};
+    const referred = this.db.users.find((user) => user.id === referral.referredUserId) || {};
+    const settings = this.db.systemSettings.referral;
+    const depositActivity = {
+      amount: referral.qualifiedDepositAmount || "0",
+      required: settings.minimumDepositNgn,
+      qualified: !!referral.depositQualified,
+    };
+    const spendActivity = {
+      amount: referral.qualifiedSpendAmount || "0",
+      required: settings.minimumSpendNgn,
+      qualified: !!referral.spendQualified,
+    };
+    const tradeActivity = {
+      count: Number(referral.qualifiedTradeCount || 0),
+      required: Number(settings.minimumTrades || 0),
+      qualified: !!referral.tradeQualified,
+    };
+    const base = {
+      id: referral.id,
+      status: referral.status,
+      depositQualified: !!referral.depositQualified,
+      spendQualified: !!referral.spendQualified,
+      tradeQualified: !!referral.tradeQualified,
+      depositProgress: depositActivity,
+      spendProgress: spendActivity,
+      tradeProgress: tradeActivity,
+      qualifiedAt: referral.qualifiedAt || null,
+      rewardedAt: referral.rewardedAt || null,
+      rewardAmount: referral.rewardAmount || "0",
+      rewardAmountSnapshot: referral.rewardAmountSnapshot || referral.rewardAmount || "0",
+      createdAt: referral.createdAt,
+      updatedAt: referral.updatedAt,
+    };
+    if (admin) {
+      return {
+        ...base,
+        referralCode: referral.referralCode,
+        referrer: { id: referrer.id || "", name: referrer.name || "", email: referrer.email || "" },
+        referredUser: { id: referred.id || "", name: referred.name || "", email: referred.email || "" },
+      };
+    }
+    return {
+      ...base,
+      referredUser: {
+        label: this.maskReferralUser(referred),
+        registeredAt: referred.createdAt || referral.createdAt,
+      },
+    };
+  }
+
+  issueReferralReward(referral, settings, requestMeta = {}) {
+    if (referral.rewardedAt) {
+      return false;
+    }
+    const existingReward = this.db.transactions.find((transaction) => transaction.reference === referral.rewardReference);
+    if (existingReward) {
+      referral.rewardedAt = referral.rewardedAt || existingReward.createdAt || this.clock();
+      referral.rewardAmount = referral.rewardAmount || existingReward.amount || "0";
+      referral.rewardTransactionId = existingReward.id;
+      referral.status = "rewarded";
+      referral.updatedAt = this.clock();
+      return false;
+    }
+    if (!settings.enabled || compare(settings.bonusAmountNgn, "0") <= 0) {
+      return false;
+    }
+
+    const maxEarnings = settings.maximumEarningsNgn || "0";
+    const paidTotal = this.getReferralPaidTotalNgn(referral.referrerUserId);
+    const remainingCap = compare(maxEarnings, "0") > 0 ? subtract(maxEarnings, paidTotal) : settings.bonusAmountNgn;
+    if (compare(remainingCap, "0") <= 0) {
+      referral.status = "qualified";
+      referral.updatedAt = this.clock();
+      return false;
+    }
+    const rewardAmount = compare(maxEarnings, "0") > 0 ? minAmount(settings.bonusAmountNgn, remainingCap) : settings.bonusAmountNgn;
+    const wallet = this.ensureWallet(referral.referrerUserId, "NGN");
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = add(wallet.availableBalance, rewardAmount);
+    wallet.updatedAt = this.clock();
+    this.clearUserPnlLots(referral.referrerUserId);
+
+    const transaction = {
+      id: this.idGenerator(12),
+      userId: referral.referrerUserId,
+      type: "REFERRAL_BONUS",
+      currency: "NGN",
+      amount: rewardAmount,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      reference: referral.rewardReference,
+      status: "SUCCESSFUL",
+      description: "Referral Bonus",
+      createdBy: "system",
+      createdAt: this.clock(),
+      metadata: {
+        type: "referral_bonus",
+        referralId: referral.id,
+        referredUserId: referral.referredUserId,
+        bonusAmountSnapshot: rewardAmount,
+        uniqueReference: referral.rewardReference,
+        displayAmounts: this.getDisplayAmounts(rewardAmount, "NGN"),
+      },
+    };
+    this.db.transactions.unshift(transaction);
+    referral.rewardAmount = rewardAmount;
+    referral.rewardAmountSnapshot = rewardAmount;
+    referral.rewardedAt = transaction.createdAt;
+    referral.rewardTransactionId = transaction.id;
+    referral.status = "rewarded";
+    referral.updatedAt = this.clock();
+    this.createNotification({
+      userId: referral.referrerUserId,
+      type: "REFERRAL",
+      title: "Referral Bonus",
+      message: `${rewardAmount} NGN has been added to your wallet.`,
+      entityType: "Referral",
+      entityId: referral.id,
+      route: "/?tab=referral",
+      dedupeKey: referral.rewardReference,
+    });
+    this.audit({ id: "system", role: "system" }, "REFERRAL_REWARD_PAID", "Referral", referral.id, {
+      amount: rewardAmount,
+      currency: "NGN",
+    }, requestMeta);
+    return true;
+  }
+
+  evaluateReferralQualification(referredUserId, requestMeta = {}) {
+    this.ensureState();
+    const referral = this.db.referrals.find((item) => item.referredUserId === referredUserId);
+    if (!referral) {
+      return null;
+    }
+    if (referral.rewardedAt) {
+      return clone(referral);
+    }
+    const settings = this.db.systemSettings.referral;
+    const depositTotal = this.getReferralDepositTotalNgn(referredUserId);
+    const spendTotal = this.getReferralSpendTotalNgn(referredUserId);
+    const tradeCount = this.getReferralTradeCount(referredUserId);
+    const depositQualified = compare(depositTotal, settings.minimumDepositNgn) >= 0;
+    const spendQualified = compare(spendTotal, settings.minimumSpendNgn) >= 0;
+    const tradeQualified = tradeCount >= Number(settings.minimumTrades || 0);
+    const activityQualified = spendQualified || tradeQualified;
+    const fullyQualified = depositQualified && activityQualified;
+
+    referral.depositQualified = depositQualified;
+    referral.spendQualified = spendQualified;
+    referral.tradeQualified = tradeQualified;
+    referral.qualifiedDepositAmount = depositTotal;
+    referral.qualifiedSpendAmount = spendTotal;
+    referral.qualifiedTradeCount = tradeCount;
+    referral.depositQualifiedAt = depositQualified ? referral.depositQualifiedAt || this.clock() : null;
+    referral.activityQualifiedAt = activityQualified ? referral.activityQualifiedAt || this.clock() : null;
+    referral.qualifiedAt = fullyQualified ? referral.qualifiedAt || this.clock() : null;
+    referral.status = referral.rewardedAt
+      ? "rewarded"
+      : fullyQualified
+        ? "qualified"
+        : (depositQualified || activityQualified ? "in_progress" : "registered");
+    referral.updatedAt = this.clock();
+
+    if (fullyQualified) {
+      this.issueReferralReward(referral, settings, requestMeta);
+    }
+    this.persist();
+    return clone(referral);
+  }
+
+  getReferralStatsForUser(userId) {
+    const referrals = this.db.referrals.filter((referral) => referral.referrerUserId === userId);
+    return {
+      totalReferrals: referrals.length,
+      qualifiedReferrals: referrals.filter((referral) => referral.qualifiedAt).length,
+      pendingReferrals: referrals.filter((referral) => !referral.qualifiedAt).length,
+      rewardedReferrals: referrals.filter((referral) => referral.rewardedAt).length,
+      totalReferralEarnings: referrals.reduce((sum, referral) => add(sum, referral.rewardedAt ? referral.rewardAmount || "0" : "0"), "0"),
+    };
+  }
+
+  getReferralProfile(user) {
+    this.ensureState();
+    const code = this.ensureReferralCode(user);
+    const settings = this.getReferralSettings();
+    const referrals = this.db.referrals
+      .filter((referral) => referral.referrerUserId === user.id)
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      .map((referral) => this.serializeReferral(referral));
+    return {
+      settings,
+      referralCode: code,
+      referralPath: `/signup?ref=${encodeURIComponent(code)}`,
+      stats: this.getReferralStatsForUser(user.id),
+      referrals,
+    };
+  }
+
+  getAdminReferralSummary({ limit = 50, offset = 0 } = {}) {
+    this.ensureState();
+    const referrals = this.db.referrals
+      .slice()
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+    const totalPayout = referrals.reduce((sum, referral) => add(sum, referral.rewardedAt ? referral.rewardAmount || "0" : "0"), "0");
+    return {
+      settings: this.getReferralSettings(),
+      stats: {
+        totalReferrals: referrals.length,
+        qualifiedReferrals: referrals.filter((referral) => referral.qualifiedAt).length,
+        pendingReferrals: referrals.filter((referral) => !referral.qualifiedAt).length,
+        rewardsPaid: referrals.filter((referral) => referral.rewardedAt).length,
+        totalReferralPayout: totalPayout,
+      },
+      total: referrals.length,
+      limit,
+      offset,
+      referrals: referrals.slice(offset, offset + limit).map((referral) => this.serializeReferral(referral, { admin: true })),
+    };
   }
 
   sanitizeVtuSettings(settings = this.db.systemSettings?.vtu || {}) {
@@ -589,6 +999,10 @@ class FinancialService {
         ...before.trading,
         ...(patch.trading || {}),
       },
+      referral: {
+        ...before.referral,
+        ...(patch.referral || {}),
+      },
     };
 
     if (patch.exchangeRate?.usdtToNgn !== undefined) {
@@ -612,6 +1026,11 @@ class FinancialService {
     next.withdrawal.usdtFee = normalizeNonNegativeAmount(next.withdrawal.usdtFee || "0", "USDT withdrawal fee");
     next.withdrawal.ngnFee = normalizeNonNegativeAmount(next.withdrawal.ngnFee || DEFAULT_NGN_WITHDRAWAL_FEE, "NGN withdrawal fee");
     next.trading.minJoinUsdt = normalizeAmount(next.trading.minJoinUsdt || DEFAULT_MIN_TRADE_JOIN_USDT, "Minimum trade join amount");
+    next.referral = this.normalizeReferralSettings({
+      ...next.referral,
+      updatedBy: patch.referral ? admin.id : next.referral.updatedBy,
+      updatedAt: patch.referral ? this.clock() : next.referral.updatedAt,
+    });
     next.withdrawal.maxDailyCount = 0;
     next.withdrawal.maxDailyNgn = normalizeAmount(next.withdrawal.maxDailyNgn || "10000000", "Daily withdrawal limit");
     this.db.systemSettings = next;
@@ -3468,8 +3887,10 @@ class FinancialService {
         exchangeRate: clone(this.db.systemSettings.exchangeRate),
         telegram: clone(this.db.systemSettings.telegram),
         trading: clone(this.db.systemSettings.trading),
+        referral: clone(this.db.systemSettings.referral),
         vtu: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
       },
+      referral: this.getAdminReferralSummary({ limit: 5 }),
       vtu: this.getVtuAdminSummary(),
       todayPnl: this.getTodayPnl(),
       totalPnl: this.db.transactions

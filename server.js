@@ -4980,6 +4980,9 @@ async function handleApi(req, res, url) {
         { id: "vtu_ng", role: "system" },
         getRequestMeta(req)
       );
+      if (status === "successful") {
+        financialService.evaluateReferralQualification(transaction.userId, getRequestMeta(req));
+      }
       financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
       sendJson(res, 200, { received: true, transaction });
     } catch (error) {
@@ -5004,6 +5007,64 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { user: user ? sanitizeUser(user) : null, exchanges: listExchanges() });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/referrals/settings") {
+    sendJson(res, 200, { settings: financialService.getReferralSettings() });
+    return true;
+  }
+
+  if (req.method === "GET" && (url.pathname === "/api/referrals/me" || url.pathname === "/api/referrals/me/stats" || url.pathname === "/api/referrals/me/list")) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    const profile = financialService.getReferralProfile(user);
+    if (url.pathname === "/api/referrals/me/stats") {
+      sendJson(res, 200, { stats: profile.stats, settings: profile.settings, referralCode: profile.referralCode, referralPath: profile.referralPath });
+      return true;
+    }
+    if (url.pathname === "/api/referrals/me/list") {
+      sendJson(res, 200, { referrals: profile.referrals, settings: profile.settings });
+      return true;
+    }
+    sendJson(res, 200, profile);
+    return true;
+  }
+
+  if (req.method === "GET" && (url.pathname === "/api/admin/referrals" || url.pathname === "/api/admin/referrals/stats" || url.pathname === "/api/admin/referrals/settings")) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+    const summary = financialService.getAdminReferralSummary({ limit, offset });
+    if (url.pathname === "/api/admin/referrals/stats") {
+      sendJson(res, 200, { stats: summary.stats, settings: summary.settings });
+      return true;
+    }
+    if (url.pathname === "/api/admin/referrals/settings") {
+      sendJson(res, 200, { settings: summary.settings });
+      return true;
+    }
+    sendJson(res, 200, summary);
+    return true;
+  }
+
+  if (req.method === "PATCH" && url.pathname === "/api/admin/referrals/settings") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const settings = financialService.updateSettings(admin, { referral: await readBody(req) }, getRequestMeta(req));
+      scheduleSettingsUsersBroadcast("referral_settings_updated");
+      sendJson(res, 200, { settings: settings.referral });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
@@ -5059,6 +5120,7 @@ async function handleApi(req, res, url) {
     }
 
     const { salt, hash } = hashPassword(password);
+    const referralCode = String(body.referralCode || body.referral || body.ref || "").trim();
     const user = {
       id: randomId(12),
       email,
@@ -5076,6 +5138,7 @@ async function handleApi(req, res, url) {
     };
     db.users.push(user);
     financialService.ensureState();
+    financialService.registerReferralForSignup(user, referralCode, getRequestMeta(req));
     financialService.audit(user, "USER_REGISTERED", "User", user.id, {}, getRequestMeta(req));
     const remember = parseBooleanFlag(body.remember, false);
     const session = createSession(user.id, { remember });
@@ -5482,6 +5545,9 @@ async function handleApi(req, res, url) {
         });
         const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
         const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, user, getRequestMeta(req));
+        if (status === "successful") {
+          financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
+        }
         const responsePayload = { transaction: settled };
         financialService.saveIdempotent("vtu-airtime", user.id, idempotencyKey, responsePayload);
         sendJson(res, status === "processing" ? 202 : 201, responsePayload);
@@ -5556,6 +5622,9 @@ async function handleApi(req, res, url) {
         });
         const status = mapProviderStatus(extractProviderData(providerResponse).status, providerResponse.code);
         const settled = financialService.applyVtuProviderResult(transaction.requestId, { ...providerResponse, mappedStatus: status }, user, getRequestMeta(req));
+        if (status === "successful") {
+          financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
+        }
         const responsePayload = { transaction: settled };
         financialService.saveIdempotent("vtu-data", user.id, idempotencyKey, responsePayload);
         sendJson(res, status === "processing" ? 202 : 201, responsePayload);
@@ -5886,6 +5955,7 @@ async function handleApi(req, res, url) {
         await readBody(req),
         getRequestMeta(req)
       );
+      financialService.evaluateReferralQualification(deposit.userId, getRequestMeta(req));
       await sendDepositSuccessChannelAlert(deposit);
       const targetUser = db.users.find((item) => item.id === deposit.userId && item.role === "user");
       const financeSummary = targetUser ? await buildUserTradeInvestmentSummary(targetUser) : null;
@@ -7704,6 +7774,7 @@ async function handleApi(req, res, url) {
         category: "tradingSignals",
         route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
       });
+      financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
       persist();
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
     } catch (error) {

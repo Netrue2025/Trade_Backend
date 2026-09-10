@@ -17,6 +17,7 @@ const CATEGORY_BY_TYPE = {
   DEPOSIT: "transactions",
   WITHDRAWAL: "transactions",
   BONUS: "transactions",
+  REFERRAL: "transactions",
   TRANSFER: "transactions",
   BALANCE: "transactions",
   QUEST: "quest",
@@ -37,6 +38,7 @@ const ALLOWED_ROUTE_PREFIXES = [
   "/?tab=wallet",
   "/?tab=history",
   "/?tab=signals",
+  "/?tab=referral",
   "/?tab=quest",
   "/?tab=settings",
   "/?tab=services",
@@ -93,10 +95,13 @@ function inferRoute(notification = {}) {
   if (type === "VTU") {
     return "/?tab=services";
   }
+  if (type === "REFERRAL") {
+    return "/?tab=referral";
+  }
   if (type === "MESSAGE" || entityType === "CHATMESSAGE") {
     return "/?tab=home";
   }
-  if (["DEPOSIT", "WITHDRAWAL", "TRANSFER", "BONUS", "BALANCE"].includes(type)) {
+  if (["DEPOSIT", "WITHDRAWAL", "TRANSFER", "BONUS", "REFERRAL", "BALANCE"].includes(type)) {
     return "/?tab=history";
   }
   return "/?tab=home";

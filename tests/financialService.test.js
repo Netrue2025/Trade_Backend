@@ -582,6 +582,173 @@ test("admin bonus credits user wallet and creates notification", () => {
   assert.equal(service.listNotifications(user)[0].type, "BONUS");
 });
 
+test("referral code generation preserves existing users and balances", () => {
+  const { db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "2500");
+  const userCountBefore = db.users.length;
+  const balanceBefore = service.ensureWallet(user.id, "NGN").availableBalance;
+
+  const profile = service.getReferralProfile(user);
+
+  assert.match(profile.referralCode, /^NTR-[A-Z0-9]+$/);
+  assert.equal(db.users.length, userCountBefore);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, balanceBefore);
+});
+
+test("valid referral signup records relationship without paying bonus", () => {
+  const { db, service, user } = createHarness();
+  const referrer = {
+    id: "referrer-1",
+    name: "Referrer",
+    email: "referrer@example.com",
+    role: "user",
+  };
+  db.users.push(referrer);
+  service.ensureState();
+
+  const referral = service.registerReferralForSignup(user, referrer.referralCode);
+
+  assert.equal(referral.referrerUserId, referrer.id);
+  assert.equal(referral.referredUserId, user.id);
+  assert.equal(referral.status, "registered");
+  assert.equal(service.ensureWallet(referrer.id, "NGN").availableBalance, "0");
+  assert.equal(service.db.transactions.some((item) => item.type === "REFERRAL_BONUS"), false);
+});
+
+test("invalid and self referral codes do not block normal accounts", () => {
+  const { service, user } = createHarness();
+
+  assert.equal(service.registerReferralForSignup(user, "NTR-NOTREAL"), null);
+  assert.equal(service.registerReferralForSignup(user, user.referralCode), null);
+  assert.equal(service.db.referrals.length, 0);
+});
+
+test("referral pays once after deposit and successful VTU spend qualify", () => {
+  const { admin, db, service, user } = createHarness();
+  const referrer = {
+    id: "referrer-1",
+    name: "Referrer",
+    email: "referrer@example.com",
+    role: "user",
+  };
+  db.users.push(referrer);
+  service.ensureState();
+  service.registerReferralForSignup(user, referrer.referralCode);
+
+  const firstDeposit = service.createDeposit(user, { amount: "1999", currency: "NGN", depositorName: "Ada User" });
+  service.approveDeposit(admin, firstDeposit.id);
+  service.evaluateReferralQualification(user.id);
+  assert.equal(service.db.referrals[0].depositQualified, false);
+  assert.equal(service.ensureWallet(referrer.id, "NGN").availableBalance, "0");
+
+  const secondDeposit = service.createDeposit(user, { amount: "1000", currency: "NGN", depositorName: "Ada User" });
+  service.approveDeposit(admin, secondDeposit.id);
+  service.evaluateReferralQualification(user.id);
+  assert.equal(service.db.referrals[0].depositQualified, true);
+  assert.equal(service.ensureWallet(referrer.id, "NGN").availableBalance, "0");
+
+  const failed = service.createVtuTransaction(user, {
+    productType: "airtime",
+    requestId: "airtime-failed",
+    phone: "08030000000",
+    network: "mtn",
+    faceValue: "2000",
+    providerCost: "2000",
+    amountCharged: "2000",
+  });
+  service.applyVtuProviderResult(failed.requestId, { mappedStatus: "failed", data: { status: "failed" } });
+  service.evaluateReferralQualification(user.id);
+  assert.equal(service.db.referrals[0].spendQualified, false);
+
+  setWallet(service, user.id, "NGN", "2500");
+  const successful = service.createVtuTransaction(user, {
+    productType: "data",
+    requestId: "data-success",
+    phone: "08030000000",
+    network: "mtn",
+    planName: "2GB",
+    faceValue: "2000",
+    providerCost: "2000",
+    amountCharged: "2000",
+  });
+  service.applyVtuProviderResult(successful.requestId, { mappedStatus: "successful", data: { status: "successful" } });
+  service.evaluateReferralQualification(user.id);
+  service.evaluateReferralQualification(user.id);
+
+  const rewards = service.db.transactions.filter((item) => item.type === "REFERRAL_BONUS");
+  assert.equal(rewards.length, 1);
+  assert.equal(rewards[0].amount, "500");
+  assert.equal(rewards[0].status, "SUCCESSFUL");
+  assert.equal(service.ensureWallet(referrer.id, "NGN").availableBalance, "500");
+  assert.equal(service.db.referrals[0].status, "rewarded");
+});
+
+test("referral can qualify through two active joined trades", () => {
+  const { admin, db, service, user } = createHarness();
+  const referrer = {
+    id: "referrer-1",
+    name: "Referrer",
+    email: "referrer@example.com",
+    role: "user",
+  };
+  db.users.push(referrer);
+  service.ensureState();
+  service.registerReferralForSignup(user, referrer.referralCode);
+  const deposit = service.createDeposit(user, { amount: "2000", currency: "NGN", depositorName: "Ada User" });
+  service.approveDeposit(admin, deposit.id);
+  service.db.tradeInvestments.push(
+    { id: "trade-investment-1", userId: user.id, tradeId: "trade-1", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" },
+    { id: "trade-investment-2", userId: user.id, tradeId: "trade-2", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" },
+    { id: "trade-investment-3", userId: user.id, tradeId: "trade-3", amountUsdt: "1", status: "STOPPED", joinedAt: "2026-08-30T10:00:00.000Z" }
+  );
+
+  const referral = service.evaluateReferralQualification(user.id);
+
+  assert.equal(referral.tradeQualified, true);
+  assert.equal(referral.qualifiedTradeCount, 2);
+  assert.equal(service.ensureWallet(referrer.id, "NGN").availableBalance, "500");
+});
+
+test("admin referral bonus changes affect future rewards only", () => {
+  const { admin, db, service, user } = createHarness();
+  const referrer = {
+    id: "referrer-1",
+    name: "Referrer",
+    email: "referrer@example.com",
+    role: "user",
+  };
+  const nextUser = {
+    id: "user-2",
+    name: "Bola User",
+    email: "bola@example.com",
+    role: "user",
+  };
+  db.users.push(referrer, nextUser);
+  service.ensureState();
+  service.registerReferralForSignup(user, referrer.referralCode);
+  const oldDeposit = service.createDeposit(user, { amount: "2000", currency: "NGN", depositorName: "Ada User" });
+  service.approveDeposit(admin, oldDeposit.id);
+  service.db.tradeInvestments.push(
+    { id: "trade-investment-1", userId: user.id, tradeId: "trade-1", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" },
+    { id: "trade-investment-2", userId: user.id, tradeId: "trade-2", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" }
+  );
+  service.evaluateReferralQualification(user.id);
+
+  service.updateSettings(admin, { referral: { bonusAmountNgn: "700" } });
+  service.registerReferralForSignup(nextUser, referrer.referralCode);
+  const newDeposit = service.createDeposit(nextUser, { amount: "2000", currency: "NGN", depositorName: "Bola User" });
+  service.approveDeposit(admin, newDeposit.id);
+  service.db.tradeInvestments.push(
+    { id: "trade-investment-3", userId: nextUser.id, tradeId: "trade-3", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" },
+    { id: "trade-investment-4", userId: nextUser.id, tradeId: "trade-4", amountUsdt: "1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" }
+  );
+  service.evaluateReferralQualification(nextUser.id);
+
+  const rewards = service.db.transactions.filter((item) => item.type === "REFERRAL_BONUS");
+  assert.deepEqual(rewards.map((item) => item.amount).sort(), ["500", "700"]);
+  assert.equal(service.db.referrals.find((item) => item.referredUserId === user.id).rewardAmountSnapshot, "500");
+});
+
 test("admin can generate and track Netrue gift cards", () => {
   const { admin, service } = createHarness();
 
