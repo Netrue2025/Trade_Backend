@@ -8194,19 +8194,6 @@ async function startServer() {
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));
-  await tradeLearningService.init();
-  await signalEngine.setTimeframe(db.meta?.signalTimeframe, { scan: false }).catch(async () => {
-    await signalEngine.setTimeframe("15m", { scan: false });
-  });
-  await signalEngine.hydrateSignals(db.signals || []);
-  await sweepExpiredSignals();
-  db.meta = {
-    ...(db.meta || {}),
-    signalTimeframe: signalEngine.getTimeframe(),
-    signalAutoTrade: autoTradeService.getConfig(),
-  };
-  await saveDb(db);
-  await syncTradeLearningHistory();
 
   const listeningPort = await listenOnAvailablePort(server, port);
   const storageMode = shouldUseMongo() ? "MongoDB" : "local JSON file";
@@ -8218,8 +8205,8 @@ async function startServer() {
   console.log(`Trade MVP running on http://localhost:${listeningPort} using ${storageMode} storage`);
   console.log(`Telegram signal bot diagnostics: ${JSON.stringify(getSignalBotDiagnostics())}`);
 
+  void runPostListenStartupTasks();
   void ensureTradeListenerRunning(true);
-  void ensureSignalEngineRunning(true, { awaitInitialScan: false });
   void startTradeReconciliation(true);
   setInterval(() => {
     void startTradeReconciliation();
@@ -8230,6 +8217,46 @@ async function startServer() {
   setInterval(() => {
     void sweepExpiredSignals();
   }, SIGNAL_EXPIRY_SWEEP_MS);
+}
+
+async function runPostListenStartupTasks() {
+  try {
+    await tradeLearningService.init();
+  } catch (error) {
+    console.error("Failed to initialize trade learning service:", error.message || error);
+  }
+
+  try {
+    await signalEngine.setTimeframe(db.meta?.signalTimeframe, { scan: false }).catch(async () => {
+      await signalEngine.setTimeframe("15m", { scan: false });
+    });
+    await signalEngine.hydrateSignals(db.signals || []);
+    await sweepExpiredSignals();
+    db.meta = {
+      ...(db.meta || {}),
+      signalTimeframe: signalEngine.getTimeframe(),
+      signalAutoTrade: autoTradeService.getConfig(),
+    };
+  } catch (error) {
+    console.error("Failed to initialize signal engine state:", error.message || error);
+  }
+
+  await runStartupPersistenceTasks();
+  void ensureSignalEngineRunning(true, { awaitInitialScan: false });
+}
+
+async function runStartupPersistenceTasks() {
+  try {
+    await saveDb(db);
+  } catch (error) {
+    console.error("Failed to persist startup application state:", error.message || error);
+  }
+
+  try {
+    await syncTradeLearningHistory();
+  } catch (error) {
+    console.error("Failed to sync startup trade learning history:", error.message || error);
+  }
 }
 
 function listenOnce(targetServer, targetPort) {
