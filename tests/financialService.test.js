@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
-function createHarness() {
+function createHarness(options = {}) {
   let id = 0;
   const db = {
     users: [
@@ -28,6 +28,7 @@ function createHarness() {
     persist: () => undefined,
     idGenerator: () => `id-${++id}`,
     clock: () => "2026-08-30T10:00:00.000Z",
+    notificationPublisher: options.notificationPublisher || null,
   });
   service.ensureState();
   return {
@@ -1257,6 +1258,27 @@ test("user support message creates admin notification", () => {
   assert.match(service.listNotifications(admin)[0].message, /withdrawal/);
 });
 
+test("user support message publishes message push notification", async () => {
+  const published = [];
+  const { admin, service, user } = createHarness({
+    notificationPublisher: (notification) => {
+      published.push(notification);
+    },
+  });
+
+  const notifications = service.sendSupportMessage(user, {
+    message: "Please check my withdrawal.",
+  });
+  await Promise.resolve();
+
+  assert.equal(notifications[0].category, "messages");
+  assert.equal(published.length, 1);
+  assert.equal(published[0].userId, admin.id);
+  assert.equal(published[0].type, "MESSAGE");
+  assert.equal(published[0].category, "messages");
+  assert.equal(published[0].entityType, "ChatMessage");
+});
+
 test("admin reply creates a temporary user chat message", () => {
   const { admin, service, user } = createHarness();
 
@@ -1270,6 +1292,27 @@ test("admin reply creates a temporary user chat message", () => {
   assert.equal(result.message.conversationUserId, user.id);
   assert.equal(result.message.senderRole, "admin");
   assert.equal(service.db.chatMessages.length, 1);
+});
+
+test("admin reply publishes message push notification", async () => {
+  const published = [];
+  const { admin, service, user } = createHarness({
+    notificationPublisher: (notification) => {
+      published.push(notification);
+    },
+  });
+
+  const result = service.sendAdminMessage(admin, user.id, {
+    message: "Your withdrawal has been reviewed.",
+  });
+  await Promise.resolve();
+
+  assert.equal(result.notification.category, "messages");
+  assert.equal(published.length, 1);
+  assert.equal(published[0].userId, user.id);
+  assert.equal(published[0].type, "MESSAGE");
+  assert.equal(published[0].category, "messages");
+  assert.equal(published[0].entityId, result.message.id);
 });
 
 test("chat notifications expire after 24 hours", () => {

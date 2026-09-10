@@ -2361,10 +2361,13 @@ class FinancialService {
     const notification = this.createNotification({
       userId: targetUser.id,
       type: "MESSAGE",
+      category: "messages",
       title: String(input.title || "Admin message").trim(),
       message,
       entityType: "ChatMessage",
       entityId: chatMessage.id,
+      route: "/?tab=home",
+      dedupeKey: `message:${chatMessage.id}`,
       metadata: {
         chatMessageId: chatMessage.id,
         conversationUserId: targetUser.id,
@@ -2407,10 +2410,13 @@ class FinancialService {
       notifications.push(this.createNotification({
         userId: admin.id,
         type: "MESSAGE",
+        category: "messages",
         title,
         message: `${user.name || user.email || "User"}: ${message}`,
         entityType: "ChatMessage",
         entityId: chatMessage.id,
+        route: "/?tab=home",
+        dedupeKey: `message:${chatMessage.id}`,
         metadata: {
           chatMessageId: chatMessage.id,
           conversationUserId: user.id,

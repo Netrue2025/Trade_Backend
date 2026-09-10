@@ -5,6 +5,7 @@ const { randomId } = require("../lib/security");
 
 const DEFAULT_PREFERENCES = {
   transactions: true,
+  messages: true,
   quest: true,
   lowBalance: true,
   vtuPurchases: true,
@@ -26,7 +27,7 @@ const CATEGORY_BY_TYPE = {
   TRADE: "tradingSignals",
   LOW_BALANCE: "lowBalance",
   APP_UPDATE: "appUpdates",
-  MESSAGE: "transactions",
+  MESSAGE: "messages",
   INFO: "appUpdates",
 };
 
@@ -91,6 +92,9 @@ function inferRoute(notification = {}) {
   }
   if (type === "VTU") {
     return "/?tab=services";
+  }
+  if (type === "MESSAGE" || entityType === "CHATMESSAGE") {
+    return "/?tab=home";
   }
   if (["DEPOSIT", "WITHDRAWAL", "TRANSFER", "BONUS", "BALANCE"].includes(type)) {
     return "/?tab=history";
