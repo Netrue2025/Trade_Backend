@@ -2,7 +2,44 @@ const { add, compare, multiplyRatio, subtract } = require("../lib/money");
 const { decryptSetting, encryptSetting } = require("../lib/settingsCrypto");
 
 const PRODUCT_CACHE_TTL_MS = 1000 * 60 * 15;
-const DELIVERY_KEYS = ["delivery", "credentials", "codes", "pin", "pins", "account", "accounts", "license", "licenses", "serial", "serials"];
+const DELIVERY_KEYS = [
+  "delivery",
+  "credentials",
+  "codes",
+  "pin",
+  "pins",
+  "account",
+  "accounts",
+  "license",
+  "licenses",
+  "serial",
+  "serials",
+  "link",
+  "url",
+  "activation_link",
+  "activationLink",
+  "activation_url",
+  "activationUrl",
+  "invite_link",
+  "inviteLink",
+  "invite_url",
+  "inviteUrl",
+  "order_link",
+  "orderLink",
+  "plan_link",
+  "planLink",
+  "redeem_link",
+  "redeemLink",
+  "download_link",
+  "downloadLink",
+  "gemini_link",
+  "geminiLink",
+  "access_link",
+  "accessLink",
+  "message",
+  "note",
+  "details",
+];
 const SUCCESS_STATUSES = new Set(["success", "successful", "completed", "complete", "delivered", "fulfilled", "paid"]);
 const FAILURE_STATUSES = new Set(["failed", "failure", "cancelled", "canceled", "refunded", "rejected"]);
 const PROCESSING_STATUSES = new Set(["pending", "processing", "queued", "created", "submitted", "in_progress"]);
@@ -13,6 +50,44 @@ function clone(value) {
 
 function normalizeText(value, fallback = "") {
   return String(value ?? fallback).replace(/\s+/g, " ").trim();
+}
+
+function isHttpUrl(value = "") {
+  try {
+    const url = new URL(String(value || "").trim());
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function findHttpUrl(value) {
+  if (typeof value === "string") {
+    const direct = value.trim();
+    if (isHttpUrl(direct)) {
+      return direct;
+    }
+    const match = direct.match(/https?:\/\/[^\s"'<>]+/i);
+    return match ? match[0] : "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const url = findHttpUrl(item);
+      if (url) {
+        return url;
+      }
+    }
+    return "";
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      const url = findHttpUrl(item);
+      if (url) {
+        return url;
+      }
+    }
+  }
+  return "";
 }
 
 function firstValue(object = {}, keys = []) {
@@ -191,6 +266,9 @@ function mapSupplierStatus(payload = {}) {
   if (FAILURE_STATUSES.has(status)) {
     return status === "refunded" ? "refunded" : "failed";
   }
+  if (extractDeliveryPayload(payload)) {
+    return "delivered";
+  }
   if (PROCESSING_STATUSES.has(status)) {
     return "processing";
   }
@@ -203,12 +281,23 @@ function extractSupplierOrderId(payload = {}) {
 }
 
 function extractDeliveryPayload(payload = {}) {
-  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const source = extractSupplierRecord(payload);
   const delivery = {};
   for (const key of DELIVERY_KEYS) {
     if (source[key] !== undefined && source[key] !== null && source[key] !== "") {
-      delivery[key] = source[key];
+      if (["message", "note", "details"].includes(key) && !findHttpUrl(source[key])) {
+        continue;
+      }
+      if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key])) {
+        Object.assign(delivery, source[key]);
+      } else {
+        delivery[key] = source[key];
+      }
     }
+  }
+  const activationLink = findHttpUrl(delivery);
+  if (activationLink && !delivery.activationLink) {
+    delivery.activationLink = activationLink;
   }
   return Object.keys(delivery).length ? delivery : null;
 }
@@ -375,6 +464,7 @@ class DigitalServicesService {
 module.exports = {
   DigitalServicesService,
   PRODUCT_CACHE_TTL_MS,
+  extractDeliveryPayload,
   extractSupplierRows,
   mapSupplierStatus,
 };
