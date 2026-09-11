@@ -427,7 +427,9 @@ class DigitalServicesService {
   }
 
   async requeryOrder(actor, orderId, requestMeta = {}) {
-    const order = this.financialService.getDigitalServiceOrder(actor, orderId);
+    const order = this.financialService.getDigitalServiceOrderRecord
+      ? this.financialService.getDigitalServiceOrderRecord(actor, orderId)
+      : this.financialService.getDigitalServiceOrder(actor, orderId);
     if (!order.supplierOrderId) {
       throw new Error("This order does not have a supplier order ID yet.");
     }

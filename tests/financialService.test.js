@@ -1921,6 +1921,73 @@ test("digital service purchase treats supplier activation link as delivered", as
     assert.equal(order.delivery.activationLink, "https://gemini.google.com/activate/example-plan");
     assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
     assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+    assert.equal(service.listNotifications(admin).some((item) => item.title === "Store order completed" && item.entityId === order.id), true);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("user can requery pending digital service order with supplier link", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, {
+      digitalServices: {
+        enabled: true,
+        globalMarkupPercent: "0",
+      },
+    });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "92",
+        supplierProductId: "92",
+        provider: "akunding",
+        name: "Gemini Pro",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "3000",
+        stock: 5,
+        available: true,
+      },
+    ]);
+    const product = service.getDigitalServiceProduct("92", { admin: true });
+    const pending = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    service.applyDigitalServiceOrderResult(pending.id, {
+      status: "processing",
+      supplierStatus: "pending",
+      supplierOrderId: "AK-STRING-92",
+    }, user);
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        getOrder: async (orderId) => {
+          assert.equal(orderId, "AK-STRING-92");
+          return {
+            data: {
+              id: "AK-STRING-92",
+              status: "pending",
+              link: "https://gemini.google.com/activate/requery-plan",
+            },
+          };
+        },
+      },
+    });
+
+    const delivered = await digitalServices.requeryOrder(user, pending.id);
+
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.delivery.activationLink, "https://gemini.google.com/activate/requery-plan");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
   } finally {
     if (previousKey === undefined) {
       delete process.env.SETTINGS_ENCRYPTION_KEY;

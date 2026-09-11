@@ -5728,6 +5728,21 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const digitalOrderRequeryMatch = url.pathname.match(/^\/api\/digital-services\/orders\/([^/]+)\/requery$/);
+  if (req.method === "POST" && digitalOrderRequeryMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const order = await digitalServicesService.requeryOrder(user, decodeURIComponent(digitalOrderRequeryMatch[1] || ""), getRequestMeta(req));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/digital-services/orders") {
     const user = requireAuth(req, res, "user");
     if (!user) {

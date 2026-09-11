@@ -4681,13 +4681,18 @@ class FinancialService {
       .map((order) => this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" }));
   }
 
-  getDigitalServiceOrder(user, orderId) {
+  getDigitalServiceOrderRecord(user, orderId) {
     this.ensureState();
     const id = String(orderId || "").trim();
     const order = this.db.digitalServiceOrders.find((item) => item.id === id || item.requestId === id || item.supplierOrderId === id);
     if (!order || (user.role !== "admin" && order.userId !== user.id)) {
       throw new Error("Digital service order not found.");
     }
+    return order;
+  }
+
+  getDigitalServiceOrder(user, orderId) {
+    const order = this.getDigitalServiceOrderRecord(user, orderId);
     return this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" });
   }
 
@@ -4831,6 +4836,22 @@ class FinancialService {
         entityType: "DIGITAL_SERVICE",
         entityId: order.id,
         route: "/?tab=store",
+      });
+      const user = this.db.users.find((item) => item.id === order.userId);
+      this.notifyAdmins({
+        type: "DIGITAL_SERVICE",
+        title: "Store order completed",
+        message: `${user?.name || user?.email || "A user"} completed ${order.productName}.`,
+        entityType: "DIGITAL_SERVICE",
+        entityId: order.id,
+        route: "/?tab=store",
+        dedupeKey: `digital-service-admin-completed:${order.id}`,
+        metadata: {
+          category: "transactions",
+          orderId: order.id,
+          requestId: order.requestId,
+          userId: order.userId,
+        },
       });
     } else if (nextStatus === "failed" || nextStatus === "refunded") {
       if (order.balanceReserved) {

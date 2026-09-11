@@ -182,10 +182,10 @@ class AkundingService {
     if (method === "GET" && path === "/v1/orders") {
       return [];
     }
-    const orderMatch = path.match(/^\/v1\/orders\/(\d+)$/);
+    const orderMatch = path.match(/^\/v1\/orders\/([^/]+)$/);
     if (method === "GET" && orderMatch) {
       return {
-        id: Number(orderMatch[1]),
+        id: decodeURIComponent(orderMatch[1]),
         status: "delivered",
         delivery: { note: "Mock order delivered." },
         updated_at: this.clock(),
@@ -230,11 +230,11 @@ class AkundingService {
   }
 
   getOrder(orderId) {
-    return this.request(`/v1/orders/${encodeURIComponent(Number(orderId))}`);
+    return this.request(`/v1/orders/${encodeURIComponent(String(orderId || "").trim())}`);
   }
 
   exportOrder(orderId, format = "txt") {
-    return this.request(`/v1/orders/${encodeURIComponent(Number(orderId))}/export`, {
+    return this.request(`/v1/orders/${encodeURIComponent(String(orderId || "").trim())}/export`, {
       query: { format },
     });
   }
