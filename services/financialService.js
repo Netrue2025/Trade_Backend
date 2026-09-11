@@ -4396,6 +4396,132 @@ class FinancialService {
     return this.db.systemSettings.digitalServices.productOverrides?.[id] || {};
   }
 
+  normalizeRecoveredDigitalServiceStatus(order = {}, transaction = {}) {
+    const status = String(order.status || transaction.status || "").trim().toLowerCase();
+    if (["delivered", "successful", "success", "completed", "complete"].includes(status)) {
+      return "delivered";
+    }
+    if (["failed", "failure"].includes(status)) {
+      return "failed";
+    }
+    if (["refunded"].includes(status)) {
+      return "refunded";
+    }
+    return "processing";
+  }
+
+  findCachedDigitalServiceOrder(userId, requestId) {
+    const record = this.db.idempotencyKeys.find((item) =>
+      item.scope === "digital-service:order" &&
+      item.userId === userId &&
+      item.response?.order &&
+      item.response.order.requestId === requestId
+    );
+    return record?.response?.order || null;
+  }
+
+  findDigitalServiceProviderAudit(requestId) {
+    return this.db.auditLogs.find((item) =>
+      item.action === "DIGITAL_SERVICE_PROVIDER_RESULT_APPLIED" &&
+      item.metadata?.requestId === requestId
+    ) || null;
+  }
+
+  recoverMissingDigitalServiceOrdersFromHistory(actor = { id: "system", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const existingReferences = new Set(this.db.digitalServiceOrders.map((order) => String(order.requestId || "").trim()).filter(Boolean));
+    const existingIds = new Set(this.db.digitalServiceOrders.map((order) => String(order.id || "").trim()).filter(Boolean));
+    const recovered = [];
+    const userScope = actor?.role === "user" ? actor.id : "";
+    const digitalTransactions = this.db.transactions
+      .filter((transaction) =>
+        transaction.type === "DIGITAL_SERVICE" &&
+        transaction.userId &&
+        transaction.reference &&
+        (!userScope || transaction.userId === userScope)
+      )
+      .sort((a, b) => Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0));
+
+    for (const transaction of digitalTransactions) {
+      const requestId = String(transaction.reference || "").trim();
+      if (!requestId || existingReferences.has(requestId)) {
+        continue;
+      }
+      const cachedOrder = this.findCachedDigitalServiceOrder(transaction.userId, requestId) || {};
+      const providerAudit = this.findDigitalServiceProviderAudit(requestId);
+      const providerMetadata = providerAudit?.metadata || {};
+      const metadata = transaction.metadata && typeof transaction.metadata === "object" ? transaction.metadata : {};
+      const productId = String(cachedOrder.productId || metadata.productId || "").trim();
+      const product = productId ? this.db.digitalServiceProducts.find((item) => item.id === productId || item.supplierProductId === productId) : null;
+      const rawAmount = String(cachedOrder.amountCharged || transaction.amount || "0").replace(/,/g, "").replace(/^-/, "");
+      const amountCharged = compare(rawAmount || "0", "0") > 0 ? rawAmount : "0";
+      if (compare(amountCharged, "0") <= 0) {
+        continue;
+      }
+      const quantity = Math.max(1, Math.min(Math.floor(Number(cachedOrder.quantity || metadata.quantity || 1)), 1000));
+      const productName = String(
+        cachedOrder.productName ||
+        product?.name ||
+        String(transaction.description || "").replace(/^Digital service\s*/i, "").trim() ||
+        "Digital service"
+      ).trim();
+      const providerCostNgn = cachedOrder.providerCostNgn || (product?.providerCostNgn ? multiplyRatio(product.providerCostNgn, String(quantity), "1") : amountCharged);
+      const status = cachedOrder.delivery ? "delivered" : this.normalizeRecoveredDigitalServiceStatus({
+        ...cachedOrder,
+        status: cachedOrder.status || providerMetadata.status,
+      }, transaction);
+      const wallet = this.ensureWallet(transaction.userId, "NGN");
+      const balanceReserved = DIGITAL_SERVICE_ACTIVE_STATUSES.includes(status) && compare(wallet.lockedBalance || "0", amountCharged) >= 0;
+      const recoveredOrder = {
+        id: existingIds.has(String(cachedOrder.id || "")) ? this.idGenerator(12) : String(cachedOrder.id || this.idGenerator(12)),
+        userId: transaction.userId,
+        requestId,
+        provider: cachedOrder.provider || "akunding",
+        productId: productId || cachedOrder.productId || "recovered",
+        supplierProductId: product?.supplierProductId || productId || "",
+        productName,
+        category: cachedOrder.category || product?.category || metadata.category || "Digital",
+        imageUrl: cachedOrder.imageUrl || product?.imageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
+        quantity,
+        currency: "NGN",
+        unitPrice: quantity > 0 ? multiplyRatio(amountCharged, "1", String(quantity)) : amountCharged,
+        amountCharged,
+        providerCost: cachedOrder.providerCost || providerCostNgn,
+        providerCostNgn,
+        markupAmount: compare(amountCharged, providerCostNgn) > 0 ? subtract(amountCharged, providerCostNgn) : "0",
+        status,
+        supplierStatus: cachedOrder.supplierStatus || providerMetadata.supplierStatus || status,
+        supplierOrderId: cachedOrder.supplierOrderId || providerMetadata.supplierOrderId || "",
+        supplierResponse: null,
+        deliveryEncrypted: cachedOrder.delivery ? this.encryptDigitalServiceDelivery(cachedOrder.delivery) : "",
+        failureReason: cachedOrder.failureReason || "",
+        walletReservedAmount: amountCharged,
+        balanceReserved,
+        createdAt: cachedOrder.createdAt || transaction.createdAt || this.clock(),
+        updatedAt: cachedOrder.updatedAt || transaction.createdAt || this.clock(),
+        completedAt: cachedOrder.completedAt || (DIGITAL_SERVICE_FINAL_STATUSES.includes(status) ? (transaction.createdAt || this.clock()) : null),
+        refundedAt: cachedOrder.refundedAt || (status === "refunded" ? (transaction.createdAt || this.clock()) : null),
+        recoveredFromHistory: true,
+        recoveredAt: this.clock(),
+      };
+      this.db.digitalServiceOrders.unshift(recoveredOrder);
+      existingReferences.add(requestId);
+      existingIds.add(recoveredOrder.id);
+      recovered.push(this.sanitizeDigitalServiceOrder(recoveredOrder, { admin: actor?.role === "admin" }));
+    }
+
+    if (recovered.length) {
+      this.audit(actor, "DIGITAL_SERVICE_ORDERS_RECOVERED", "DigitalServiceOrder", "history", {
+        count: recovered.length,
+      }, requestMeta);
+      this.persist();
+    }
+    return {
+      count: recovered.length,
+      orders: recovered,
+    };
+  }
+
   isSafeDigitalServiceImageUrl(value = "") {
     const raw = String(value || "").trim();
     if (!raw) {
@@ -4902,6 +5028,7 @@ class FinancialService {
       requestId: order.requestId,
       status: order.status,
       supplierStatus: order.supplierStatus,
+      supplierOrderId: order.supplierOrderId,
     }, requestMeta);
     this.persist();
     return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });

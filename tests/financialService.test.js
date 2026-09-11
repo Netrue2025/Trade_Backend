@@ -1997,6 +1997,62 @@ test("user can requery pending digital service order with supplier link", async 
   }
 });
 
+test("missing digital service order history can be recovered without changing balances", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, {
+      digitalServices: {
+        enabled: true,
+        globalMarkupPercent: "0",
+      },
+    });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "93",
+        supplierProductId: "93",
+        provider: "akunding",
+        name: "Gemini Pro",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "2500",
+        stock: 5,
+        available: true,
+      },
+    ]);
+    const product = service.getDigitalServiceProduct("93", { admin: true });
+    const pending = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const delivered = service.applyDigitalServiceOrderResult(pending.id, {
+      status: "delivered",
+      supplierStatus: "pending",
+      supplierOrderId: "AK-93",
+      delivery: { activationLink: "https://gemini.google.com/activate/restored-plan" },
+    }, user);
+    service.saveIdempotent("digital-service:order", user.id, "digital-restore-key", { order: delivered });
+
+    const walletBefore = { ...service.ensureWallet(user.id, "NGN") };
+    db.digitalServiceOrders = [];
+
+    const recovery = service.recoverMissingDigitalServiceOrdersFromHistory(admin);
+    const [restored] = service.listDigitalServiceOrders(user, { limit: 10 });
+
+    assert.equal(recovery.count, 1);
+    assert.equal(restored.status, "delivered");
+    assert.equal(restored.requestId, pending.requestId);
+    assert.equal(restored.delivery.activationLink, "https://gemini.google.com/activate/restored-plan");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, walletBefore.availableBalance);
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, walletBefore.lockedBalance);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
 test("digital service supplier failure refunds reserved wallet once", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "6000");

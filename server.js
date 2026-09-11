@@ -5724,6 +5724,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 300);
+    financialService.recoverMissingDigitalServiceOrdersFromHistory(user, getRequestMeta(req));
     sendJson(res, 200, { orders: financialService.listDigitalServiceOrders(user, { limit }) });
     return true;
   }
@@ -6571,14 +6572,33 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    financialService.recoverMissingDigitalServiceOrdersFromHistory(admin, getRequestMeta(req));
     sendJson(res, 200, {
       settings: financialService.getDigitalServiceSettings(),
       supplier: akundingService.getPublicStatus(),
       summary: financialService.getDigitalServiceAdminSummary(),
       products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
-      orders: financialService.listDigitalServiceOrders(admin, { limit: 100 }),
+      orders: financialService.listDigitalServiceOrders(admin, { limit: 300 }),
       apiBaseUrl: DEFAULT_AKUNDING_BASE_URL,
     });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/digital-services/recover-orders") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const recovery = financialService.recoverMissingDigitalServiceOrdersFromHistory(admin, getRequestMeta(req));
+      sendJson(res, 200, {
+        recovery,
+        orders: financialService.listDigitalServiceOrders(admin, { limit: 300 }),
+        summary: financialService.getDigitalServiceAdminSummary(),
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
@@ -6633,6 +6653,7 @@ async function handleApi(req, res, url) {
     }
     const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 250), 1), 500);
     const status = url.searchParams.get("status") || "";
+    financialService.recoverMissingDigitalServiceOrdersFromHistory(admin, getRequestMeta(req));
     sendJson(res, 200, {
       orders: financialService.listDigitalServiceOrders(admin, { limit, status }),
       summary: financialService.getDigitalServiceAdminSummary(),
