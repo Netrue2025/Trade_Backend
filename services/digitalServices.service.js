@@ -55,7 +55,25 @@ function normalizeCurrency(raw = {}) {
 }
 
 function normalizeProviderCost(raw = {}) {
-  return normalizeAmountText(firstValue(raw, ["price", "reseller_price", "cost", "amount", "rate", "selling_price"]), "0");
+  return normalizeAmountText(firstValue(raw, [
+    "price",
+    "unit_price",
+    "unitPrice",
+    "reseller_price",
+    "resellerPrice",
+    "reseller_amount",
+    "resellerAmount",
+    "wholesale_price",
+    "wholesalePrice",
+    "cost",
+    "amount",
+    "rate",
+    "selling_price",
+    "sellingPrice",
+    "naira_price",
+    "ngn_price",
+    "usd_price",
+  ]), "0");
 }
 
 function normalizeStock(raw = {}) {
@@ -83,11 +101,40 @@ function isProductAvailable(raw = {}) {
 }
 
 function getImageCandidate(raw = {}) {
-  const image = firstValue(raw, ["image", "image_url", "imageUrl", "thumbnail", "thumbnail_url", "icon", "logo", "photo"]);
+  const image = firstValue(raw, [
+    "image",
+    "image_url",
+    "imageUrl",
+    "product_image",
+    "productImage",
+    "photo_url",
+    "photoUrl",
+    "thumbnail",
+    "thumbnail_url",
+    "thumbnailUrl",
+    "icon",
+    "logo",
+    "photo",
+  ]);
   if (Array.isArray(image)) {
     return image[0] || "";
   }
   return String(image || "");
+}
+
+function normalizeSupplierImageUrl(value, baseUrl = "https://akunding.shop") {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  if (/^https?:\/\//i.test(raw)) {
+    return raw;
+  }
+  try {
+    return new URL(raw.replace(/^\.?\//, ""), `${String(baseUrl || "https://akunding.shop").replace(/\/+$/, "")}/`).toString();
+  } catch {
+    return "";
+  }
 }
 
 function normalizeMarkupMode(value) {
@@ -157,7 +204,7 @@ class DigitalServicesService {
       stock: normalizeStock(raw),
       providerStatus: normalizeStatus(raw),
       available: isProductAvailable(raw),
-      imageUrl: getImageCandidate(raw),
+      imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw), this.akundingService.baseUrl),
       deliveryLabel: normalizeText(firstValue(raw, ["delivery", "delivery_time", "delivery_label", "duration"]), "After purchase"),
       planLabel: normalizeText(firstValue(raw, ["plan", "duration", "validity"]), ""),
       raw,

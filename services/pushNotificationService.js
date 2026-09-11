@@ -40,6 +40,7 @@ const ALLOWED_ROUTE_PREFIXES = [
   "/?tab=wallet",
   "/?tab=history",
   "/?tab=signals",
+  "/?tab=store",
   "/?tab=referral",
   "/?tab=quest",
   "/?tab=settings",
@@ -95,10 +96,10 @@ function inferRoute(notification = {}) {
     return "/?tab=signals";
   }
   if (type === "VTU") {
-    return "/?tab=services";
+    return "/?tab=store";
   }
   if (type === "DIGITAL_SERVICE" || entityType === "DIGITAL_SERVICE") {
-    return "/?tab=services";
+    return "/?tab=store";
   }
   if (type === "REFERRAL") {
     return "/?tab=referral";

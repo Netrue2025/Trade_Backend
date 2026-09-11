@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
+const { DigitalServicesService } = require("../services/digitalServices.service");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
@@ -1619,6 +1620,87 @@ test("digital service product pricing hides supplier cost from users", () => {
   assert.equal(userProduct.providerCost, undefined);
   assert.equal(adminProduct.providerCostNgn, "3000");
   assert.equal(adminProduct.markupAmount, "300");
+});
+
+test("digital service products use supplier price by default", () => {
+  const previousMarkup = process.env.AKUNDING_GLOBAL_MARKUP_PERCENT;
+  delete process.env.AKUNDING_GLOBAL_MARKUP_PERCENT;
+  try {
+    const { service } = createHarness();
+    service.replaceDigitalServiceProducts([
+      {
+        id: "56",
+        supplierProductId: "56",
+        provider: "akunding",
+        name: "Cloud Tool",
+        category: "Cloud",
+        currency: "NGN",
+        providerCost: "1000",
+        stock: 3,
+        available: true,
+      },
+    ]);
+
+    const [userProduct] = service.listDigitalServiceProducts();
+    const [adminProduct] = service.listDigitalServiceProducts({ admin: true });
+
+    assert.equal(userProduct.price, "1000");
+    assert.equal(userProduct.sellingPrice, "1000");
+    assert.equal(adminProduct.providerCostNgn, "1000");
+    assert.equal(adminProduct.markupAmount, "0");
+  } finally {
+    if (previousMarkup === undefined) {
+      delete process.env.AKUNDING_GLOBAL_MARKUP_PERCENT;
+    } else {
+      process.env.AKUNDING_GLOBAL_MARKUP_PERCENT = previousMarkup;
+    }
+  }
+});
+
+test("digital service supplier relative images are normalized to provider URLs", () => {
+  const { service } = createHarness();
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: {
+      baseUrl: "https://akunding.shop",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+    },
+  });
+
+  const product = digitalServices.normalizeSupplierProduct({
+    id: 57,
+    name: "Image Tool",
+    price: "500",
+    image: "/storage/products/tool.png",
+  });
+
+  assert.equal(product.imageUrl, "https://akunding.shop/storage/products/tool.png");
+});
+
+test("digital service product image can be set by admin override", () => {
+  const { admin, service } = createHarness();
+  service.replaceDigitalServiceProducts([
+    {
+      id: "58",
+      supplierProductId: "58",
+      provider: "akunding",
+      name: "Image Override Tool",
+      category: "Media",
+      currency: "NGN",
+      providerCost: "750",
+      stock: 4,
+      available: true,
+      imageUrl: "https://akunding.shop/default.png",
+    },
+  ]);
+
+  service.updateDigitalServiceProductOverride(admin, "58", {
+    customImageUrl: "https://cdn.example.com/products/override.png",
+  });
+
+  const [product] = service.listDigitalServiceProducts();
+  assert.equal(product.imageUrl, "https://cdn.example.com/products/override.png");
 });
 
 test("digital service order reserves wallet and delivery consumes reserve once", () => {

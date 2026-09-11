@@ -36,7 +36,7 @@ const VTU_LEDGER_TYPES = ["VTU_AIRTIME", "VTU_DATA", "VTU_REFUND"];
 const DIGITAL_SERVICE_FINAL_STATUSES = ["delivered", "failed", "refunded"];
 const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "payment_reserved", "submitted", "processing"];
 const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND"];
-const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "20";
+const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "0";
 const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
 
 function nowIso() {
@@ -109,6 +109,9 @@ function normalizeOptionalUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) {
     return "";
+  }
+  if (raw.startsWith("/")) {
+    return raw;
   }
   try {
     const url = new URL(raw);
@@ -4411,9 +4414,25 @@ class FinancialService {
     }
   }
 
+  isValidAdminDigitalServiceImageUrl(value = "") {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return false;
+    }
+    if (raw.startsWith("/")) {
+      return true;
+    }
+    try {
+      const parsed = new URL(raw);
+      return ["http:", "https:"].includes(parsed.protocol);
+    } catch {
+      return false;
+    }
+  }
+
   getDigitalServiceImageUrl(product = {}, override = this.getDigitalServiceOverride(product.id)) {
     const custom = override.customImageUrl || "";
-    if (this.isSafeDigitalServiceImageUrl(custom)) {
+    if (this.isValidAdminDigitalServiceImageUrl(custom)) {
       return custom;
     }
     if (this.isSafeDigitalServiceImageUrl(product.imageUrl)) {
@@ -4736,7 +4755,7 @@ class FinancialService {
       message: "Your order is processing.",
       entityType: "DIGITAL_SERVICE",
       entityId: order.id,
-      route: "/?tab=services",
+      route: "/?tab=store",
     });
     this.audit(user, "DIGITAL_SERVICE_ORDER_CREATED", "DigitalServiceOrder", order.id, {
       productId: order.productId,
@@ -4783,7 +4802,7 @@ class FinancialService {
         message: `${order.productName} is ready.`,
         entityType: "DIGITAL_SERVICE",
         entityId: order.id,
-        route: "/?tab=services",
+        route: "/?tab=store",
       });
     } else if (nextStatus === "failed" || nextStatus === "refunded") {
       if (order.balanceReserved) {
@@ -4824,7 +4843,7 @@ class FinancialService {
         message: "Your NGN wallet has been updated.",
         entityType: "DIGITAL_SERVICE",
         entityId: order.id,
-        route: "/?tab=services",
+        route: "/?tab=store",
       });
     } else {
       order.status = DIGITAL_SERVICE_ACTIVE_STATUSES.includes(nextStatus) ? nextStatus : "processing";
