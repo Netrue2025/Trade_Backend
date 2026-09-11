@@ -36,6 +36,9 @@ const DELIVERY_KEYS = [
   "geminiLink",
   "access_link",
   "accessLink",
+  "data",
+  "value",
+  "text",
   "message",
   "note",
   "details",
@@ -123,6 +126,9 @@ function extractSupplierRows(payload) {
 }
 
 function extractSupplierRecord(payload) {
+  if (typeof payload === "string") {
+    return { message: payload };
+  }
   if (!payload || Array.isArray(payload) || typeof payload !== "object") {
     return {};
   }
@@ -130,6 +136,9 @@ function extractSupplierRecord(payload) {
     const value = payload[key];
     if (value && !Array.isArray(value) && typeof value === "object") {
       return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      return { [key]: value };
     }
   }
   return payload;
@@ -283,6 +292,10 @@ function extractSupplierOrderId(payload = {}) {
 function extractDeliveryPayload(payload = {}) {
   const source = extractSupplierRecord(payload);
   const delivery = {};
+  if (typeof payload === "string") {
+    const activationLink = findHttpUrl(payload);
+    return activationLink ? { message: payload, activationLink } : null;
+  }
   for (const key of DELIVERY_KEYS) {
     if (source[key] !== undefined && source[key] !== null && source[key] !== "") {
       if (["message", "note", "details"].includes(key) && !findHttpUrl(source[key])) {
@@ -300,6 +313,26 @@ function extractDeliveryPayload(payload = {}) {
     delivery.activationLink = activationLink;
   }
   return Object.keys(delivery).length ? delivery : null;
+}
+
+function mergeSupplierPayloads(payloads = []) {
+  const merged = {};
+  const raw = [];
+  for (const payload of payloads.filter(Boolean)) {
+    raw.push(payload);
+    const record = extractSupplierRecord(payload);
+    if (record && typeof record === "object" && !Array.isArray(record)) {
+      Object.assign(merged, record);
+    }
+    if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
+      for (const [key, value] of Object.entries(payload)) {
+        if (value !== undefined && value !== null && value !== "" && typeof value !== "object") {
+          merged[key] = value;
+        }
+      }
+    }
+  }
+  return raw.length ? { data: merged, raw } : null;
 }
 
 class DigitalServicesService {
@@ -414,8 +447,16 @@ class DigitalServicesService {
         quantity,
         idempotencyKey: order.requestId,
       });
-      return this.applySupplierResult(order.id, providerResponse, user, requestMeta);
+      const supplierOrderId = extractSupplierOrderId(providerResponse);
+      let supplementalPayloads = [];
+      if (supplierOrderId) {
+        supplementalPayloads = await this.fetchSupplierOrderPayloads({ ...order, supplierOrderId }).catch(() => []);
+      }
+      return this.applySupplierResult(order.id, mergeSupplierPayloads([providerResponse, ...supplementalPayloads]) || providerResponse, user, requestMeta);
     } catch (error) {
+      if (extractDeliveryPayload(error.payload)) {
+        return this.applySupplierResult(order.id, error.payload, user, requestMeta);
+      }
       const isFinalFailure = Number(error.statusCode || 0) > 0 && Number(error.statusCode || 0) < 500 && error.code !== "AKUNDING_TIMEOUT";
       const payload = {
         status: isFinalFailure ? "failed" : "processing",
@@ -433,8 +474,61 @@ class DigitalServicesService {
     if (!order.supplierOrderId) {
       throw new Error("This order does not have a supplier order ID yet.");
     }
-    const providerResponse = await this.akundingService.getOrder(order.supplierOrderId);
-    return this.applySupplierResult(order.id, providerResponse, actor, requestMeta);
+    const payloads = await this.fetchSupplierOrderPayloads(order);
+    if (!payloads.length) {
+      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+        status: "processing",
+        supplierStatus: "not_found",
+        supplierOrderId: order.supplierOrderId,
+        message: "Supplier order is not available from the lookup endpoint yet.",
+      }, actor, requestMeta);
+    }
+    return this.applySupplierResult(order.id, mergeSupplierPayloads(payloads), actor, requestMeta);
+  }
+
+  async fetchSupplierOrderPayloads(order = {}) {
+    const supplierOrderId = String(order.supplierOrderId || "").trim();
+    if (!supplierOrderId) {
+      return [];
+    }
+    const payloads = [];
+    const pushPayload = (payload) => {
+      if (payload !== undefined && payload !== null && payload !== "") {
+        payloads.push(payload);
+      }
+    };
+    const trySupplierCall = async (call) => {
+      try {
+        pushPayload(await call());
+      } catch (error) {
+        if (extractDeliveryPayload(error.payload)) {
+          pushPayload(error.payload);
+        }
+        if (![404, 422].includes(Number(error.statusCode || 0))) {
+          throw error;
+        }
+      }
+    };
+
+    if (typeof this.akundingService.getOrder === "function") {
+      await trySupplierCall(() => this.akundingService.getOrder(supplierOrderId));
+    }
+    if (typeof this.akundingService.exportOrder === "function") {
+      await trySupplierCall(() => this.akundingService.exportOrder(supplierOrderId));
+    }
+
+    if (!payloads.some((payload) => extractDeliveryPayload(payload)) && typeof this.akundingService.listOrders === "function") {
+      await trySupplierCall(async () => {
+        const ordersPayload = await this.akundingService.listOrders({ limit: 200 });
+        const match = extractSupplierRows(ordersPayload).find((row) => {
+          const record = extractSupplierRecord(row);
+          return String(extractSupplierOrderId(record) || record.id || "").trim() === supplierOrderId;
+        });
+        return match || null;
+      });
+    }
+
+    return payloads;
   }
 
   applySupplierResult(orderId, providerResponse, actor, requestMeta = {}) {

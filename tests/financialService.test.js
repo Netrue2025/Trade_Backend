@@ -1931,6 +1931,72 @@ test("digital service purchase treats supplier activation link as delivered", as
   }
 });
 
+test("digital service purchase uses export payload when order lookup returns 404", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, {
+      digitalServices: {
+        enabled: true,
+        globalMarkupPercent: "0",
+      },
+    });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "94",
+        supplierProductId: "94",
+        provider: "akunding",
+        name: "Gemini Pro",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "2500",
+        stock: 10,
+        available: true,
+      },
+    ]);
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        createOrder: async () => ({
+          data: {
+            id: 9400,
+            status: "pending",
+          },
+        }),
+        getOrder: async () => {
+          const error = new Error("Order not found.");
+          error.statusCode = 404;
+          error.payload = { detail: "Not found" };
+          throw error;
+        },
+        exportOrder: async (orderId) => {
+          assert.equal(orderId, "9400");
+          return { data: "Activate with https://gemini.google.com/activate/exported-plan" };
+        },
+      },
+    });
+
+    const order = await digitalServices.purchase(user, { productId: "94", quantity: 1 });
+
+    assert.equal(order.status, "delivered");
+    assert.equal(order.supplierOrderId, "");
+    assert.equal(order.delivery.activationLink, "https://gemini.google.com/activate/exported-plan");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "7500");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
 test("user can requery pending digital service order with supplier link", async () => {
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
