@@ -6645,6 +6645,21 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const adminDigitalProductRefreshMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/products\/([^/]+)\/refresh$/);
+  if (req.method === "POST" && adminDigitalProductRefreshMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const product = await digitalServicesService.refreshProduct(decodeURIComponent(adminDigitalProductRefreshMatch[1] || ""));
+      sendJson(res, 200, { product, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   const adminDigitalOrderRequeryMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/requery$/);
   if (req.method === "POST" && adminDigitalOrderRequeryMatch) {
     const admin = requireAuth(req, res, "admin");

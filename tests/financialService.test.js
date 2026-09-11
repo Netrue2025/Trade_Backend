@@ -1620,6 +1620,7 @@ test("digital service product pricing hides supplier cost from users", () => {
   assert.equal(userProduct.providerCost, undefined);
   assert.equal(adminProduct.providerCostNgn, "3000");
   assert.equal(adminProduct.markupAmount, "300");
+  assert.equal(adminProduct.supplierCurrency, "USD");
 });
 
 test("digital service products use supplier price by default", () => {
@@ -1657,6 +1658,42 @@ test("digital service products use supplier price by default", () => {
   }
 });
 
+test("digital service sync accepts nested API product payloads and reseller cost", async () => {
+  const { admin, service } = createHarness();
+  service.updateSettings(admin, {
+    digitalServices: {
+      enabled: true,
+    },
+  });
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: {
+      baseUrl: "https://akunding.shop",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+      listProducts: async () => ({
+        data: {
+          products: [
+            {
+              id: 57,
+              name: "Nested Tool",
+              price: "1500",
+              reseller_price: "1200",
+              currency: "NGN",
+              stock: 8,
+            },
+          ],
+        },
+      }),
+    },
+  });
+
+  const [product] = await digitalServices.syncProducts({ force: true });
+  assert.equal(product.name, "Nested Tool");
+  assert.equal(product.providerCostNgn, "1200");
+  assert.equal(product.sellingPrice, "1200");
+});
+
 test("digital service supplier relative images are normalized to provider URLs", () => {
   const { service } = createHarness();
   const digitalServices = new DigitalServicesService({
@@ -1676,6 +1713,58 @@ test("digital service supplier relative images are normalized to provider URLs",
   });
 
   assert.equal(product.imageUrl, "https://akunding.shop/storage/products/tool.png");
+});
+
+test("admin can refresh a single digital service product API price", async () => {
+  const { admin, service } = createHarness();
+  service.updateSettings(admin, {
+    digitalServices: {
+      enabled: true,
+      globalMarkupPercent: "25",
+    },
+  });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "59",
+      supplierProductId: "59",
+      provider: "akunding",
+      name: "Old Price Tool",
+      category: "Media",
+      currency: "NGN",
+      providerCost: "1000",
+      stock: 4,
+      available: true,
+    },
+  ]);
+  service.updateDigitalServiceProductOverride(admin, "59", {
+    displayName: "Published Tool",
+    customImageUrl: "https://cdn.example.com/products/published.png",
+  });
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: {
+      baseUrl: "https://akunding.shop",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+      getProduct: async () => ({
+        data: {
+          id: 59,
+          name: "Fresh API Tool",
+          reseller_price: "2000",
+          currency: "NGN",
+          stock: 9,
+          image: "/storage/products/fresh.png",
+        },
+      }),
+    },
+  });
+
+  const product = await digitalServices.refreshProduct("59");
+  assert.equal(product.name, "Published Tool");
+  assert.equal(product.providerCostNgn, "2000");
+  assert.equal(product.markupAmount, "500");
+  assert.equal(product.sellingPrice, "2500");
+  assert.equal(product.imageUrl, "https://cdn.example.com/products/published.png");
 });
 
 test("digital service product image can be set by admin override", () => {
@@ -1701,6 +1790,31 @@ test("digital service product image can be set by admin override", () => {
 
   const [product] = service.listDigitalServiceProducts();
   assert.equal(product.imageUrl, "https://cdn.example.com/products/override.png");
+});
+
+test("admin-enabled digital service product is visible in user store", () => {
+  const { admin, service } = createHarness();
+  service.replaceDigitalServiceProducts([
+    {
+      id: "60",
+      supplierProductId: "60",
+      provider: "akunding",
+      name: "Manual Publish Tool",
+      category: "Store",
+      currency: "NGN",
+      providerCost: "900",
+      stock: 0,
+      available: false,
+    },
+  ]);
+  service.updateDigitalServiceProductOverride(admin, "60", {
+    enabled: true,
+  });
+
+  const [product] = service.listDigitalServiceProducts();
+  assert.equal(product.name, "Manual Publish Tool");
+  assert.equal(product.available, true);
+  assert.equal(product.supplierAvailable, false);
 });
 
 test("digital service order reserves wallet and delivery consumes reserve once", () => {

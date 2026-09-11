@@ -4480,7 +4480,8 @@ class FinancialService {
   sanitizeDigitalServiceProduct(product = {}, { admin = false } = {}) {
     const override = this.getDigitalServiceOverride(product.id);
     const pricing = this.priceDigitalServiceProduct(product);
-    const enabled = override.enabled !== undefined ? !!override.enabled : product.available !== false;
+    const overrideExists = Object.prototype.hasOwnProperty.call(override, "enabled");
+    const enabled = overrideExists ? !!override.enabled : product.available !== false;
     const response = {
       id: String(product.id || product.supplierProductId || "").trim(),
       name: override.displayName || product.name || "Digital Service",
@@ -4489,8 +4490,9 @@ class FinancialService {
       currency: "NGN",
       price: pricing.sellingPrice,
       sellingPrice: pricing.sellingPrice,
+      supplierAvailable: product.available !== false,
       stock: Number(product.stock || 0),
-      available: enabled && product.available !== false && compare(pricing.sellingPrice, "0") > 0,
+      available: enabled && compare(pricing.sellingPrice, "0") > 0,
       featured: !!override.featured,
       order: Number(override.order || 0),
       imageUrl: this.getDigitalServiceImageUrl(product, override),
@@ -4503,6 +4505,7 @@ class FinancialService {
       response.supplierProductId = product.supplierProductId || product.id || "";
       response.provider = product.provider || "akunding";
       response.providerCost = product.providerCost || "0";
+      response.supplierCurrency = product.currency || "NGN";
       response.providerCostNgn = pricing.providerCostNgn;
       response.markupAmount = pricing.markupAmount;
       response.override = override;
@@ -4566,6 +4569,31 @@ class FinancialService {
     this.db.digitalServiceProducts = [...nextById.values()];
     this.updateDigitalServiceSyncStatus({ status: "connected", error: "" });
     return this.listDigitalServiceProducts({ includeInactive: true, admin: true });
+  }
+
+  upsertDigitalServiceProduct(product = {}, { provider = "akunding" } = {}) {
+    this.ensureState();
+    const normalized = {
+      ...product,
+      id: String(product.id || product.supplierProductId || "").trim(),
+      supplierProductId: String(product.supplierProductId || product.id || "").trim(),
+      provider,
+      syncedAt: product.syncedAt || this.clock(),
+    };
+    if (!normalized.id || !normalized.supplierProductId) {
+      throw new Error("Digital service product is missing a supplier product ID.");
+    }
+    const index = this.db.digitalServiceProducts.findIndex((item) => String(item.id || item.supplierProductId || "") === normalized.id);
+    if (index >= 0) {
+      this.db.digitalServiceProducts[index] = {
+        ...this.db.digitalServiceProducts[index],
+        ...normalized,
+      };
+    } else {
+      this.db.digitalServiceProducts.unshift(normalized);
+    }
+    this.updateDigitalServiceSyncStatus({ status: "connected", error: "" });
+    return this.getDigitalServiceProduct(normalized.id, { admin: true });
   }
 
   updateDigitalServiceProductOverride(admin, productId, input = {}, requestMeta = {}) {

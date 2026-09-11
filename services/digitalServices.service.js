@@ -24,6 +24,42 @@ function firstValue(object = {}, keys = []) {
   return "";
 }
 
+function extractSupplierRows(payload) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  for (const key of ["data", "products", "items", "results", "records"]) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (value && typeof value === "object") {
+      for (const nestedKey of ["data", "products", "items", "results", "records"]) {
+        if (Array.isArray(value[nestedKey])) {
+          return value[nestedKey];
+        }
+      }
+    }
+  }
+  return [];
+}
+
+function extractSupplierRecord(payload) {
+  if (!payload || Array.isArray(payload) || typeof payload !== "object") {
+    return {};
+  }
+  for (const key of ["data", "product", "item", "record", "result"]) {
+    const value = payload[key];
+    if (value && !Array.isArray(value) && typeof value === "object") {
+      return value;
+    }
+  }
+  return payload;
+}
+
 function normalizeProductId(raw = {}) {
   return String(firstValue(raw, ["id", "product_id", "productId", "variation_id", "sku"]) || "").trim();
 }
@@ -56,9 +92,6 @@ function normalizeCurrency(raw = {}) {
 
 function normalizeProviderCost(raw = {}) {
   return normalizeAmountText(firstValue(raw, [
-    "price",
-    "unit_price",
-    "unitPrice",
     "reseller_price",
     "resellerPrice",
     "reseller_amount",
@@ -66,6 +99,13 @@ function normalizeProviderCost(raw = {}) {
     "wholesale_price",
     "wholesalePrice",
     "cost",
+    "provider_cost",
+    "providerCost",
+    "api_cost",
+    "apiCost",
+    "price",
+    "unit_price",
+    "unitPrice",
     "amount",
     "rate",
     "selling_price",
@@ -218,10 +258,33 @@ class DigitalServicesService {
       return this.financialService.listDigitalServiceProducts();
     }
     const products = await this.akundingService.listProducts({ includeOutOfStock: true });
-    const normalized = (Array.isArray(products) ? products : [])
-      .map((product) => this.normalizeSupplierProduct(product))
+    const normalized = extractSupplierRows(products)
+      .map((product) => this.normalizeSupplierProduct(extractSupplierRecord(product)))
       .filter((product) => product.supplierProductId);
     return this.financialService.replaceDigitalServiceProducts(normalized, { provider: "akunding" });
+  }
+
+  async refreshProduct(productId) {
+    const settings = this.financialService.getDigitalServiceSettings();
+    if (!settings.enabled) {
+      throw new Error("Digital Services is not available now.");
+    }
+    if (!this.akundingService.isConfigured()) {
+      throw new Error("Digital Services supplier is not configured.");
+    }
+    const current = this.financialService.getDigitalServiceProduct(productId, { admin: true });
+    const supplierProductId = current.supplierProductId || current.id || productId;
+    const payload = await this.akundingService.getProduct(supplierProductId);
+    const normalized = this.normalizeSupplierProduct(extractSupplierRecord(payload));
+    if (!normalized.supplierProductId) {
+      normalized.id = current.id;
+      normalized.supplierProductId = supplierProductId;
+    }
+    return this.financialService.upsertDigitalServiceProduct({
+      ...normalized,
+      id: current.id,
+      supplierProductId,
+    }, { provider: "akunding" });
   }
 
   async listProducts({ query = "", category = "", force = false } = {}) {
@@ -312,5 +375,6 @@ class DigitalServicesService {
 module.exports = {
   DigitalServicesService,
   PRODUCT_CACHE_TTL_MS,
+  extractSupplierRows,
   mapSupplierStatus,
 };
