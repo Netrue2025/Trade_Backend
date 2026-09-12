@@ -4614,12 +4614,13 @@ class FinancialService {
     let markupAmount = multiplyRatio(providerCostNgn, this.db.systemSettings.digitalServices.globalMarkupPercent || "0", "100");
     let sellingPrice = add(providerCostNgn, markupAmount);
     const mode = normalizeMarkupMode(override.markupMode);
-    if (mode === "fixed") {
+    const fixedSellingPrice = normalizeNonNegativeAmount(override.customPriceNgn || "0", "Custom product price");
+    if (compare(fixedSellingPrice, "0") > 0) {
+      sellingPrice = fixedSellingPrice;
+      markupAmount = compare(sellingPrice, providerCostNgn) > 0 ? subtract(sellingPrice, providerCostNgn) : "0";
+    } else if (mode === "fixed") {
       markupAmount = normalizeNonNegativeAmount(override.markupValue || "0", "Product fixed markup");
       sellingPrice = add(providerCostNgn, markupAmount);
-    } else if (mode === "custom" && compare(override.customPriceNgn || "0", "0") > 0) {
-      sellingPrice = normalizeAmount(override.customPriceNgn, "Custom product price");
-      markupAmount = compare(sellingPrice, providerCostNgn) > 0 ? subtract(sellingPrice, providerCostNgn) : "0";
     } else if (override.markupValue !== undefined && compare(override.markupValue || "0", "0") > 0) {
       markupAmount = multiplyRatio(providerCostNgn, normalizePercent(override.markupValue, "Product markup"), "100");
       sellingPrice = add(providerCostNgn, markupAmount);

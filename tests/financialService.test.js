@@ -1702,6 +1702,41 @@ test("digital service products use supplier price by default", () => {
   }
 });
 
+test("digital service fixed selling price overrides calculated markup", () => {
+  const { admin, service } = createHarness();
+  service.updateSettings(admin, {
+    digitalServices: {
+      enabled: true,
+      globalMarkupPercent: "50",
+    },
+  });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "57",
+      supplierProductId: "57",
+      provider: "akunding",
+      name: "Fixed Price Tool",
+      category: "Tools",
+      currency: "NGN",
+      providerCost: "1000",
+      stock: 4,
+      available: true,
+    },
+  ]);
+  service.updateDigitalServiceProductOverride(admin, "57", {
+    markupMode: "percentage",
+    markupValue: "30",
+    customPriceNgn: "1200",
+  });
+
+  const [userProduct] = service.listDigitalServiceProducts();
+  const [adminProduct] = service.listDigitalServiceProducts({ admin: true });
+
+  assert.equal(userProduct.sellingPrice, "1200");
+  assert.equal(adminProduct.providerCostNgn, "1000");
+  assert.equal(adminProduct.markupAmount, "200");
+});
+
 test("digital service sync accepts nested API product payloads and reseller cost", async () => {
   const { admin, service } = createHarness();
   service.updateSettings(admin, {
