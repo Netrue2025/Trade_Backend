@@ -1622,8 +1622,48 @@ test("digital service product pricing hides supplier cost from users", () => {
 
   assert.equal(userProduct.sellingPrice, "3300");
   assert.equal(userProduct.providerCost, undefined);
+  assert.equal(userProduct.priceCurrency, "USD");
+  assert.equal(userProduct.displayPrice, "2.2");
+  assert.equal(userProduct.ngnEquivalent, "3300");
   assert.equal(adminProduct.providerCostNgn, "3000");
   assert.equal(adminProduct.markupAmount, "300");
+  assert.equal(adminProduct.supplierCurrency, "USD");
+});
+
+test("emma store products default supplier prices to USD and show NGN equivalent", () => {
+  const { admin, service } = createHarness();
+  service.updateSettings(admin, {
+    exchangeRate: { usdtToNgn: "1600" },
+    digitalServices: {
+      enabled: true,
+      globalMarkupPercent: "25",
+    },
+  });
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    emmaService: {
+      baseUrl: "https://ssondigitalworks.online/api/reseller",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+    },
+  });
+  const normalized = digitalServices.normalizeSupplierProduct({
+    id: 91,
+    name: "Emma AI Plan",
+    price: "$10",
+    image: "/images/ai.png",
+  }, { provider: "emma" });
+  service.replaceDigitalServiceProducts([normalized], { provider: "emma" });
+
+  const [userProduct] = service.listDigitalServiceProducts({ store: "emma" });
+  const [adminProduct] = service.listDigitalServiceProducts({ store: "emma", admin: true });
+
+  assert.equal(normalized.currency, "USD");
+  assert.equal(normalized.providerCost, "10");
+  assert.equal(userProduct.priceCurrency, "USD");
+  assert.equal(userProduct.displayPrice, "12.5");
+  assert.equal(userProduct.ngnEquivalent, "20000");
+  assert.equal(adminProduct.providerCostNgn, "16000");
   assert.equal(adminProduct.supplierCurrency, "USD");
 });
 

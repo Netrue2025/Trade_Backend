@@ -2784,6 +2784,7 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
       : [],
   };
 
+  trade.exitOrders = Array.isArray(trade.exitOrders) ? trade.exitOrders : [];
   trade.exitOrders.push(externalExit);
   return true;
 }
@@ -2799,7 +2800,7 @@ async function reconcileExecution(account, symbol, execution, exchange = getAcco
 
   try {
     const latest = await getOrder(account, symbol, execution.orderId, exchange);
-    return sanitizeExecution(latest);
+    return latest ? sanitizeExecution(latest) : execution;
   } catch {
     return execution;
   }
@@ -2918,39 +2919,37 @@ async function reconcileTradeStatuses() {
         adminSnapshot
       ) {
         const exchangeInfo = await getExchangeInfo(trade.symbol, adminAccount?.testnet, exchange).catch(() => null);
-        if (exchangeInfo) {
-          const adminExternallyClosed = await reconcileExternalClosuresForOwner(
-            trade,
-            admin,
-            adminSnapshot.accountInfo,
-            adminSnapshot.openOrders,
-            exchangeInfo
-          );
-          if (adminExternallyClosed) {
-            changed = true;
-          }
+        const adminExternallyClosed = await reconcileExternalClosuresForOwner(
+          trade,
+          admin,
+          adminSnapshot.accountInfo,
+          adminSnapshot.openOrders,
+          exchangeInfo
+        );
+        if (adminExternallyClosed) {
+          changed = true;
+        }
 
-          for (const mirror of trade.mirroredExecutions || []) {
-            const user = db.users.find((item) => item.id === mirror.userId);
-            if (!user || mirror.order?.status !== "FILLED") {
-              continue;
-            }
-            const mirrorExchange = normalizeExchange(mirror.exchange, exchange);
-            const userSnapshot = await getOwnerSnapshot(user, mirrorExchange);
-            if (!userSnapshot) {
-              continue;
-            }
-            const userExternallyClosed = await reconcileExternalClosuresForOwner(
-              trade,
-              user,
-              userSnapshot.accountInfo,
-              userSnapshot.openOrders,
-              exchangeInfo,
-              mirror.userId
-            );
-            if (userExternallyClosed) {
-              changed = true;
-            }
+        for (const mirror of trade.mirroredExecutions || []) {
+          const user = db.users.find((item) => item.id === mirror.userId);
+          if (!user || mirror.order?.status !== "FILLED") {
+            continue;
+          }
+          const mirrorExchange = normalizeExchange(mirror.exchange, exchange);
+          const userSnapshot = await getOwnerSnapshot(user, mirrorExchange);
+          if (!userSnapshot) {
+            continue;
+          }
+          const userExternallyClosed = await reconcileExternalClosuresForOwner(
+            trade,
+            user,
+            userSnapshot.accountInfo,
+            userSnapshot.openOrders,
+            exchangeInfo,
+            mirror.userId
+          );
+          if (userExternallyClosed) {
+            changed = true;
           }
         }
       }
@@ -3048,22 +3047,26 @@ function deriveTradeLifecycle(trade) {
   if (exitStatuses.includes("FILLED")) {
     return "CLOSED";
   }
-  if (trade.adminExecution?.status === "NEW" || trade.adminExecution?.status === "PARTIALLY_FILLED") {
-    return "PENDING";
-  }
-  if (trade.adminExecution?.status === "FILLED" && trade.side === "BUY") {
-    return "OPEN";
-  }
-  if (trade.adminExecution?.status === "FILLED" && trade.side === "SELL") {
-    return "CLOSED";
-  }
-  if (trade.adminExecution?.status === "CANCELED") {
+  const adminStatus = String(trade.adminExecution?.status || "").trim().toUpperCase();
+  if (!trade.adminExecution || !adminStatus) {
     return "CANCELED";
   }
-  if (trade.adminExecution?.status === "ERROR") {
+  if (adminStatus === "NEW" || adminStatus === "PARTIALLY_FILLED") {
+    return "PENDING";
+  }
+  if (adminStatus === "FILLED" && trade.side === "BUY") {
+    return "OPEN";
+  }
+  if (adminStatus === "FILLED" && trade.side === "SELL") {
+    return "CLOSED";
+  }
+  if (adminStatus === "CANCELED") {
+    return "CANCELED";
+  }
+  if (adminStatus === "ERROR") {
     return "ERROR";
   }
-  return "OPEN";
+  return "CANCELED";
 }
 
 function getStrategyReason(trade) {

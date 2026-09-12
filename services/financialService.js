@@ -4594,6 +4594,19 @@ class FinancialService {
     return amount;
   }
 
+  getDigitalServiceDisplayPricing(product = {}, pricing = this.priceDigitalServiceProduct(product)) {
+    const supplierCurrency = String(product.currency || "NGN").trim().toUpperCase();
+    const exchangeRate = normalizeNonNegativeAmount(this.db.systemSettings.exchangeRate.usdtToNgn || "0", "Exchange rate");
+    const usesDollarDisplay = ["USD", "USDT"].includes(supplierCurrency) && compare(exchangeRate || "0", "0") > 0;
+    return {
+      walletCurrency: "NGN",
+      priceCurrency: usesDollarDisplay ? supplierCurrency : "NGN",
+      displayPrice: usesDollarDisplay ? multiplyRatio(pricing.sellingPrice, "1", exchangeRate) : pricing.sellingPrice,
+      ngnEquivalent: pricing.sellingPrice,
+      exchangeRate,
+    };
+  }
+
   priceDigitalServiceProduct(product = {}) {
     this.ensureState();
     const override = this.getDigitalServiceOverride(product.id);
@@ -4621,6 +4634,7 @@ class FinancialService {
   sanitizeDigitalServiceProduct(product = {}, { admin = false } = {}) {
     const override = this.getDigitalServiceOverride(product.id);
     const pricing = this.priceDigitalServiceProduct(product);
+    const displayPricing = this.getDigitalServiceDisplayPricing(product, pricing);
     const overrideExists = Object.prototype.hasOwnProperty.call(override, "enabled");
     const enabled = overrideExists ? !!override.enabled : product.available !== false;
     const response = {
@@ -4631,8 +4645,13 @@ class FinancialService {
       storeKey: product.storeKey || (product.provider === "emma" ? "emma" : "alaba"),
       storeName: product.storeName || (product.provider === "emma" ? "Emma Store" : "Alaba Store"),
       currency: "NGN",
+      walletCurrency: displayPricing.walletCurrency,
+      priceCurrency: displayPricing.priceCurrency,
       price: pricing.sellingPrice,
       sellingPrice: pricing.sellingPrice,
+      displayPrice: displayPricing.displayPrice,
+      ngnEquivalent: displayPricing.ngnEquivalent,
+      exchangeRate: displayPricing.exchangeRate,
       supplierAvailable: product.available !== false,
       stock: Number(product.stock || 0),
       available: enabled && compare(pricing.sellingPrice, "0") > 0,
@@ -4650,6 +4669,9 @@ class FinancialService {
       response.providerCost = product.providerCost || "0";
       response.supplierCurrency = product.currency || "NGN";
       response.providerCostNgn = pricing.providerCostNgn;
+      response.supplierDisplayPrice = ["USD", "USDT"].includes(String(product.currency || "").toUpperCase())
+        ? product.providerCost || "0"
+        : pricing.providerCostNgn;
       response.markupAmount = pricing.markupAmount;
       response.override = override;
     }

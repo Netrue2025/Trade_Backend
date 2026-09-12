@@ -153,12 +153,19 @@ function normalizeProductId(raw = {}) {
 }
 
 function normalizeNumber(value, fallback = 0) {
-  const numeric = Number(String(value ?? "").replace(/,/g, ""));
+  const text = String(value ?? "").replace(/,/g, "").trim();
+  if (!text) {
+    return fallback;
+  }
+  const numeric = Number(text);
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function normalizeAmountText(value, fallback = "0") {
-  const text = String(value ?? "").replace(/,/g, "").trim();
+  const text = String(value ?? "")
+    .replace(/,/g, "")
+    .replace(/[^\d.-]/g, "")
+    .trim();
   return /^-?\d+(?:\.\d+)?$/.test(text) ? text : String(fallback);
 }
 
@@ -174,8 +181,16 @@ function normalizeDescription(raw = {}) {
   return normalizeText(firstValue(raw, ["description", "details", "summary", "short_description"]), "");
 }
 
-function normalizeCurrency(raw = {}) {
-  return String(firstValue(raw, ["currency", "currency_code"]) || "NGN").trim().toUpperCase();
+function normalizeCurrency(raw = {}, fallback = "NGN") {
+  const rawCurrency = firstValue(raw, ["currency", "currency_code", "currencySymbol", "currency_symbol"]);
+  const value = String(rawCurrency || fallback).trim().toUpperCase();
+  if (["$", "US$", "USDOLLAR", "DOLLAR"].includes(value)) {
+    return "USD";
+  }
+  if (["₦", "N", "NAIRA"].includes(value)) {
+    return "NGN";
+  }
+  return value || fallback;
 }
 
 function normalizeProviderCost(raw = {}) {
@@ -386,6 +401,7 @@ class DigitalServicesService {
   normalizeSupplierProduct(raw = {}, { provider = "akunding", service = this.getProviderService(provider) } = {}) {
     const normalizedProvider = normalizeProviderKey(provider);
     const supplierProductId = normalizeProductId(raw);
+    const supplierCurrency = normalizeCurrency(raw, normalizedProvider === "emma" ? "USD" : "NGN");
     return {
       id: createProviderProductId(normalizedProvider, supplierProductId),
       supplierProductId,
@@ -395,7 +411,7 @@ class DigitalServicesService {
       name: normalizeName(raw),
       description: normalizeDescription(raw),
       category: normalizeCategory(raw) || getProviderStoreLabel(normalizedProvider),
-      currency: normalizeCurrency(raw),
+      currency: normalizedProvider === "emma" && supplierCurrency === "NGN" ? "USD" : supplierCurrency,
       providerCost: normalizeProviderCost(raw),
       stock: normalizeStock(raw),
       providerStatus: normalizeStatus(raw),
