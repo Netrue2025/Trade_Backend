@@ -1547,7 +1547,7 @@ test("VTU settings encrypt credentials and never return secrets", () => {
 });
 
 test("VTU purchase reserves wallet and success consumes reserve once", () => {
-  const { service, user } = createHarness();
+  const { admin, db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "10000");
 
   const transaction = service.createVtuTransaction(user, {
@@ -1564,6 +1564,10 @@ test("VTU purchase reserves wallet and success consumes reserve once", () => {
   assert.equal(transaction.status, "processing");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "9000");
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
+  const adminNotification = db.notifications.find((item) => item.userId === admin.id && item.entityId === transaction.id);
+  assert.equal(adminNotification?.type, "VTU");
+  assert.match(adminNotification?.title || "", /airtime/i);
+  assert.equal(adminNotification?.metadata?.requestId, "airtime_test_1");
 
   const settled = service.applyVtuProviderResult("airtime_test_1", {
     code: "success",

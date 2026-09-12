@@ -1624,6 +1624,21 @@ class FinancialService {
       entityType: "VTU",
       entityId: transaction.id,
     });
+    this.notifyAdmins({
+      type: "VTU",
+      title: productType === "data" ? "Data recharge" : "Airtime recharge",
+      message: `${user.name || user.email || "A user"} bought ${productType === "data" ? transaction.planName || "data" : transaction.faceValue} for ${transaction.phone}.`,
+      entityType: "VTU",
+      entityId: transaction.id,
+      route: "/?tab=history",
+      dedupeKey: `vtu-admin-purchase:${transaction.id}`,
+      metadata: {
+        category: "transactions",
+        productType,
+        requestId,
+        userId: user.id,
+      },
+    });
     this.audit(user, "VTU_PURCHASE_CREATED", "VtuTransaction", transaction.id, {
       productType,
       amountCharged,
