@@ -57,6 +57,7 @@ const { PaystackService, maskAccountNumber } = require("./services/paystackServi
 const { TelegramService } = require("./services/telegramService");
 const { PushNotificationService } = require("./services/pushNotificationService");
 const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
+const { EmmaResellerService, DEFAULT_EMMA_RESELLER_BASE_URL } = require("./services/emmaReseller.service");
 const { DigitalServicesService } = require("./services/digitalServices.service");
 const {
   VtuService,
@@ -135,6 +136,7 @@ let financialService = null;
 let questService = null;
 let vtuService = null;
 let akundingService = null;
+let emmaResellerService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
@@ -5651,10 +5653,6 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/digital-services/status") {
-    const user = requireAuth(req, res, "user");
-    if (!user) {
-      return true;
-    }
     const status = digitalServicesService.getStatus();
     sendJson(res, 200, {
       settings: {
@@ -5664,26 +5662,29 @@ async function handleApi(req, res, url) {
         lastSyncAt: status.settings.lastSyncAt,
         lastSyncStatus: status.settings.lastSyncStatus,
       },
+      suppliers: status.suppliers,
     });
     return true;
   }
 
   if (req.method === "GET" && url.pathname === "/api/digital-services/products") {
-    const user = requireAuth(req, res, "user");
-    if (!user) {
-      return true;
-    }
     try {
+      const store = url.searchParams.get("store") || "";
       const products = await digitalServicesService.listProducts({
         query: url.searchParams.get("q") || "",
         category: url.searchParams.get("category") || "",
+        store,
         force: url.searchParams.get("refresh") === "1",
       });
-      const categories = [...new Set(financialService.listDigitalServiceProducts().map((product) => product.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+      const categories = [...new Set(financialService.listDigitalServiceProducts({ store }).map((product) => product.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
       const status = digitalServicesService.getStatus();
       sendJson(res, 200, {
         products,
         categories,
+        stores: [
+          { id: "alaba", name: "Alaba Store" },
+          { id: "emma", name: "Emma Store" },
+        ],
         status: {
           settings: {
             enabled: status.settings.enabled,
@@ -5692,6 +5693,7 @@ async function handleApi(req, res, url) {
             lastSyncAt: status.settings.lastSyncAt,
             lastSyncStatus: status.settings.lastSyncStatus,
           },
+          suppliers: status.suppliers,
         },
       });
     } catch (error) {
@@ -5702,10 +5704,6 @@ async function handleApi(req, res, url) {
 
   const digitalProductMatch = url.pathname.match(/^\/api\/digital-services\/products\/([^/]+)$/);
   if (req.method === "GET" && digitalProductMatch) {
-    const user = requireAuth(req, res, "user");
-    if (!user) {
-      return true;
-    }
     try {
       if (!digitalServicesService.getStatus().settings.enabled) {
         throw new Error("Digital Services is not available now.");
@@ -6576,10 +6574,12 @@ async function handleApi(req, res, url) {
     sendJson(res, 200, {
       settings: financialService.getDigitalServiceSettings(),
       supplier: akundingService.getPublicStatus(),
+      suppliers: digitalServicesService.getProviderStatuses(),
       summary: financialService.getDigitalServiceAdminSummary(),
       products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
       orders: financialService.listDigitalServiceOrders(admin, { limit: 300 }),
       apiBaseUrl: DEFAULT_AKUNDING_BASE_URL,
+      emmaApiBaseUrl: DEFAULT_EMMA_RESELLER_BASE_URL,
     });
     return true;
   }
@@ -6609,7 +6609,7 @@ async function handleApi(req, res, url) {
     }
     try {
       const settings = financialService.updateDigitalServiceSettings(admin, await readBody(req), getRequestMeta(req));
-      sendJson(res, 200, { settings, supplier: akundingService.getPublicStatus() });
+      sendJson(res, 200, { settings, supplier: akundingService.getPublicStatus(), suppliers: digitalServicesService.getProviderStatuses() });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -6637,6 +6637,7 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, {
         products,
         supplierAccount: supplierAccount ? { connected: true } : null,
+        suppliers: digitalServicesService.getProviderStatuses(),
         summary: financialService.getDigitalServiceAdminSummary(),
       });
     } catch (error) {
@@ -8535,7 +8536,8 @@ async function startServer() {
   financialService.scanDuplicateUserReviews({ persistChanges: false });
   vtuService = new VtuService({ financialService, logger: console });
   akundingService = new AkundingService({ logger: console });
-  digitalServicesService = new DigitalServicesService({ financialService, akundingService });
+  emmaResellerService = new EmmaResellerService({ logger: console });
+  digitalServicesService = new DigitalServicesService({ financialService, akundingService, emmaService: emmaResellerService });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

@@ -46,6 +46,10 @@ const DELIVERY_KEYS = [
 const SUCCESS_STATUSES = new Set(["success", "successful", "completed", "complete", "delivered", "fulfilled", "paid"]);
 const FAILURE_STATUSES = new Set(["failed", "failure", "cancelled", "canceled", "refunded", "rejected"]);
 const PROCESSING_STATUSES = new Set(["pending", "processing", "queued", "created", "submitted", "in_progress"]);
+const PROVIDER_LABELS = {
+  akunding: "Alaba Store",
+  emma: "Emma Store",
+};
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -261,6 +265,20 @@ function normalizeSupplierImageUrl(value, baseUrl = "https://akunding.shop") {
   }
 }
 
+function normalizeProviderKey(value = "akunding") {
+  const key = String(value || "akunding").trim().toLowerCase();
+  return key === "emma" ? "emma" : "akunding";
+}
+
+function getProviderStoreLabel(provider = "akunding") {
+  return PROVIDER_LABELS[normalizeProviderKey(provider)] || "Alaba Store";
+}
+
+function createProviderProductId(provider, supplierProductId) {
+  const id = String(supplierProductId || "").trim();
+  return normalizeProviderKey(provider) === "emma" ? `emma:${id}` : id;
+}
+
 function normalizeMarkupMode(value) {
   const mode = String(value || "percentage").trim().toLowerCase();
   return ["percentage", "fixed", "custom"].includes(mode) ? mode : "percentage";
@@ -336,37 +354,53 @@ function mergeSupplierPayloads(payloads = []) {
 }
 
 class DigitalServicesService {
-  constructor({ financialService, akundingService, clock = () => new Date().toISOString() } = {}) {
+  constructor({ financialService, akundingService, emmaService = null, clock = () => new Date().toISOString() } = {}) {
     this.financialService = financialService;
     this.akundingService = akundingService;
+    this.emmaService = emmaService;
     this.clock = clock;
+  }
+
+  getProviderService(provider = "akunding") {
+    return normalizeProviderKey(provider) === "emma" ? this.emmaService : this.akundingService;
+  }
+
+  getProviderStatuses() {
+    return {
+      akunding: this.akundingService?.getPublicStatus?.() || { configured: false },
+      emma: this.emmaService?.getPublicStatus?.() || { configured: false },
+    };
   }
 
   getStatus() {
     const settings = this.financialService.getDigitalServiceSettings();
-    const supplier = this.akundingService.getPublicStatus();
+    const suppliers = this.getProviderStatuses();
     return {
       settings,
-      supplier,
-      configured: settings.enabled && supplier.configured,
+      supplier: suppliers.akunding,
+      suppliers,
+      configured: settings.enabled && Object.values(suppliers).some((supplier) => supplier.configured),
     };
   }
 
-  normalizeSupplierProduct(raw = {}) {
+  normalizeSupplierProduct(raw = {}, { provider = "akunding", service = this.getProviderService(provider) } = {}) {
+    const normalizedProvider = normalizeProviderKey(provider);
     const supplierProductId = normalizeProductId(raw);
     return {
-      id: supplierProductId,
+      id: createProviderProductId(normalizedProvider, supplierProductId),
       supplierProductId,
-      provider: "akunding",
+      provider: normalizedProvider,
+      storeKey: normalizedProvider === "emma" ? "emma" : "alaba",
+      storeName: getProviderStoreLabel(normalizedProvider),
       name: normalizeName(raw),
       description: normalizeDescription(raw),
-      category: normalizeCategory(raw),
+      category: normalizeCategory(raw) || getProviderStoreLabel(normalizedProvider),
       currency: normalizeCurrency(raw),
       providerCost: normalizeProviderCost(raw),
       stock: normalizeStock(raw),
       providerStatus: normalizeStatus(raw),
       available: isProductAvailable(raw),
-      imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw), this.akundingService.baseUrl),
+      imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw), service?.baseUrl || "https://akunding.shop"),
       deliveryLabel: normalizeText(firstValue(raw, ["delivery", "delivery_time", "delivery_label", "duration"]), "After purchase"),
       planLabel: normalizeText(firstValue(raw, ["plan", "duration", "validity"]), ""),
       raw,
@@ -379,11 +413,27 @@ class DigitalServicesService {
     if (!settings.enabled && !force) {
       return this.financialService.listDigitalServiceProducts();
     }
-    const products = await this.akundingService.listProducts({ includeOutOfStock: true });
-    const normalized = extractSupplierRows(products)
-      .map((product) => this.normalizeSupplierProduct(extractSupplierRecord(product)))
-      .filter((product) => product.supplierProductId);
-    return this.financialService.replaceDigitalServiceProducts(normalized, { provider: "akunding" });
+    const synced = [];
+    const errors = [];
+    for (const provider of ["akunding", "emma"]) {
+      const service = this.getProviderService(provider);
+      if (!service?.isConfigured?.()) {
+        continue;
+      }
+      try {
+        const products = await service.listProducts({ includeOutOfStock: true });
+        const normalized = extractSupplierRows(products)
+          .map((product) => this.normalizeSupplierProduct(extractSupplierRecord(product), { provider, service }))
+          .filter((product) => product.supplierProductId);
+        synced.push(...this.financialService.replaceDigitalServiceProducts(normalized, { provider: normalizeProviderKey(provider) }));
+      } catch (error) {
+        errors.push(`${getProviderStoreLabel(provider)}: ${error.message}`);
+      }
+    }
+    if (!synced.length && errors.length) {
+      throw new Error(errors.join(" | "));
+    }
+    return this.financialService.listDigitalServiceProducts({ includeInactive: true, admin: true });
   }
 
   async refreshProduct(productId) {
@@ -391,13 +441,15 @@ class DigitalServicesService {
     if (!settings.enabled) {
       throw new Error("Digital Services is not available now.");
     }
-    if (!this.akundingService.isConfigured()) {
+    const current = this.financialService.getDigitalServiceProduct(productId, { admin: true });
+    const provider = normalizeProviderKey(current.provider);
+    const service = this.getProviderService(provider);
+    if (!service?.isConfigured?.()) {
       throw new Error("Digital Services supplier is not configured.");
     }
-    const current = this.financialService.getDigitalServiceProduct(productId, { admin: true });
     const supplierProductId = current.supplierProductId || current.id || productId;
-    const payload = await this.akundingService.getProduct(supplierProductId);
-    const normalized = this.normalizeSupplierProduct(extractSupplierRecord(payload));
+    const payload = await service.getProduct(supplierProductId);
+    const normalized = this.normalizeSupplierProduct(extractSupplierRecord(payload), { provider, service });
     if (!normalized.supplierProductId) {
       normalized.id = current.id;
       normalized.supplierProductId = supplierProductId;
@@ -406,10 +458,10 @@ class DigitalServicesService {
       ...normalized,
       id: current.id,
       supplierProductId,
-    }, { provider: "akunding" });
+    }, { provider });
   }
 
-  async listProducts({ query = "", category = "", force = false } = {}) {
+  async listProducts({ query = "", category = "", store = "", force = false } = {}) {
     const settings = this.financialService.getDigitalServiceSettings();
     if (!settings.enabled) {
       return [];
@@ -417,10 +469,11 @@ class DigitalServicesService {
     let products = this.financialService.listDigitalServiceProducts({ includeInactive: false });
     const lastSync = products.reduce((latest, product) => Math.max(latest, Date.parse(product.syncedAt || "") || 0), 0);
     const stale = !lastSync || Date.now() - lastSync > PRODUCT_CACHE_TTL_MS;
-    if (settings.enabled && this.akundingService.isConfigured() && (force || stale || !products.length)) {
+    const hasConfiguredSupplier = Object.values(this.getProviderStatuses()).some((supplier) => supplier.configured);
+    if (settings.enabled && hasConfiguredSupplier && (force || stale || !products.length)) {
       products = await this.syncProducts({ force });
     }
-    return this.financialService.listDigitalServiceProducts({ query, category, includeInactive: false });
+    return this.financialService.listDigitalServiceProducts({ query, category, store, includeInactive: false });
   }
 
   getProduct(productId) {
@@ -432,18 +485,20 @@ class DigitalServicesService {
     if (!settings.enabled) {
       throw new Error("Digital Services is not available now.");
     }
-    if (!this.akundingService.isConfigured()) {
+    const product = this.financialService.getDigitalServiceProduct(input.productId, { admin: true });
+    const provider = normalizeProviderKey(product.provider);
+    const service = this.getProviderService(provider);
+    if (!service?.isConfigured?.()) {
       throw new Error("Digital Services supplier is not configured.");
     }
-    const product = this.financialService.getDigitalServiceProduct(input.productId, { admin: true });
     const quantity = Math.max(1, Math.min(Math.floor(Number(input.quantity || 1)), 1000));
     const order = this.financialService.createDigitalServiceOrder(user, {
       product,
       quantity,
     }, requestMeta);
     try {
-      const providerResponse = await this.akundingService.createOrder({
-        productId: Number(product.supplierProductId),
+      const providerResponse = await service.createOrder({
+        productId: product.supplierProductId,
         quantity,
         idempotencyKey: order.requestId,
       });
@@ -457,10 +512,10 @@ class DigitalServicesService {
       if (extractDeliveryPayload(error.payload)) {
         return this.applySupplierResult(order.id, error.payload, user, requestMeta);
       }
-      const isFinalFailure = Number(error.statusCode || 0) > 0 && Number(error.statusCode || 0) < 500 && error.code !== "AKUNDING_TIMEOUT";
+      const isFinalFailure = Number(error.statusCode || 0) > 0 && Number(error.statusCode || 0) < 500 && !["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code);
       const payload = {
         status: isFinalFailure ? "failed" : "processing",
-        supplierStatus: error.code === "AKUNDING_TIMEOUT" ? "unknown" : "error",
+        supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code) ? "unknown" : "error",
         message: isFinalFailure ? error.message : "Supplier status is pending confirmation.",
       };
       return this.financialService.applyDigitalServiceOrderResult(order.id, payload, user, requestMeta);
@@ -510,16 +565,17 @@ class DigitalServicesService {
       }
     };
 
-    if (typeof this.akundingService.getOrder === "function") {
-      await trySupplierCall(() => this.akundingService.getOrder(supplierOrderId));
+    const service = this.getProviderService(order.provider);
+    if (typeof service?.getOrder === "function") {
+      await trySupplierCall(() => service.getOrder(supplierOrderId));
     }
-    if (typeof this.akundingService.exportOrder === "function") {
-      await trySupplierCall(() => this.akundingService.exportOrder(supplierOrderId));
+    if (typeof service?.exportOrder === "function") {
+      await trySupplierCall(() => service.exportOrder(supplierOrderId));
     }
 
-    if (!payloads.some((payload) => extractDeliveryPayload(payload)) && typeof this.akundingService.listOrders === "function") {
+    if (!payloads.some((payload) => extractDeliveryPayload(payload)) && typeof service?.listOrders === "function") {
       await trySupplierCall(async () => {
-        const ordersPayload = await this.akundingService.listOrders({ limit: 200 });
+        const ordersPayload = await service.listOrders({ limit: 200 });
         const match = extractSupplierRows(ordersPayload).find((row) => {
           const record = extractSupplierRecord(row);
           return String(extractSupplierOrderId(record) || record.id || "").trim() === supplierOrderId;

@@ -7,6 +7,7 @@ const { VtuService } = require("../services/vtuService");
 
 function createHarness(fetchImpl) {
   let id = 0;
+  const now = new Date().toISOString();
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
   const db = {
@@ -23,7 +24,7 @@ function createHarness(fetchImpl) {
     db,
     persist: () => undefined,
     idGenerator: () => `id-${++id}`,
-    clock: () => "2026-09-06T10:00:00.000Z",
+    clock: () => now,
   });
   financialService.ensureState();
   financialService.updateVtuSettings(db.users[0], {
@@ -46,7 +47,7 @@ function createHarness(fetchImpl) {
     service: new VtuService({
       financialService,
       fetchImpl,
-      clock: () => "2026-09-06T10:00:00.000Z",
+      clock: () => now,
       logger: { warn: () => undefined, error: () => undefined },
     }),
   };

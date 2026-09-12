@@ -310,7 +310,7 @@ function defaultSettings() {
       enabled: false,
       globalMarkupPercent: getEnvValue("AKUNDING_GLOBAL_MARKUP_PERCENT") || DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT,
       fallbackImageUrl: DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
-      allowedImageDomains: ["akunding.shop"],
+      allowedImageDomains: ["akunding.shop", "ssondigitalworks.online"],
       productOverrides: {},
       lastSyncAt: null,
       lastSyncStatus: "",
@@ -479,7 +479,7 @@ class FinancialService {
   normalizeDigitalServiceSettings(settings = {}) {
     const allowedImageDomains = Array.isArray(settings.allowedImageDomains)
       ? settings.allowedImageDomains
-      : String(settings.allowedImageDomains || "akunding.shop")
+      : String(settings.allowedImageDomains || "akunding.shop, ssondigitalworks.online")
           .split(",")
           .map((item) => item.trim())
           .filter(Boolean);
@@ -509,7 +509,7 @@ class FinancialService {
       enabled: settings.enabled !== undefined ? normalizeBoolean(settings.enabled) : false,
       globalMarkupPercent: normalizePercent(settings.globalMarkupPercent ?? DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT, "Digital Services markup"),
       fallbackImageUrl: settings.fallbackImageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
-      allowedImageDomains: allowedImageDomains.length ? allowedImageDomains : ["akunding.shop"],
+      allowedImageDomains: allowedImageDomains.length ? allowedImageDomains : ["akunding.shop", "ssondigitalworks.online"],
       productOverrides,
       lastSyncAt: settings.lastSyncAt || null,
       lastSyncStatus: settings.lastSyncStatus || "",
@@ -4628,6 +4628,8 @@ class FinancialService {
       name: override.displayName || product.name || "Digital Service",
       description: product.description || "",
       category: override.displayCategory || product.category || "Digital",
+      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : "alaba"),
+      storeName: product.storeName || (product.provider === "emma" ? "Emma Store" : "Alaba Store"),
       currency: "NGN",
       price: pricing.sellingPrice,
       sellingPrice: pricing.sellingPrice,
@@ -4654,13 +4656,15 @@ class FinancialService {
     return response;
   }
 
-  listDigitalServiceProducts({ query = "", category = "", includeInactive = false, admin = false } = {}) {
+  listDigitalServiceProducts({ query = "", category = "", store = "", includeInactive = false, admin = false } = {}) {
     this.ensureState();
     const normalizedQuery = String(query || "").trim().toLowerCase();
     const normalizedCategory = String(category || "").trim().toLowerCase();
+    const normalizedStore = String(store || "").trim().toLowerCase();
     return this.db.digitalServiceProducts
       .map((product) => this.sanitizeDigitalServiceProduct(product, { admin }))
       .filter((product) => includeInactive || product.available)
+      .filter((product) => !normalizedStore || String(product.storeKey || product.provider || "").toLowerCase() === normalizedStore)
       .filter((product) => !normalizedCategory || String(product.category || "").toLowerCase() === normalizedCategory)
       .filter((product) => {
         if (!normalizedQuery) {
@@ -4687,24 +4691,32 @@ class FinancialService {
 
   replaceDigitalServiceProducts(products = [], { provider = "akunding" } = {}) {
     this.ensureState();
+    const providerKey = String(provider || "akunding").trim().toLowerCase();
     const normalizedProducts = products
       .map((product) => ({
         ...product,
         id: String(product.id || product.supplierProductId || "").trim(),
         supplierProductId: String(product.supplierProductId || product.id || "").trim(),
-        provider,
+        provider: providerKey,
+        storeKey: product.storeKey || (providerKey === "emma" ? "emma" : "alaba"),
+        storeName: product.storeName || (providerKey === "emma" ? "Emma Store" : "Alaba Store"),
         syncedAt: product.syncedAt || this.clock(),
       }))
       .filter((product) => product.id && product.supplierProductId);
     const nextById = new Map(normalizedProducts.map((product) => [product.id, product]));
     for (const existing of this.db.digitalServiceProducts) {
-      if (!nextById.has(existing.id)) {
+      if (String(existing.provider || "akunding").toLowerCase() === providerKey && !nextById.has(existing.id)) {
         nextById.set(existing.id, {
           ...existing,
           available: false,
           providerStatus: "unavailable",
           syncedAt: this.clock(),
         });
+      }
+    }
+    for (const existing of this.db.digitalServiceProducts) {
+      if (String(existing.provider || "akunding").toLowerCase() !== providerKey && !nextById.has(existing.id)) {
+        nextById.set(existing.id, existing);
       }
     }
     this.db.digitalServiceProducts = [...nextById.values()];
@@ -4714,11 +4726,14 @@ class FinancialService {
 
   upsertDigitalServiceProduct(product = {}, { provider = "akunding" } = {}) {
     this.ensureState();
+    const providerKey = String(provider || "akunding").trim().toLowerCase();
     const normalized = {
       ...product,
       id: String(product.id || product.supplierProductId || "").trim(),
       supplierProductId: String(product.supplierProductId || product.id || "").trim(),
-      provider,
+      provider: providerKey,
+      storeKey: product.storeKey || (providerKey === "emma" ? "emma" : "alaba"),
+      storeName: product.storeName || (providerKey === "emma" ? "Emma Store" : "Alaba Store"),
       syncedAt: product.syncedAt || this.clock(),
     };
     if (!normalized.id || !normalized.supplierProductId) {
@@ -4876,7 +4891,9 @@ class FinancialService {
       id: this.idGenerator(12),
       userId: user.id,
       requestId,
-      provider: "akunding",
+      provider: product.provider || "akunding",
+      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : "alaba"),
+      storeName: product.storeName || (product.provider === "emma" ? "Emma Store" : "Alaba Store"),
       productId: product.id,
       supplierProductId: product.supplierProductId || product.id,
       productName: product.name,

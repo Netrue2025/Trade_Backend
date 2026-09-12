@@ -1821,6 +1821,50 @@ test("admin-enabled digital service product is visible in user store", () => {
   assert.equal(product.supplierAvailable, false);
 });
 
+test("digital service sync preserves products from other stores", () => {
+  const { service } = createHarness();
+  service.replaceDigitalServiceProducts([
+    {
+      id: "94",
+      supplierProductId: "94",
+      provider: "akunding",
+      storeKey: "alaba",
+      storeName: "Alaba Store",
+      name: "Gemini Pro",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "2500",
+      available: true,
+      stock: 10,
+    },
+  ], { provider: "akunding" });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "emma:94",
+      supplierProductId: "94",
+      provider: "emma",
+      storeKey: "emma",
+      storeName: "Emma Store",
+      name: "Emma Canva",
+      category: "Design",
+      currency: "NGN",
+      providerCost: "1500",
+      available: true,
+      stock: 5,
+    },
+  ], { provider: "emma" });
+
+  const allProducts = service.listDigitalServiceProducts({ includeInactive: true, admin: true });
+  const alabaProducts = service.listDigitalServiceProducts({ store: "alaba", includeInactive: true, admin: true });
+  const emmaProducts = service.listDigitalServiceProducts({ store: "emma", includeInactive: true, admin: true });
+
+  assert.equal(allProducts.length, 2);
+  assert.equal(alabaProducts.length, 1);
+  assert.equal(alabaProducts[0].id, "94");
+  assert.equal(emmaProducts.length, 1);
+  assert.equal(emmaProducts[0].id, "emma:94");
+});
+
 test("digital service order reserves wallet and delivery consumes reserve once", () => {
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
