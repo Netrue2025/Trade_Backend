@@ -16,10 +16,8 @@ const DEFAULT_FRONTEND_ORIGIN = "https://netruefi.org";
 const DEFAULT_FRONTEND_ORIGINS = [
   DEFAULT_FRONTEND_ORIGIN,
   "https://www.netruefi.org",
-  "https://trade-frontend-rg2z.onrender.com",
 ];
 const DEFAULT_BACKEND_ORIGIN = "https://tradebackend-production-8530.up.railway.app";
-const RENDER_FRONTEND_ORIGIN_PATTERN = /^https:\/\/trade-frontend-[a-z0-9-]+\.onrender\.com$/i;
 
 function loadEnvFile() {
   const envPath = path.join(rootDir, ".env");
@@ -778,7 +776,7 @@ function isAllowedCorsOrigin(origin) {
     return false;
   }
 
-  return getAllowedCorsOrigins().includes(origin) || RENDER_FRONTEND_ORIGIN_PATTERN.test(origin);
+  return getAllowedCorsOrigins().includes(origin);
 }
 
 function buildCorsHeaders(req) {
@@ -868,14 +866,11 @@ function getFrontendUrl() {
   if (!configured) {
     return DEFAULT_FRONTEND_ORIGIN;
   }
-  if (RENDER_FRONTEND_ORIGIN_PATTERN.test(configured) && configured !== DEFAULT_FRONTEND_ORIGIN) {
-    return DEFAULT_FRONTEND_ORIGIN;
-  }
   return configured;
 }
 
 function getBackendUrl() {
-  const explicit = normalizeOrigin(getEnvValue("BACKEND_URL", "RENDER_EXTERNAL_URL") || "");
+  const explicit = normalizeOrigin(getEnvValue("BACKEND_URL") || "");
   if (explicit) {
     return explicit;
   }

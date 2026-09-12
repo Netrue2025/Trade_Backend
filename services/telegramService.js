@@ -52,8 +52,7 @@ function shouldEnableTradeBotPolling() {
     return isTrue(explicit);
   }
 
-  const runningOnRender = !!getEnvValue("RENDER", "RENDER_EXTERNAL_URL");
-  return !runningOnRender;
+  return true;
 }
 
 class TelegramService {
