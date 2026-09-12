@@ -3028,8 +3028,8 @@ function startTradeReconciliation(force = false) {
   return tradeReconcilePromise;
 }
 
-async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS) {
-  const promise = startTradeReconciliation();
+async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS, { force = false } = {}) {
+  const promise = startTradeReconciliation(force);
   if (!promise) {
     return;
   }
@@ -7959,7 +7959,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(user));
-    await waitForTradeReconciliation();
+    await waitForTradeReconciliation(4000, { force: true });
     await settleInactiveTradeInvestmentsForUsers({
       userId: user.role === "user" ? user.id : "",
       reason: "TRADE_CLOSED",
