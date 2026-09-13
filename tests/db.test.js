@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { mergeMongoSnapshots, shouldUseMongo } = require("../lib/db");
+const { __testing, mergeMongoSnapshots, shouldUseMongo } = require("../lib/db");
 
 const mongoEnvKeys = [
   "MONGODB_URI",
@@ -38,12 +38,97 @@ function withMongoEnv(envPatch, callback) {
   }
 }
 
+function withEnv(keys, envPatch, callback) {
+  const previous = {};
+  for (const key of keys) {
+    previous[key] = process.env[key];
+    delete process.env[key];
+  }
+  Object.assign(process.env, envPatch);
+  try {
+    return callback();
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  }
+}
+
 test("mongo detection accepts lowercase Railway URI alias", () => {
   withMongoEnv({
     mongo_URI: "mongodb+srv://trade_mvp:trade123@cluster0.x8eukch.mongodb.net/trade_mvp?appName=Cluster0",
   }, () => {
     assert.equal(shouldUseMongo(), true);
   });
+});
+
+test("mongo client options use production-safe default timeouts", () => {
+  withEnv([
+    "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
+    "MONGODB_CONNECT_TIMEOUT_MS",
+    "MONGODB_SOCKET_TIMEOUT_MS",
+  ], {}, () => {
+    assert.deepEqual(__testing.getMongoClientOptions(), {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+      socketTimeoutMS: 30000,
+      maxPoolSize: 10,
+    });
+  });
+});
+
+test("mongo client options do not allow 1000ms production server selection", () => {
+  withEnv([
+    "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
+    "MONGODB_CONNECT_TIMEOUT_MS",
+    "MONGODB_SOCKET_TIMEOUT_MS",
+  ], {
+    MONGODB_SERVER_SELECTION_TIMEOUT_MS: "1000",
+    MONGODB_CONNECT_TIMEOUT_MS: "1000",
+    MONGODB_SOCKET_TIMEOUT_MS: "5000",
+  }, () => {
+    assert.deepEqual(__testing.getMongoClientOptions(), {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+      socketTimeoutMS: 30000,
+      maxPoolSize: 10,
+    });
+  });
+});
+
+test("app-state full snapshot read timeout is not shorter than Mongo server selection", () => {
+  withEnv(["MONGODB_APP_STATE_READ_TIMEOUT_MS"], {}, () => {
+    assert.equal(__testing.getAppStateReadTimeoutMs(), 20000);
+  });
+  withEnv(["MONGODB_APP_STATE_READ_TIMEOUT_MS"], {
+    MONGODB_APP_STATE_READ_TIMEOUT_MS: "8000",
+  }, () => {
+    assert.equal(__testing.getAppStateReadTimeoutMs(), 10000);
+  });
+});
+
+test("full snapshot read falls back to projected field reads on read failure", async () => {
+  let callCount = 0;
+  const collection = {
+    async findOne(_filter, options = {}) {
+      callCount += 1;
+      if (!options.projection) {
+        throw new Error("simulated slow full read");
+      }
+      const field = Object.keys(options.projection).find((key) => key !== "_id");
+      return { _id: "trade-mvp-state", [field]: field === "users" ? [{ id: "user-1" }] : [] };
+    },
+  };
+
+  const snapshot = await __testing.loadMongoSnapshot(collection);
+
+  assert.equal(callCount > 1, true);
+  assert.equal(snapshot._id, "trade-mvp-state");
+  assert.deepEqual(snapshot.users, [{ id: "user-1" }]);
 });
 
 test("mongo snapshot merge preserves newer wallet balances from current state", () => {
