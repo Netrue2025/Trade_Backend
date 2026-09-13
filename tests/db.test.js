@@ -293,6 +293,62 @@ test("transaction added during active save is included in subsequent snapshot", 
   assert.equal(saves[1].transactions[0].id, "txn-1");
 });
 
+test("coalesced follow-up save persists final C state for financial arrays", async () => {
+  const releaseFirst = deferred();
+  const saves = [];
+  const db = {
+    wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "A", updatedAt: "2026-09-13T10:00:00.000Z" }],
+    transactions: [{ id: "txn-a", amount: "A", createdAt: "2026-09-13T10:00:00.000Z" }],
+    deposits: [{ id: "dep-a", amount: "A", createdAt: "2026-09-13T10:00:00.000Z" }],
+    withdrawals: [{ id: "wd-a", amount: "A", createdAt: "2026-09-13T10:00:00.000Z" }],
+    referrals: [{ id: "ref-a", rewardAmount: "A", createdAt: "2026-09-13T10:00:00.000Z" }],
+    digitalServiceOrders: [{ id: "order-a", amountCharged: "A", createdAt: "2026-09-13T10:00:00.000Z" }],
+  };
+  const controller = __testing.createAppStateSaveController({
+    logger: createMemoryLogger(),
+    isMongoEnabled: () => true,
+    getCollection: async () => ({}),
+    saveMongo: async (_collection, snapshot) => {
+      saves.push(JSON.parse(JSON.stringify(snapshot)));
+      if (saves.length === 1) {
+        await releaseFirst.promise;
+      }
+    },
+    getSlowWarningMs: () => 1000,
+  });
+
+  const firstSave = controller.requestSave(db);
+  await waitFor(() => saves.length === 1, "first save start");
+  db.wallets[0] = { ...db.wallets[0], availableBalance: "B", updatedAt: "2026-09-13T10:01:00.000Z" };
+  db.transactions = [{ id: "txn-b", amount: "B", createdAt: "2026-09-13T10:01:00.000Z" }];
+  db.deposits = [{ id: "dep-b", amount: "B", createdAt: "2026-09-13T10:01:00.000Z" }];
+  db.withdrawals = [{ id: "wd-b", amount: "B", createdAt: "2026-09-13T10:01:00.000Z" }];
+  db.referrals = [{ id: "ref-b", rewardAmount: "B", createdAt: "2026-09-13T10:01:00.000Z" }];
+  db.digitalServiceOrders = [{ id: "order-b", amountCharged: "B", createdAt: "2026-09-13T10:01:00.000Z" }];
+  const secondRequest = controller.requestSave(db);
+
+  db.wallets[0] = { ...db.wallets[0], availableBalance: "C", updatedAt: "2026-09-13T10:02:00.000Z" };
+  db.transactions = [{ id: "txn-c", amount: "C", createdAt: "2026-09-13T10:02:00.000Z" }];
+  db.deposits = [{ id: "dep-c", amount: "C", createdAt: "2026-09-13T10:02:00.000Z" }];
+  db.withdrawals = [{ id: "wd-c", amount: "C", createdAt: "2026-09-13T10:02:00.000Z" }];
+  db.referrals = [{ id: "ref-c", rewardAmount: "C", createdAt: "2026-09-13T10:02:00.000Z" }];
+  db.digitalServiceOrders = [{ id: "order-c", amountCharged: "C", createdAt: "2026-09-13T10:02:00.000Z" }];
+  const thirdRequest = controller.requestSave(db);
+
+  releaseFirst.resolve();
+  await firstSave;
+  await Promise.allSettled([secondRequest, thirdRequest]);
+
+  assert.equal(saves.length, 2);
+  assert.equal(saves[0].wallets[0].availableBalance, "A");
+  assert.equal(saves[1].wallets[0].availableBalance, "C");
+  assert.equal(saves[1].transactions[0].id, "txn-c");
+  assert.equal(saves[1].deposits[0].id, "dep-c");
+  assert.equal(saves[1].withdrawals[0].id, "wd-c");
+  assert.equal(saves[1].referrals[0].id, "ref-c");
+  assert.equal(saves[1].digitalServiceOrders[0].id, "order-c");
+});
+
 test("slow save warning does not release the save lock before Mongo operation settles", async () => {
   const releaseFirst = deferred();
   const saves = [];
@@ -372,6 +428,173 @@ test("trade learning remains disabled by default", async () => {
     const result = await service.recordTrade({ id: "trade-1" });
     assert.equal(result.skipped, true);
     assert.equal(result.reason, "trade_learning_disabled");
+  });
+});
+
+test("non-backup app-state save skips pre-save read and writes latest owned fields", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+    "MONGODB_APP_STATE_FULL_OPERATIONS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.markBackupThrottleNow();
+    let findOneCalls = 0;
+    const updates = [];
+    const collection = {
+      async findOne() {
+        findOneCalls += 1;
+        throw new Error("pre-save read should not run");
+      },
+      async updateOne(filter, update, options) {
+        updates.push({ filter, update, options });
+        return { acknowledged: true, modifiedCount: 1 };
+      },
+    };
+    const latest = {
+      wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "3000", updatedAt: "2026-09-13T11:00:00.000Z" }],
+      transactions: [{ id: "txn-latest", amount: "-100", createdAt: "2026-09-13T11:00:00.000Z" }],
+      deposits: [{ id: "dep-latest", amount: "1000", createdAt: "2026-09-13T11:00:00.000Z" }],
+      withdrawals: [{ id: "wd-latest", amount: "500", createdAt: "2026-09-13T11:00:00.000Z" }],
+      referrals: [{ id: "ref-latest", rewardAmount: "100", createdAt: "2026-09-13T11:00:00.000Z" }],
+      digitalServiceOrders: [{ id: "order-latest", amountCharged: "2500", createdAt: "2026-09-13T11:00:00.000Z" }],
+    };
+
+    await __testing.saveMongoSnapshot(collection, latest, { logger: createMemoryLogger() });
+
+    assert.equal(findOneCalls, 0);
+    assert.equal(updates.length, 1);
+    assert.deepEqual(updates[0].filter, { _id: "trade-mvp-state" });
+    assert.equal(updates[0].options.upsert, true);
+    assert.equal(updates[0].update.$set.wallets[0].availableBalance, "3000");
+    assert.equal(updates[0].update.$set.transactions[0].id, "txn-latest");
+    assert.equal(updates[0].update.$set.deposits[0].id, "dep-latest");
+    assert.equal(updates[0].update.$set.withdrawals[0].id, "wd-latest");
+    assert.equal(updates[0].update.$set.referrals[0].id, "ref-latest");
+    assert.equal(updates[0].update.$set.digitalServiceOrders[0].id, "order-latest");
+  });
+});
+
+test("non-backup app-state save uses $set and does not remove unknown top-level fields", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+    "MONGODB_APP_STATE_FULL_OPERATIONS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.markBackupThrottleNow();
+    const updates = [];
+    const collection = {
+      async findOne() {
+        throw new Error("pre-save read should not run");
+      },
+      async updateOne(filter, update, options) {
+        updates.push({ filter, update, options });
+        return { acknowledged: true };
+      },
+    };
+
+    await __testing.saveMongoSnapshot(collection, { wallets: [] }, { logger: createMemoryLogger() });
+
+    assert.equal(updates.length, 1);
+    assert.ok(updates[0].update.$set);
+    assert.equal(Object.prototype.hasOwnProperty.call(updates[0].update.$set, "someFutureField"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(updates[0].update, "$unset"), false);
+  });
+});
+
+test("backup-due app-state save reads previous state, merges, updates, and backs up previous state", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+    "MONGODB_APP_STATE_FULL_OPERATIONS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.resetBackupThrottle();
+    let findOneCalls = 0;
+    const updates = [];
+    const backups = [];
+    const previous = {
+      _id: "trade-mvp-state",
+      wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "9000", updatedAt: "2026-09-13T12:00:00.000Z" }],
+      transactions: [{ id: "txn-current", amount: "-50", createdAt: "2026-09-13T12:00:00.000Z" }],
+      systemSettings: {},
+    };
+    const incoming = {
+      wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "1000", updatedAt: "2026-09-13T10:00:00.000Z" }],
+      transactions: [{ id: "txn-incoming", amount: "-10", createdAt: "2026-09-13T10:00:00.000Z" }],
+      systemSettings: {},
+    };
+    const collection = {
+      async findOne() {
+        findOneCalls += 1;
+        return JSON.parse(JSON.stringify(previous));
+      },
+      async updateOne(filter, update, options) {
+        updates.push({ filter, update, options });
+        return { acknowledged: true };
+      },
+    };
+
+    await __testing.saveMongoSnapshot(collection, incoming, {
+      logger: createMemoryLogger(),
+      backupSnapshot: async (snapshot) => {
+        backups.push(JSON.parse(JSON.stringify(snapshot)));
+      },
+    });
+    await waitFor(() => backups.length === 1, "backup capture");
+
+    assert.equal(findOneCalls, 1);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].update.$set.wallets[0].availableBalance, "9000");
+    assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-current"), true);
+    assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-incoming"), true);
+    assert.equal(backups[0].wallets[0].availableBalance, "9000");
+    assert.equal(__testing.isMongoBackupDue(), false);
+  });
+});
+
+test("non-backup direct save reports update failure and controller recovers", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.markBackupThrottleNow();
+    let shouldFail = true;
+    const updates = [];
+    const controller = __testing.createAppStateSaveController({
+      logger: createMemoryLogger(),
+      isMongoEnabled: () => true,
+      getCollection: async () => ({
+        async findOne() {
+          throw new Error("pre-save read should not run");
+        },
+        async updateOne(_filter, update) {
+          updates.push(update);
+          if (shouldFail) {
+            throw new Error("simulated update failure");
+          }
+          return { acknowledged: true };
+        },
+      }),
+      getSlowWarningMs: () => 1000,
+    });
+
+    await assert.rejects(() => controller.requestSave({ wallets: [] }), /MongoDB app-state update failed: simulated update failure/);
+    shouldFail = false;
+    await controller.requestSave({ wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "10" }] });
+
+    assert.equal(updates.length, 2);
+    assert.equal(updates[1].$set.wallets[0].availableBalance, "10");
   });
 });
 
