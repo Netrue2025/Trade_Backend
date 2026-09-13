@@ -157,7 +157,20 @@ class TradeLearningService {
   }
 
   isEnabled() {
-    return !!this.mongoUri;
+    return parseBoolean(getEnvValue("TRADE_LEARNING_ENABLED"), false) && !!this.mongoUri;
+  }
+
+  getDisabledSummary(strategyType = "QUALITY_ERS") {
+    return {
+      enabled: false,
+      disabled: true,
+      reason: "TRADE_LEARNING_ENABLED is not true.",
+      strategyType: String(strategyType || "QUALITY_ERS").trim().toUpperCase() || "QUALITY_ERS",
+      sampleSize: 0,
+      winRate: 0,
+      averageProfitLoss: 0,
+      generatedAt: new Date().toISOString(),
+    };
   }
 
   shouldUseSharedAppMongo() {
@@ -224,7 +237,7 @@ class TradeLearningService {
 
   async init() {
     if (!this.isEnabled()) {
-      this.logger.warn("Trade learning service disabled: MongoDB is not configured.");
+      this.logger.warn("Trade learning service disabled. Set TRADE_LEARNING_ENABLED=true to enable adaptive learning writes.");
       return this;
     }
 
@@ -234,6 +247,9 @@ class TradeLearningService {
   }
 
   async recordTrade(tradeRecord = {}) {
+    if (!this.isEnabled()) {
+      return { ok: false, skipped: true, reason: "trade_learning_disabled" };
+    }
     const collection = await this.getCollection();
     if (!collection) {
       return { ok: false, skipped: true, reason: "mongo_disabled" };
@@ -269,6 +285,9 @@ class TradeLearningService {
   }
 
   async listTrades({ strategyType } = {}) {
+    if (!this.isEnabled()) {
+      return [];
+    }
     const collection = await this.getCollection();
     if (!collection) {
       return [];
@@ -285,6 +304,9 @@ class TradeLearningService {
 
   async analyzePerformance({ strategyType = "QUALITY_ERS", forceRefresh = false } = {}) {
     const normalizedStrategy = String(strategyType || "").trim().toUpperCase() || "QUALITY_ERS";
+    if (!this.isEnabled()) {
+      return this.getDisabledSummary(normalizedStrategy);
+    }
     const cacheKey = `analysis:${normalizedStrategy}`;
     const cached = this.cache.get(cacheKey);
     if (!forceRefresh && cached && Date.now() - cached.updatedAt < this.ttlMs) {
@@ -323,6 +345,14 @@ class TradeLearningService {
     const baseParameters = {
       ...defaults,
     };
+
+    if (!this.isEnabled()) {
+      return {
+        ...baseParameters,
+        adaptiveStrategyEnabled: false,
+        adaptiveSource: "trade_learning_disabled",
+      };
+    }
 
     const adaptiveEnabled = enabled === undefined
       ? parseBoolean(process.env.USE_ADAPTIVE_STRATEGY, false)
