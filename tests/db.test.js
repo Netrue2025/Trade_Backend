@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { __testing, mergeMongoSnapshots, shouldUseMongo } = require("../lib/db");
+const { __testing, mergeMongoSnapshots, saveDb, shouldUseMongo } = require("../lib/db");
 const { TradeLearningService } = require("../services/tradeLearning");
 
 const mongoEnvKeys = [
@@ -204,6 +204,154 @@ test("projected fallback preserves notifications and chatMessages", async () => 
 
   assert.deepEqual(snapshot.notifications, [{ id: "notification-1", userId: "admin", message: "Order ready" }]);
   assert.deepEqual(snapshot.chatMessages, [{ id: "chat-1", conversationUserId: "user-1", message: "Hello" }]);
+});
+
+test("startup refuses to bootstrap defaults when existing app_state cannot be read", async () => {
+  __testing.resetMongoAppStatePersistenceReady();
+  let insertCalled = false;
+  const collection = {
+    async findOne() {
+      return null;
+    },
+    async countDocuments() {
+      return 1;
+    },
+    async insertOne() {
+      insertCalled = true;
+    },
+  };
+
+  await assert.rejects(
+    () => __testing.loadDbFromMongoCollection(collection),
+    /existing app_state document could not be read safely/
+  );
+
+  assert.equal(insertCalled, false);
+  assert.equal(__testing.isMongoAppStatePersistenceReady(), false);
+});
+
+test("startup refuses to persist when projected fallback omits an app_state field", async () => {
+  __testing.resetMongoAppStatePersistenceReady();
+  let insertCalled = false;
+  const collection = {
+    async findOne(_filter, options = {}) {
+      if (!options.projection) {
+        throw new Error("simulated full read timeout");
+      }
+      const field = Object.keys(options.projection).find((key) => key !== "_id");
+      if (field === "transactions") {
+        return { _id: "trade-mvp-state" };
+      }
+      return { _id: "trade-mvp-state", [field]: [] };
+    },
+    async countDocuments() {
+      return 1;
+    },
+    async insertOne() {
+      insertCalled = true;
+    },
+  };
+
+  await assert.rejects(
+    () => __testing.loadDbFromMongoCollection(collection),
+    /existing app_state document could not be read safely/
+  );
+
+  assert.equal(insertCalled, false);
+  assert.equal(__testing.isMongoAppStatePersistenceReady(), false);
+});
+
+test("saveDb refuses Mongo writes before startup state is verified", async () => {
+  await withMongoEnv({
+    MONGODB_URI: "mongodb+srv://trade_mvp:trade123@cluster0.x8eukch.mongodb.net/trade_mvp?appName=Cluster0",
+  }, async () => {
+    __testing.resetMongoAppStatePersistenceReady();
+    await assert.rejects(
+      () => saveDb({ users: [] }),
+      /before startup state has been loaded and verified/
+    );
+  });
+});
+
+test("projected startup fallback preserves users roles wallets and financial history through save and reload", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.resetMongoAppStatePersistenceReady();
+    __testing.markBackupThrottleNow();
+    const baseline = __testing.normalizeDb({
+      users: Array.from({ length: 100 }, (_, index) => ({
+        id: `user-${index + 1}`,
+        email: `user-${index + 1}@example.com`,
+        role: index === 0 ? "admin" : "user",
+        createdAt: "2026-09-13T08:00:00.000Z",
+      })),
+      wallets: [{ userId: "user-2", currency: "NGN", availableBalance: "100", lockedBalance: "0", updatedAt: "2026-09-13T08:00:00.000Z" }],
+      transactions: [{ id: "txn-1", userId: "user-2", amount: "100", type: "DEPOSIT", createdAt: "2026-09-13T08:00:00.000Z" }],
+      deposits: [{ id: "dep-1", userId: "user-2", amount: "100", status: "APPROVED", createdAt: "2026-09-13T08:00:00.000Z" }],
+      withdrawals: [{ id: "wd-1", userId: "user-2", amount: "25", status: "SUCCESS", createdAt: "2026-09-13T08:00:00.000Z" }],
+      referrals: [{ id: "ref-1", referrerUserId: "user-2", referredUserId: "user-3", status: "REWARDED", createdAt: "2026-09-13T08:00:00.000Z" }],
+    });
+    let document = { _id: "trade-mvp-state", ...JSON.parse(JSON.stringify(baseline)) };
+    const collection = {
+      async findOne(_filter, options = {}) {
+        if (!options.projection) {
+          throw new Error("simulated full read timeout");
+        }
+        const field = Object.keys(options.projection).find((key) => key !== "_id");
+        return { _id: document._id, [field]: JSON.parse(JSON.stringify(document[field])) };
+      },
+      async countDocuments() {
+        return document ? 1 : 0;
+      },
+      async updateOne(_filter, update) {
+        document = {
+          ...document,
+          ...(update.$set || {}),
+        };
+        return { acknowledged: true };
+      },
+      async insertOne() {
+        throw new Error("insert should not be used for existing app_state");
+      },
+    };
+
+    const loaded = await __testing.loadDbFromMongoCollection(collection);
+    assert.equal(loaded.users.length, 100);
+    assert.equal(loaded.users[0].role, "admin");
+    assert.equal(loaded.wallets[0].availableBalance, "100");
+    assert.equal(loaded.transactions.length, 1);
+    assert.equal(loaded.deposits.length, 1);
+    assert.equal(loaded.withdrawals.length, 1);
+    assert.equal(loaded.referrals.length, 1);
+    assert.equal(__testing.isMongoAppStatePersistenceReady(), true);
+
+    loaded.users.push({
+      id: "user-101",
+      email: "user-101@example.com",
+      role: "user",
+      createdAt: "2026-09-13T09:00:00.000Z",
+    });
+    loaded.wallets[0] = { ...loaded.wallets[0], availableBalance: "150", updatedAt: "2026-09-13T09:00:00.000Z" };
+    loaded.transactions.unshift({ id: "txn-2", userId: "user-2", amount: "50", type: "DEPOSIT", createdAt: "2026-09-13T09:00:00.000Z" });
+
+    await __testing.saveMongoSnapshot(collection, loaded, { logger: createMemoryLogger() });
+    __testing.resetMongoAppStatePersistenceReady();
+    const reloaded = await __testing.loadDbFromMongoCollection(collection);
+
+    assert.equal(reloaded.users.length, 101);
+    assert.equal(reloaded.users.some((user) => user.id === "user-101"), true);
+    assert.equal(reloaded.users.find((user) => user.id === "user-1").role, "admin");
+    assert.equal(reloaded.wallets[0].availableBalance, "150");
+    assert.equal(reloaded.transactions.length, 2);
+    assert.equal(reloaded.deposits.length, 1);
+    assert.equal(reloaded.withdrawals.length, 1);
+    assert.equal(reloaded.referrals.length, 1);
+  });
 });
 
 test("projected fallback default concurrency is safer for M0", () => {
@@ -416,6 +564,16 @@ test("backup throttling remains functional", () => {
     __testing.resetBackupThrottle();
     assert.equal(__testing.shouldBackupMongoSnapshot(), true);
     assert.equal(__testing.shouldBackupMongoSnapshot(), false);
+  });
+});
+
+test("backup defaults keep five snapshots every six hours", () => {
+  withEnv([
+    "MONGODB_APP_STATE_BACKUP_LIMIT",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+  ], {}, () => {
+    assert.equal(__testing.getMongoBackupLimit(), 5);
+    assert.equal(__testing.getMongoBackupIntervalMs(), 21600000);
   });
 });
 

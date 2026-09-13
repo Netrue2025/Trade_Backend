@@ -2336,3 +2336,129 @@ test("admin can delete selected finance history records", () => {
   assert.equal(service.listDeposits(admin).some((item) => item.id === deposit.id), false);
   assert.equal(service.listTransactions(admin).some((item) => item.id === transactionId), false);
 });
+
+test("48-hour cleanup deletes only disposable history older than cutoff", () => {
+  let persistCount = 0;
+  const db = {
+    users: [
+      { id: "admin-1", role: "admin", name: "Admin" },
+      { id: "user-1", role: "user", name: "Ada" },
+    ],
+    wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "5000", lockedBalance: "0" }],
+    transactions: [{ id: "txn-pnl", userId: "user-1", type: "TRADING_PROFIT", amount: "250", createdAt: "2026-08-20T10:00:00.000Z" }],
+    deposits: [{ id: "dep-old", userId: "user-1", amount: "1000", status: "APPROVED", createdAt: "2026-08-20T10:00:00.000Z" }],
+    withdrawals: [{ id: "wd-old", userId: "user-1", amount: "500", status: "SUCCESS", createdAt: "2026-08-20T10:00:00.000Z" }],
+    referrals: [{ id: "ref-old", referrerUserId: "user-1", referredUserId: "user-2", createdAt: "2026-08-20T10:00:00.000Z" }],
+    vtuTransactions: [{ id: "vtu-old", userId: "user-1", createdAt: "2026-08-20T10:00:00.000Z" }],
+    digitalServiceOrders: [{ id: "order-old", userId: "user-1", createdAt: "2026-08-20T10:00:00.000Z" }],
+    dailyPerformances: [{ id: "pnl-old", date: "2026-08-20", createdAt: "2026-08-20T10:00:00.000Z" }],
+    auditLogs: [{ id: "audit-old", createdAt: "2026-08-20T10:00:00.000Z" }],
+    webhookEvents: [{ id: "webhook-old", createdAt: "2026-08-20T10:00:00.000Z" }],
+    notifications: [
+      { id: "notice-old", userId: "user-1", createdAt: "2026-08-28T09:58:59.000Z" },
+      { id: "notice-boundary", userId: "user-1", createdAt: "2026-08-28T10:00:00.000Z" },
+      { id: "notice-recent", userId: "user-1", createdAt: "2026-08-28T10:01:00.000Z" },
+      { id: "notice-malformed", userId: "user-1", createdAt: "not-a-date" },
+    ],
+    chatMessages: [
+      { id: "chat-old", createdAt: "2026-08-28T09:58:59.000Z" },
+      { id: "chat-boundary", createdAt: "2026-08-28T10:00:00.000Z" },
+      { id: "chat-malformed", createdAt: "invalid" },
+    ],
+    pushNotificationEvents: [
+      { id: "push-old", createdAt: "2026-08-28T09:58:59.000Z" },
+      { id: "push-recent", createdAt: "2026-08-28T10:01:00.000Z" },
+    ],
+    strategyLogs: [
+      { id: "strategy-old", timestamp: "2026-08-28T09:58:59.000Z" },
+      { id: "strategy-recent", timestamp: "2026-08-28T10:01:00.000Z" },
+    ],
+    signals: [
+      { id: "signal-old-expired", status: "EXPIRED", closedAt: "2026-08-28T09:58:59.000Z" },
+      { id: "signal-old-active", status: "ACTIVE", createdAt: "2026-08-28T09:58:59.000Z" },
+      { id: "signal-recent-expired", status: "EXPIRED", closedAt: "2026-08-28T10:01:00.000Z" },
+    ],
+    sessions: [
+      { id: "session-old", expiresAt: "2026-08-28T09:58:59.000Z" },
+      { id: "session-boundary", expiresAt: "2026-08-28T10:00:00.000Z" },
+    ],
+  };
+  const service = new FinancialService({
+    db,
+    persist: () => {
+      persistCount += 1;
+    },
+    clock: () => "2026-08-30T10:00:00.000Z",
+    idGenerator: () => "cleanup-id",
+  });
+  service.ensureState();
+
+  const result = service.cleanupDisposableHistory(db.users[0], { confirm: true });
+
+  assert.deepEqual(result.deleted, {
+    notifications: 1,
+    chatMessages: 1,
+    pushNotificationEvents: 1,
+    strategyLogs: 1,
+    expiredSessions: 1,
+  });
+  assert.equal(db.notifications.some((item) => item.id === "notice-old"), false);
+  assert.equal(db.notifications.some((item) => item.id === "notice-boundary"), true);
+  assert.equal(db.notifications.some((item) => item.id === "notice-malformed"), true);
+  assert.equal(db.chatMessages.some((item) => item.id === "chat-boundary"), true);
+  assert.equal(db.pushNotificationEvents.some((item) => item.id === "push-recent"), true);
+  assert.equal(db.strategyLogs.some((item) => item.id === "strategy-recent"), true);
+  assert.equal(db.signals.some((item) => item.id === "signal-old-expired"), true);
+  assert.equal(db.signals.some((item) => item.id === "signal-old-active"), true);
+  assert.equal(db.signals.some((item) => item.id === "signal-recent-expired"), true);
+  assert.equal(db.sessions.some((item) => item.id === "session-boundary"), true);
+  assert.equal(db.users.length, 2);
+  assert.equal(db.wallets[0].availableBalance, "5000");
+  assert.equal(db.transactions.length, 1);
+  assert.equal(db.deposits.length, 1);
+  assert.equal(db.withdrawals.length, 1);
+  assert.equal(db.referrals.length, 1);
+  assert.equal(db.vtuTransactions.length, 1);
+  assert.equal(db.digitalServiceOrders.length, 1);
+  assert.equal(db.dailyPerformances.length, 1);
+  assert.equal(db.webhookEvents.length, 1);
+  assert.equal(db.auditLogs.some((item) => item.action === "DISPOSABLE_HISTORY_CLEANED"), true);
+  assert.equal(persistCount, 1);
+});
+
+test("48-hour cleanup ignores browser supplied cutoff values", () => {
+  const db = {
+    users: [{ id: "admin-1", role: "admin", name: "Admin" }],
+    notifications: [
+      { id: "notice-recent", userId: "admin-1", createdAt: "2026-08-30T09:00:00.000Z" },
+    ],
+  };
+  const service = new FinancialService({
+    db,
+    persist: () => undefined,
+    clock: () => "2026-08-30T10:00:00.000Z",
+    idGenerator: () => "cleanup-id",
+  });
+  service.ensureState();
+
+  const result = service.cleanupDisposableHistory(db.users[0], {
+    confirm: true,
+    nowMs: Date.parse("2027-08-30T10:00:00.000Z"),
+  });
+
+  assert.equal(result.deleted.notifications, 0);
+  assert.equal(db.notifications.some((item) => item.id === "notice-recent"), true);
+});
+
+test("48-hour cleanup requires admin authorization and confirmation", () => {
+  const { service, user } = createHarness();
+
+  assert.throws(
+    () => service.cleanupDisposableHistory(user, { confirm: true }),
+    /Admin access is required/
+  );
+  assert.throws(
+    () => service.cleanupDisposableHistory({ id: "admin-1", role: "admin" }, {}),
+    /Confirm old history cleanup/
+  );
+});

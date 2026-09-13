@@ -6746,6 +6746,20 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/admin/maintenance/cleanup-history") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const result = financialService.cleanupDisposableHistory(admin, await readBody(req), getRequestMeta(req));
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message || "History cleanup could not be completed." });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/admin/performance") {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {

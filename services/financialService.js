@@ -38,6 +38,7 @@ const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "payment_reserved", "submitt
 const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND"];
 const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "0";
 const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
+const DISPOSABLE_HISTORY_RETENTION_MS = 48 * 60 * 60 * 1000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -98,6 +99,16 @@ function normalizePercent(value, label = "Percent") {
     throw new Error(`${label} cannot be more than 100%.`);
   }
   return percent;
+}
+
+function timestampForHistoryCleanup(record = {}) {
+  for (const field of ["createdAt", "updatedAt", "timestamp", "sentAt", "expiresAt", "closedAt"]) {
+    const timestamp = Date.parse(record?.[field] || "");
+    if (Number.isFinite(timestamp)) {
+      return timestamp;
+    }
+  }
+  return null;
 }
 
 function normalizeMarkupMode(value) {
@@ -4167,6 +4178,86 @@ class FinancialService {
     this.audit(admin, "FINANCE_HISTORY_DELETED", "FinanceHistory", "bulk", deleted, requestMeta);
     this.persist();
     return { deletedCount, deleted };
+  }
+
+  cleanupDisposableHistory(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (!admin || admin.role !== "admin") {
+      const error = new Error("Admin access is required.");
+      error.statusCode = 403;
+      throw error;
+    }
+    if (input.confirm !== true && String(input.confirm || "").trim() !== "CLEAR_OLD_HISTORY") {
+      throw new Error("Confirm old history cleanup before continuing.");
+    }
+
+    const nowMs = Date.parse(this.clock());
+    const cutoffMs = nowMs - DISPOSABLE_HISTORY_RETENTION_MS;
+    const cutoffIso = new Date(cutoffMs).toISOString();
+    const isOlderThanCutoff = (record) => {
+      const timestamp = timestampForHistoryCleanup(record);
+      return Number.isFinite(timestamp) && timestamp < cutoffMs;
+    };
+    const before = {
+      notifications: this.db.notifications.length,
+      chatMessages: this.db.chatMessages.length,
+      pushNotificationEvents: this.db.pushNotificationEvents.length,
+      strategyLogs: Array.isArray(this.db.strategyLogs) ? this.db.strategyLogs.length : 0,
+      sessions: Array.isArray(this.db.sessions) ? this.db.sessions.length : 0,
+    };
+
+    this.db.notifications = this.db.notifications.filter((item) => !isOlderThanCutoff(item));
+    this.db.chatMessages = this.db.chatMessages.filter((item) => !isOlderThanCutoff(item));
+    this.db.pushNotificationEvents = this.db.pushNotificationEvents.filter((item) => !isOlderThanCutoff(item));
+    this.db.strategyLogs = (Array.isArray(this.db.strategyLogs) ? this.db.strategyLogs : []).filter((item) => !isOlderThanCutoff(item));
+    this.db.sessions = (Array.isArray(this.db.sessions) ? this.db.sessions : []).filter((item) => {
+      const expiresAt = Date.parse(item.expiresAt || "");
+      return !(Number.isFinite(expiresAt) && expiresAt < cutoffMs);
+    });
+
+    const deleted = {
+      notifications: before.notifications - this.db.notifications.length,
+      chatMessages: before.chatMessages - this.db.chatMessages.length,
+      pushNotificationEvents: before.pushNotificationEvents - this.db.pushNotificationEvents.length,
+      strategyLogs: before.strategyLogs - this.db.strategyLogs.length,
+      expiredSessions: before.sessions - this.db.sessions.length,
+    };
+    const deletedCount = Object.values(deleted).reduce((sum, value) => sum + value, 0);
+    const preserved = [
+      "users",
+      "wallets",
+      "balances",
+      "transactions",
+      "deposits",
+      "withdrawals",
+      "referrals",
+      "vtuTransactions",
+      "digitalServiceOrders",
+      "digitalServiceProducts",
+      "dailyPerformances",
+      "tradeInvestments",
+      "signals",
+      "giftCards",
+      "quests",
+      "questSessions",
+      "userQuestProgress",
+      "auditLogs",
+      "webhookEvents",
+      "systemSettings",
+    ];
+
+    if (deletedCount > 0) {
+      this.audit(admin, "DISPOSABLE_HISTORY_CLEANED", "Maintenance", "history-48h", { deleted, cutoffIso }, requestMeta);
+      this.persist();
+    }
+
+    return {
+      deletedCount,
+      deleted,
+      cutoffIso,
+      retentionHours: 48,
+      preserved,
+    };
   }
 
   getDeposit(depositId) {
