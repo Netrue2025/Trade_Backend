@@ -10,7 +10,7 @@ cp .env.example .env
 npm start
 ```
 
-Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment. On Railway, the backend also accepts `MONGO_URI`, `MONGO_URL`, or `DATABASE_URL` for MongoDB.
+Set `MONGODB_URI`, `APP_SECRET`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` before production deployment. On Railway, the backend also accepts `MONGO_URI`, `MONGO_URL`, `DATABASE_URL`, and the legacy `mongo_URI` alias for MongoDB.
 If the frontend is deployed separately, also set `FRONTEND_ORIGIN` to the exact frontend URL, for example `https://netruefi.org`.
 
 ## Scripts

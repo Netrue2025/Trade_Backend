@@ -1,7 +1,50 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { mergeMongoSnapshots } = require("../lib/db");
+const { mergeMongoSnapshots, shouldUseMongo } = require("../lib/db");
+
+const mongoEnvKeys = [
+  "MONGODB_URI",
+  "MONGO_URI",
+  "MONGO_URL",
+  "DATABASE_URL",
+  "mongodb_URI",
+  "mongodb_uri",
+  "mongo_URI",
+  "mongo_uri",
+  "mongo_URL",
+  "mongo_url",
+  "database_URL",
+  "database_url",
+];
+
+function withMongoEnv(envPatch, callback) {
+  const previous = {};
+  for (const key of mongoEnvKeys) {
+    previous[key] = process.env[key];
+    delete process.env[key];
+  }
+  Object.assign(process.env, envPatch);
+  try {
+    return callback();
+  } finally {
+    for (const key of mongoEnvKeys) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  }
+}
+
+test("mongo detection accepts lowercase Railway URI alias", () => {
+  withMongoEnv({
+    mongo_URI: "mongodb+srv://trade_mvp:trade123@cluster0.x8eukch.mongodb.net/trade_mvp?appName=Cluster0",
+  }, () => {
+    assert.equal(shouldUseMongo(), true);
+  });
+});
 
 test("mongo snapshot merge preserves newer wallet balances from current state", () => {
   const staleSave = {

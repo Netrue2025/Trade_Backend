@@ -48,7 +48,7 @@ const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { SubscriberModel } = require("./models/subscriberModel");
-const { emitOrderExecuted, orderEvents } = require("./services/orderEvents");
+const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber } = require("./services/paystackService");
@@ -2969,14 +2969,7 @@ async function reconcileTradeStatuses() {
         String(previousTrade?.adminExecution?.status || "").trim().toUpperCase() !== "FILLED"
         && String(trade?.adminExecution?.status || "").trim().toUpperCase() === "FILLED"
       ) {
-        notifyUsersTradeOpenToJoin(trade);
-        emitOrderExecuted({
-          eventKey: `${trade.id}:${trade.adminExecution?.orderId || trade.adminExecution?.clientOrderId || trade.adminExecution?.transactTime || "entry"}`,
-          exchange,
-          trade,
-          execution: trade.adminExecution,
-          kind: "ENTRY",
-        });
+        await publishTradeOpenNotifications(trade, exchange);
       }
 
       if (JSON.stringify(previousTrade || null) !== JSON.stringify(trade)) {
@@ -3411,6 +3404,49 @@ function notifyUsersTradeOpenToJoin(trade) {
   }
   trade.userJoinOpenNotifiedAt = nowIso();
   persist();
+  return true;
+}
+
+function buildTradeEntryEventKey(trade) {
+  return `${trade.id}:${trade.adminExecution?.orderId || trade.adminExecution?.clientOrderId || trade.adminExecution?.transactTime || "entry"}`;
+}
+
+function isTradeOpenForPublicJoin(trade) {
+  return (
+    !!trade
+    && String(trade.side || "").trim().toUpperCase() === "BUY"
+    && String(trade.adminExecution?.status || "").trim().toUpperCase() === "FILLED"
+    && deriveTradeLifecycle(trade) === "OPEN"
+  );
+}
+
+async function publishTradeOpenNotifications(trade, exchange) {
+  if (!isTradeOpenForPublicJoin(trade)) {
+    return false;
+  }
+
+  notifyUsersTradeOpenToJoin(trade);
+  const orderEvent = {
+    eventKey: buildTradeEntryEventKey(trade),
+    exchange,
+    trade,
+    execution: trade.adminExecution,
+    kind: "ENTRY",
+    emittedAt: new Date().toISOString(),
+  };
+
+  try {
+    signalBus.emit(SIGNAL_EVENTS.TRADE_EXECUTED, {
+      execution: orderEvent,
+      executedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn(`Open trade signal event failed for trade ${trade.id}:`, error.message || error);
+  }
+
+  await tradeListener.handleOrderExecuted(orderEvent).catch((error) => {
+    console.error(`Open trade Telegram notification failed for trade ${trade.id}:`, error.message || error);
+  });
   return true;
 }
 
@@ -4490,16 +4526,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   await tradeListener.handleTradeCreated(trade).catch((error) => {
     console.error(`Trade listener create event failed for trade ${trade.id}:`, error.message);
   });
-  if (String(trade.adminExecution?.status || "").trim().toUpperCase() === "FILLED") {
-    notifyUsersTradeOpenToJoin(trade);
-    emitOrderExecuted({
-      eventKey: `${trade.id}:${trade.adminExecution?.orderId || trade.adminExecution?.clientOrderId || "entry"}`,
-      exchange,
-      trade,
-      execution: trade.adminExecution,
-      kind: "ENTRY",
-    });
-  }
+  await publishTradeOpenNotifications(trade, exchange);
 
   let tpOrder = null;
   if (trade.takeProfitTargetPrice && trade.side === "BUY") {
@@ -8644,7 +8671,7 @@ function describeStartupError(error) {
   if (/mongo|mongodb|27017|server selection|timed out|econnrefused|enotfound/i.test(message)) {
     return [
       `MongoDB connection failed: ${message}`,
-      "Set a reachable Mongo connection string in Railway using MONGODB_URI, MONGO_URI, MONGO_URL, or DATABASE_URL.",
+      "Set a reachable Mongo connection string in Railway using MONGODB_URI, MONGO_URI, MONGO_URL, DATABASE_URL, or your existing mongo_URI alias.",
       "If you use MongoDB Atlas, allow Railway's outbound access in Atlas Network Access or temporarily allow 0.0.0.0/0.",
       "If you use Railway MongoDB, use the service's private Mongo connection URL from the same Railway project/environment.",
     ].join(" ");

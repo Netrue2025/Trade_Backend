@@ -6,7 +6,20 @@ const { assertValidMongoConnectionString, getEnvValue, getMongoDbNameFromUri, is
 const DEFAULT_COLLECTION_NAME = "trade_learning_trades";
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MIN_SAMPLE_SIZE = 8;
-const MONGO_URI_ENV_KEYS = ["MONGODB_URI", "MONGO_URI", "MONGO_URL", "DATABASE_URL"];
+const MONGO_URI_ENV_KEYS = [
+  "MONGODB_URI",
+  "MONGO_URI",
+  "MONGO_URL",
+  "DATABASE_URL",
+  "mongodb_URI",
+  "mongodb_uri",
+  "mongo_URI",
+  "mongo_uri",
+  "mongo_URL",
+  "mongo_url",
+  "database_URL",
+  "database_url",
+];
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
