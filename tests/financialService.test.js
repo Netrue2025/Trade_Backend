@@ -1776,6 +1776,174 @@ test("digital service fixed selling price overrides calculated markup", () => {
   assert.equal(adminProduct.markupAmount, "200");
 });
 
+test("digital service percentage markup supports values above 100 percent", () => {
+  const { admin, service } = createHarness();
+  service.replaceDigitalServiceProducts([
+    {
+      id: "markup-open",
+      supplierProductId: "markup-open",
+      provider: "akunding",
+      name: "Markup Tool",
+      category: "Tools",
+      currency: "NGN",
+      providerCost: "1000",
+      stock: 4,
+      available: true,
+    },
+  ]);
+
+  for (const [markup, expected] of [["0", "1000"], ["50", "1500"], ["100", "2000"], ["150", "2500"], ["300", "4000"]]) {
+    service.updateDigitalServiceProductOverride(admin, "markup-open", {
+      markupMode: "percentage",
+      markupValue: markup,
+      customPriceNgn: "0",
+    });
+    assert.equal(service.getDigitalServiceProduct("markup-open").sellingPrice, expected);
+  }
+
+  assert.throws(() => service.updateDigitalServiceProductOverride(admin, "markup-open", { markupValue: "-1" }), /cannot be negative/i);
+  assert.throws(() => service.updateDigitalServiceProductOverride(admin, "markup-open", { markupValue: "NaN" }), /valid decimal/i);
+  assert.throws(() => service.updateDigitalServiceProductOverride(admin, "markup-open", { markupValue: "Infinity" }), /valid decimal/i);
+  assert.throws(() => service.updateDigitalServiceProductOverride(admin, "markup-open", { markupValue: "abc" }), /valid decimal/i);
+});
+
+test("digital service API cost drives customer price and checkout ignores client price", async () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "10000");
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+  service.replaceDigitalServiceProducts([{
+    id: "api-price",
+    supplierProductId: "api-price",
+    provider: "akunding",
+    name: "API Price Tool",
+    category: "AI",
+    currency: "NGN",
+    providerCost: "2000",
+    stock: 10,
+    available: true,
+  }]);
+  service.updateDigitalServiceProductOverride(admin, "api-price", {
+    markupMode: "percentage",
+    markupValue: "150",
+  });
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: {
+      baseUrl: "https://akunding.shop",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+      createOrder: async () => ({ data: { id: "AK-api-price", status: "delivered", activation_link: "https://example.com/api-price" } }),
+    },
+  });
+
+  const adminProduct = service.getDigitalServiceProduct("api-price", { admin: true });
+  assert.equal(adminProduct.providerCostNgn, "2000");
+  assert.equal(adminProduct.sellingPrice, "5000");
+  await assert.rejects(
+    () => digitalServices.purchase(user, { productId: "api-price", quantity: 1, price: "1", expectedAmount: "1" }, { idempotencyKey: "price-stale" }),
+    (error) => error.code === "PRICE_CHANGED" && error.currentAmount === "5000"
+  );
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "10000");
+  assert.equal(db.digitalServiceOrders.length, 0);
+
+  const order = await digitalServices.purchase(user, { productId: "api-price", quantity: 1, price: "1", expectedAmount: "5000" }, { idempotencyKey: "price-ok" });
+  assert.equal(order.amountCharged, "5000");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+});
+
+test("digital service unavailable products remain visible but reject checkout before debit", async () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "8000");
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "out-stock",
+      supplierProductId: "out-stock",
+      provider: "akunding",
+      name: "Out Stock Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 0,
+      available: false,
+      providerStatus: "out_of_stock",
+    },
+    {
+      id: "good-stock",
+      supplierProductId: "good-stock",
+      provider: "akunding",
+      name: "Good Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "1000",
+      stock: 5,
+      available: true,
+    },
+  ]);
+  const products = service.listDigitalServiceProducts();
+  assert.equal(products.some((product) => product.id === "out-stock" && product.available === false), true);
+  assert.equal(products.some((product) => product.id === "good-stock" && product.available === true), true);
+  assert.throws(() => service.getDigitalServiceProduct("out-stock"), /not available/i);
+
+  let supplierCalls = 0;
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: {
+      baseUrl: "https://akunding.shop",
+      getPublicStatus: () => ({ configured: true }),
+      isConfigured: () => true,
+      createOrder: async () => {
+        supplierCalls += 1;
+        return { data: { id: "SHOULD-NOT-RUN", status: "delivered" } };
+      },
+    },
+  });
+  await assert.rejects(
+    () => digitalServices.purchase(user, { productId: "out-stock", paymentMethod: "wallet" }, { idempotencyKey: "out-wallet" }),
+    (error) => error.code === "PRODUCT_UNAVAILABLE"
+  );
+  await assert.rejects(
+    () => digitalServices.purchase(user, { productId: "out-stock", paymentMethod: "paystack" }, { idempotencyKey: "out-paystack" }),
+    (error) => error.code === "PRODUCT_UNAVAILABLE"
+  );
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "8000");
+  assert.equal(db.digitalServiceOrders.length, 0);
+  assert.equal(db.transactions.length, 0);
+  assert.equal(supplierCalls, 0);
+});
+
+test("digital service product list skips malformed products without hiding valid products", () => {
+  const { service } = createHarness();
+  service.db.digitalServiceProducts = [
+    {
+      id: "malformed-price",
+      supplierProductId: "malformed-price",
+      provider: "akunding",
+      name: "Malformed",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "not-a-number",
+      stock: 2,
+      available: true,
+    },
+    {
+      id: "valid-price",
+      supplierProductId: "valid-price",
+      provider: "akunding",
+      name: "Valid",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "1000",
+      stock: 2,
+      available: true,
+    },
+  ];
+
+  const products = service.listDigitalServiceProducts();
+  assert.equal(products.length, 1);
+  assert.equal(products[0].id, "valid-price");
+});
+
 test("digital service sync accepts nested API product payloads and reseller cost", async () => {
   const { admin, service } = createHarness();
   service.updateSettings(admin, {
@@ -1931,7 +2099,8 @@ test("admin-enabled digital service product is visible in user store", () => {
 
   const [product] = service.listDigitalServiceProducts();
   assert.equal(product.name, "Manual Publish Tool");
-  assert.equal(product.available, true);
+  assert.equal(product.visible, true);
+  assert.equal(product.available, false);
   assert.equal(product.supplierAvailable, false);
 });
 
@@ -2223,6 +2392,193 @@ test("Paystack digital service payment verifies amount and fulfills once", async
     assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === pending.requestId).length, 1);
     assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
     assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Paystack paid order can retry retryable supplier failure without another payment", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "retry-product",
+      supplierProductId: "retry-product",
+      provider: "akunding",
+      name: "Retry Product",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        listOrders: async () => [],
+        createOrder: async () => {
+          supplierCalls += 1;
+          if (supplierCalls === 1) {
+            const error = new Error("Supplier timed out.");
+            error.statusCode = 504;
+            error.code = "AKUNDING_TIMEOUT";
+            throw error;
+          }
+          return { data: { id: "AK-retry", status: "delivered", activation_link: "https://example.com/retry" } };
+        },
+      },
+    });
+
+    const pending = await digitalServices.purchase(user, { productId: "retry-product", paymentMethod: "paystack" }, { idempotencyKey: "retry-pay" });
+    const paid = service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    const failed = await digitalServices.fulfillPaidOrder(paid.id, user);
+    assert.equal(failed.paymentStatus, "paid");
+    assert.equal(failed.fulfillmentStatus, "failed_retryable");
+    assert.equal(failed.status, "processing");
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === pending.requestId).length, 1);
+
+    const delivered = await digitalServices.fulfillPaidOrder(paid.id, user);
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.fulfillmentStatus, "fulfilled");
+    assert.equal(delivered.delivery.activationLink, "https://example.com/retry");
+    assert.equal(supplierCalls, 2);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === pending.requestId).length, 1);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Paystack fulfillment retry reconciles ambiguous supplier timeout by request reference", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "ambiguous-product",
+      supplierProductId: "ambiguous-product",
+      provider: "akunding",
+      name: "Ambiguous Product",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    let recordedRequestId = "";
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        listOrders: async () => recordedRequestId
+          ? [{ id: "AK-reconciled", client_reference: recordedRequestId, status: "delivered", activation_link: "https://example.com/reconciled" }]
+          : [],
+        createOrder: async ({ idempotencyKey }) => {
+          supplierCalls += 1;
+          recordedRequestId = idempotencyKey;
+          const error = new Error("Supplier request timed out after submit.");
+          error.statusCode = 504;
+          error.code = "AKUNDING_TIMEOUT";
+          throw error;
+        },
+      },
+    });
+
+    const pending = await digitalServices.purchase(user, { productId: "ambiguous-product", paymentMethod: "paystack" }, { idempotencyKey: "ambiguous-pay" });
+    const paid = service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    const failed = await digitalServices.fulfillPaidOrder(paid.id, user);
+    assert.equal(failed.fulfillmentStatus, "failed_retryable");
+
+    const delivered = await digitalServices.fulfillPaidOrder(paid.id, user);
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.delivery.activationLink, "https://example.com/reconciled");
+    assert.equal(supplierCalls, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === pending.requestId).length, 1);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("simultaneous paid fulfillment requests do not duplicate supplier orders", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "simul-product",
+      supplierProductId: "simul-product",
+      provider: "akunding",
+      name: "Simul Product",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        listOrders: async () => [],
+        createOrder: async () => {
+          supplierCalls += 1;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return { data: { id: "AK-simul", status: "delivered", activation_link: "https://example.com/simul" } };
+        },
+      },
+    });
+
+    const pending = await digitalServices.purchase(user, { productId: "simul-product", paymentMethod: "paystack" }, { idempotencyKey: "simul-pay" });
+    const paid = service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    const [first, second] = await Promise.all([
+      digitalServices.fulfillPaidOrder(paid.id, user),
+      digitalServices.fulfillPaidOrder(paid.id, user),
+    ]);
+
+    assert.equal(first.status, "delivered");
+    assert.equal(second.status, "delivered");
+    assert.equal(first.id, second.id);
+    assert.equal(supplierCalls, 1);
   } finally {
     if (previousKey === undefined) {
       delete process.env.SETTINGS_ENCRYPTION_KEY;

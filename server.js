@@ -5886,6 +5886,7 @@ async function handleApi(req, res, url) {
           productId: body.productId,
           quantity: body.quantity || 1,
           paymentMethod,
+          expectedAmount: body.expectedAmount || body.expectedAmountNgn || "",
         }, getRequestMeta(req));
         const responsePayload = { order };
         if (paymentMethod === "paystack") {
@@ -5923,6 +5924,8 @@ async function handleApi(req, res, url) {
         code: error.code || "",
         currentBalance: error.currentBalance,
         requiredAmount: error.requiredAmount,
+        previousAmount: error.previousAmount,
+        currentAmount: error.currentAmount,
       });
     }
     return true;
@@ -6861,6 +6864,21 @@ async function handleApi(req, res, url) {
     }
     try {
       const order = await digitalServicesService.requeryOrder(admin, decodeURIComponent(adminDigitalOrderRequeryMatch[1] || ""), getRequestMeta(req));
+      sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalOrderRetryMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/retry-fulfillment$/);
+  if (req.method === "POST" && adminDigitalOrderRetryMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const order = await digitalServicesService.fulfillPaidOrder(adminDigitalOrderRetryMatch[1] ? decodeURIComponent(adminDigitalOrderRetryMatch[1]) : "", admin, getRequestMeta(req));
       sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message });

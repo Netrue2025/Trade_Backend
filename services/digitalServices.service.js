@@ -220,7 +220,7 @@ function normalizeProviderCost(raw = {}) {
 }
 
 function normalizeStock(raw = {}) {
-  const stock = firstValue(raw, ["stock", "available_quantity", "quantity_available", "qty", "available"]);
+  const stock = firstValue(raw, ["stock", "available_quantity", "quantity_available", "quantityAvailable", "qty", "available_stock", "availableStock", "available"]);
   if (stock === true) {
     return 999999;
   }
@@ -231,13 +231,13 @@ function normalizeStock(raw = {}) {
 }
 
 function normalizeStatus(raw = {}) {
-  const status = normalizeText(firstValue(raw, ["status", "availability", "state"]), "active").toLowerCase();
+  const status = normalizeText(firstValue(raw, ["status", "availability", "availability_status", "availabilityStatus", "state", "available"]), "active").toLowerCase();
   return status || "active";
 }
 
 function isProductAvailable(raw = {}) {
   const status = normalizeStatus(raw);
-  if (["inactive", "disabled", "unavailable", "out_of_stock", "out of stock", "sold_out"].includes(status)) {
+  if (["false", "0", "inactive", "disabled", "unavailable", "temporary_unavailable", "temporarily_unavailable", "out_of_stock", "out of stock", "sold_out", "sold out"].includes(status)) {
     return false;
   }
   return normalizeStock(raw) > 0;
@@ -374,6 +374,7 @@ class DigitalServicesService {
     this.akundingService = akundingService;
     this.emmaService = emmaService;
     this.clock = clock;
+    this.fulfillmentRequests = new Map();
   }
 
   getProviderService(provider = "akunding") {
@@ -507,12 +508,28 @@ class DigitalServicesService {
       return cached.order;
     }
     const product = this.financialService.getDigitalServiceProduct(input.productId, { admin: true });
+    if (!product.available) {
+      const error = new Error("This digital service is not available now.");
+      error.code = "PRODUCT_UNAVAILABLE";
+      error.statusCode = 409;
+      throw error;
+    }
     const provider = normalizeProviderKey(product.provider);
     const service = this.getProviderService(provider);
     if (!service?.isConfigured?.()) {
       throw new Error("Digital Services supplier is not configured.");
     }
     const quantity = Math.max(1, Math.min(Math.floor(Number(input.quantity || 1)), 1000));
+    const quote = this.financialService.quoteDigitalServiceOrder(product, quantity);
+    const expectedAmount = normalizeAmountText(input.expectedAmount || "", "");
+    if (expectedAmount && compare(expectedAmount, quote.amountCharged) !== 0) {
+      const error = new Error("Price updated. Please review the current price before checkout.");
+      error.code = "PRICE_CHANGED";
+      error.statusCode = 409;
+      error.previousAmount = expectedAmount;
+      error.currentAmount = quote.amountCharged;
+      throw error;
+    }
     const order = this.financialService.createDigitalServiceOrder(user, {
       product,
       quantity,
@@ -528,6 +545,24 @@ class DigitalServicesService {
   }
 
   async fulfillPaidOrder(orderId, actor, requestMeta = {}) {
+    const lockKey = String(orderId || "").trim();
+    if (lockKey && this.fulfillmentRequests.has(lockKey)) {
+      return this.fulfillmentRequests.get(lockKey);
+    }
+    const promise = this.fulfillPaidOrderUnlocked(orderId, actor, requestMeta);
+    if (lockKey) {
+      this.fulfillmentRequests.set(lockKey, promise);
+    }
+    try {
+      return await promise;
+    } finally {
+      if (lockKey) {
+        this.fulfillmentRequests.delete(lockKey);
+      }
+    }
+  }
+
+  async fulfillPaidOrderUnlocked(orderId, actor, requestMeta = {}) {
     const order = this.financialService.getDigitalServiceOrderRecord(actor, orderId);
     if (order.status === "delivered") {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
@@ -535,10 +570,17 @@ class DigitalServicesService {
     if (!["paid", "payment_reserved", "processing", "submitted"].includes(String(order.status || "").toLowerCase())) {
       throw new Error("Order payment is not confirmed.");
     }
-    if (order.fulfillmentAttemptedAt) {
+    if (order.supplierOrderId || extractDeliveryPayload(this.financialService.decryptDigitalServiceDelivery?.(order))) {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
     }
-    order.fulfillmentAttemptedAt = new Date().toISOString();
+    if (["fulfilled", "failed_final"].includes(String(order.fulfillmentStatus || "").toLowerCase())) {
+      return this.financialService.getDigitalServiceOrder(actor, order.id);
+    }
+    order.fulfillmentAttemptCount = Number(order.fulfillmentAttemptCount || 0) + 1;
+    order.lastFulfillmentAttemptAt = this.clock();
+    order.fulfillmentAttemptedAt = order.fulfillmentAttemptedAt || order.lastFulfillmentAttemptAt;
+    order.fulfillmentStatus = "processing";
+    order.lastFulfillmentError = "";
     const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
     const provider = normalizeProviderKey(order.provider || product.provider);
     const service = this.getProviderService(provider);
@@ -546,10 +588,16 @@ class DigitalServicesService {
       return this.financialService.applyDigitalServiceOrderResult(order.id, {
         status: "processing",
         supplierStatus: "supplier_unconfigured",
+        fulfillmentStatus: "failed_retryable",
         message: "Supplier fulfillment is pending configuration.",
       }, actor, requestMeta);
     }
     try {
+      const reconciledPayloads = await this.fetchSupplierOrderPayloads(order).catch(() => []);
+      const reconciled = mergeSupplierPayloads(reconciledPayloads);
+      if (reconciled) {
+        return this.applySupplierResult(order.id, reconciled, actor, requestMeta);
+      }
       const providerResponse = await service.createOrder({
         productId: order.supplierProductId || product.supplierProductId,
         quantity: order.quantity || 1,
@@ -569,6 +617,7 @@ class DigitalServicesService {
       const payload = {
         status: isFinalFailure ? "failed" : "processing",
         supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code) ? "unknown" : "error",
+        fulfillmentStatus: isFinalFailure ? "failed_final" : "failed_retryable",
         message: isFinalFailure ? error.message : "Supplier status is pending confirmation.",
       };
       return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
@@ -596,7 +645,8 @@ class DigitalServicesService {
 
   async fetchSupplierOrderPayloads(order = {}) {
     const supplierOrderId = String(order.supplierOrderId || "").trim();
-    if (!supplierOrderId) {
+    const requestId = String(order.requestId || order.paymentReference || "").trim();
+    if (!supplierOrderId && !requestId) {
       return [];
     }
     const payloads = [];
@@ -619,10 +669,10 @@ class DigitalServicesService {
     };
 
     const service = this.getProviderService(order.provider);
-    if (typeof service?.getOrder === "function") {
+    if (supplierOrderId && typeof service?.getOrder === "function") {
       await trySupplierCall(() => service.getOrder(supplierOrderId));
     }
-    if (typeof service?.exportOrder === "function") {
+    if (supplierOrderId && typeof service?.exportOrder === "function") {
       await trySupplierCall(() => service.exportOrder(supplierOrderId));
     }
 
@@ -631,7 +681,19 @@ class DigitalServicesService {
         const ordersPayload = await service.listOrders({ limit: 200 });
         const match = extractSupplierRows(ordersPayload).find((row) => {
           const record = extractSupplierRecord(row);
-          return String(extractSupplierOrderId(record) || record.id || "").trim() === supplierOrderId;
+          const supplierId = String(extractSupplierOrderId(record) || record.id || "").trim();
+          const clientReference = String(firstValue(record, [
+            "request_id",
+            "requestId",
+            "reference",
+            "client_reference",
+            "clientReference",
+            "idempotency_key",
+            "idempotencyKey",
+            "external_reference",
+            "externalReference",
+          ]) || "").trim();
+          return (supplierOrderId && supplierId === supplierOrderId) || (requestId && clientReference === requestId);
         });
         return match || null;
       });
