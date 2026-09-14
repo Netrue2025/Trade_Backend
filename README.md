@@ -31,7 +31,7 @@ Railway does not upload local `.env` files automatically. Add the variables in t
 Recommended MongoDB backup settings:
 
 ```bash
-MONGODB_APP_STATE_BACKUP_LIMIT=5
+MONGODB_APP_STATE_BACKUP_LIMIT=3
 MONGODB_APP_STATE_BACKUP_INTERVAL_MS=21600000
 MONGODB_APP_STATE_BACKUPS_ENABLED=true
 TRADE_LEARNING_ENABLED=false
@@ -43,4 +43,4 @@ Dry-run backup cleanup:
 npm run backups:cleanup
 ```
 
-The cleanup script requires `--execute --keep=5 --confirm=DELETE_OLD_APP_STATE_BACKUPS` before it can delete old backup documents. Review the dry-run output first.
+The cleanup script requires `--execute --keep=3 --confirm=DELETE_OLD_APP_STATE_BACKUPS` before it can delete old backup documents. Review the dry-run output first.

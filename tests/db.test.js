@@ -567,13 +567,66 @@ test("backup throttling remains functional", () => {
   });
 });
 
-test("backup defaults keep five snapshots every six hours", () => {
+test("backup interval enforces six hours before a new backup is due", () => {
+  withEnv([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, () => {
+    const baseline = Date.parse("2026-09-14T00:00:00.000Z");
+    __testing.markBackupThrottleNow(baseline);
+    assert.equal(__testing.isMongoBackupDue(baseline + (3 * 60 * 60 * 1000)), false);
+    assert.equal(__testing.isMongoBackupDue(baseline + 21600000 - 1), false);
+    assert.equal(__testing.isMongoBackupDue(baseline + 21600000), true);
+  });
+});
+
+test("backup defaults keep three snapshots every six hours", () => {
   withEnv([
     "MONGODB_APP_STATE_BACKUP_LIMIT",
     "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
   ], {}, () => {
-    assert.equal(__testing.getMongoBackupLimit(), 5);
+    assert.equal(__testing.getMongoBackupLimit(), 3);
     assert.equal(__testing.getMongoBackupIntervalMs(), 21600000);
+  });
+});
+
+test("rapid normal app-state saves within six hours do not create backup operations", async () => {
+  await withEnvAsync([
+    "MONGODB_APP_STATE_BACKUPS_ENABLED",
+    "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
+  ], {
+    MONGODB_APP_STATE_BACKUPS_ENABLED: "true",
+    MONGODB_APP_STATE_BACKUP_INTERVAL_MS: "21600000",
+  }, async () => {
+    __testing.markBackupThrottleNow();
+    let updateCount = 0;
+    let backupCount = 0;
+    const collection = {
+      async findOne() {
+        throw new Error("pre-save read should not run during non-backup saves");
+      },
+      async updateOne() {
+        updateCount += 1;
+        return { acknowledged: true };
+      },
+    };
+
+    for (let index = 0; index < 100; index += 1) {
+      await __testing.saveMongoSnapshot(collection, {
+        wallets: [{ userId: "user-1", currency: "NGN", availableBalance: String(1000 + index) }],
+      }, {
+        logger: createMemoryLogger(),
+        backupSnapshot: async () => {
+          backupCount += 1;
+        },
+      });
+    }
+
+    assert.equal(updateCount, 100);
+    assert.equal(backupCount, 0);
   });
 });
 

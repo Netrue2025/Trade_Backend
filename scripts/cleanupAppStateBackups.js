@@ -198,7 +198,10 @@ async function main() {
   });
 
   if (args.execute && decision.canDelete && plan.eligibleIds.length) {
-    await backupCollection.deleteMany({ _id: { $in: plan.eligibleIds } });
+    await backupCollection.deleteMany({
+      appStateId: DEFAULT_APP_STATE_ID,
+      _id: { $in: plan.eligibleIds },
+    });
   }
 
   printPlan({
