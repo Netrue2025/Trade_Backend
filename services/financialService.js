@@ -34,7 +34,7 @@ const VTU_FINAL_STATUSES = ["successful", "failed", "refunded"];
 const VTU_ACTIVE_STATUSES = ["initiated", "processing"];
 const VTU_LEDGER_TYPES = ["VTU_AIRTIME", "VTU_DATA", "VTU_REFUND"];
 const DIGITAL_SERVICE_FINAL_STATUSES = ["delivered", "failed", "refunded"];
-const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "payment_reserved", "submitted", "processing"];
+const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "pending_payment", "payment_reserved", "paid", "submitted", "processing"];
 const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND"];
 const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "0";
 const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
@@ -4922,6 +4922,10 @@ class FinancialService {
       currency: "NGN",
       amountCharged: order.amountCharged,
       status: order.status,
+      paymentMethod: order.paymentMethod || "wallet",
+      paymentStatus: order.paymentStatus || (order.paymentMethod === "paystack" ? "pending" : "paid"),
+      paymentReference: order.paymentMethod === "paystack" || admin ? order.paymentReference || "" : "",
+      paidAt: order.paidAt || null,
       supplierStatus: order.supplierStatus || "",
       supplierOrderId: admin ? order.supplierOrderId || "" : "",
       failureReason: order.failureReason || "",
@@ -4955,7 +4959,7 @@ class FinancialService {
     this.ensureState();
     const id = String(orderId || "").trim();
     const order = this.db.digitalServiceOrders.find((item) => item.id === id || item.requestId === id || item.supplierOrderId === id);
-    if (!order || (user.role !== "admin" && order.userId !== user.id)) {
+    if (!order || (!["admin", "system"].includes(user.role) && order.userId !== user.id)) {
       throw new Error("Digital service order not found.");
     }
     return order;
@@ -4990,17 +4994,27 @@ class FinancialService {
     const amountCharged = multiplyRatio(unitPrice, String(quantity), "1");
     const providerCostNgn = multiplyRatio(product.providerCostNgn || "0", String(quantity), "1");
     const markupAmount = compare(amountCharged, providerCostNgn) > 0 ? subtract(amountCharged, providerCostNgn) : "0";
-    const wallet = this.ensureWallet(user.id, "NGN");
-    if (compare(wallet.availableBalance, amountCharged) < 0) {
-      const error = new Error("Insufficient NGN balance.");
-      error.code = "INSUFFICIENT_BALANCE";
-      throw error;
+    const paymentMethod = String(input.paymentMethod || "wallet").trim().toLowerCase() === "paystack" ? "paystack" : "wallet";
+    const wallet = paymentMethod === "wallet" ? this.ensureWallet(user.id, "NGN") : null;
+    let balanceBefore = "";
+    let balanceAfter = "";
+    let balanceReserved = false;
+    if (paymentMethod === "wallet") {
+      if (compare(wallet.availableBalance, amountCharged) < 0) {
+        const error = new Error("Insufficient wallet balance.");
+        error.code = "INSUFFICIENT_BALANCE";
+        error.currentBalance = wallet.availableBalance;
+        error.requiredAmount = amountCharged;
+        throw error;
+      }
+      balanceBefore = wallet.availableBalance;
+      wallet.availableBalance = subtract(wallet.availableBalance, amountCharged);
+      wallet.lockedBalance = add(wallet.lockedBalance, amountCharged);
+      wallet.updatedAt = this.clock();
+      balanceAfter = wallet.availableBalance;
+      balanceReserved = true;
     }
     const requestId = this.createDigitalServiceRequestId();
-    const balanceBefore = wallet.availableBalance;
-    wallet.availableBalance = subtract(wallet.availableBalance, amountCharged);
-    wallet.lockedBalance = add(wallet.lockedBalance, amountCharged);
-    wallet.updatedAt = this.clock();
     const order = {
       id: this.idGenerator(12),
       userId: user.id,
@@ -5020,44 +5034,32 @@ class FinancialService {
       providerCost: product.providerCost || product.providerCostNgn || "0",
       providerCostNgn,
       markupAmount,
-      status: "payment_reserved",
+      status: paymentMethod === "wallet" ? "payment_reserved" : "pending_payment",
+      paymentMethod,
+      paymentStatus: paymentMethod === "wallet" ? "paid" : "pending",
+      paymentReference: paymentMethod === "paystack" ? requestId : "",
+      paidAt: paymentMethod === "wallet" ? this.clock() : null,
       supplierStatus: "queued",
       supplierOrderId: "",
       supplierResponse: null,
       deliveryEncrypted: "",
       failureReason: "",
-      walletReservedAmount: amountCharged,
-      balanceReserved: true,
+      walletReservedAmount: paymentMethod === "wallet" ? amountCharged : "0",
+      balanceReserved,
       createdAt: this.clock(),
       updatedAt: this.clock(),
       completedAt: null,
       refundedAt: null,
     };
     this.db.digitalServiceOrders.unshift(order);
-    this.db.transactions.unshift({
-      id: this.idGenerator(12),
-      userId: user.id,
-      type: "DIGITAL_SERVICE",
-      currency: "NGN",
-      amount: `-${amountCharged}`,
-      balanceBefore,
-      balanceAfter: wallet.availableBalance,
-      reference: requestId,
-      status: "PROCESSING",
-      description: `Digital service ${order.productName}`,
-      createdBy: user.id,
-      createdAt: this.clock(),
-      metadata: {
-        productId: order.productId,
-        quantity,
-        displayAmounts: this.getDisplayAmounts(amountCharged, "NGN"),
-      },
-    });
+    if (paymentMethod === "wallet") {
+      this.recordDigitalServicePaymentLedger(order, user, { balanceBefore, balanceAfter, status: "PROCESSING" });
+    }
     this.createNotification({
       userId: user.id,
       type: "DIGITAL_SERVICE",
       title: "Digital service order",
-      message: "Your order is processing.",
+      message: paymentMethod === "wallet" ? "Your order is processing." : "Complete Paystack payment to process your order.",
       entityType: "DIGITAL_SERVICE",
       entityId: order.id,
       route: "/?tab=store",
@@ -5070,6 +5072,102 @@ class FinancialService {
     }, requestMeta);
     this.persist();
     return this.sanitizeDigitalServiceOrder(order, { admin: false });
+  }
+
+  recordDigitalServicePaymentLedger(order, user, { balanceBefore = "", balanceAfter = "", status = "PROCESSING" } = {}) {
+    const exists = this.db.transactions.some((item) => DIGITAL_SERVICE_LEDGER_TYPES.includes(item.type) && item.reference === order.requestId);
+    if (exists) {
+      return null;
+    }
+    const transaction = {
+      id: this.idGenerator(12),
+      userId: order.userId,
+      type: "DIGITAL_SERVICE",
+      currency: "NGN",
+      amount: `-${order.amountCharged}`,
+      balanceBefore,
+      balanceAfter,
+      reference: order.requestId,
+      status,
+      description: `Digital service ${order.productName}`,
+      createdBy: user?.id || order.userId,
+      createdAt: this.clock(),
+      metadata: {
+        digitalServiceOrderId: order.id,
+        paymentMethod: order.paymentMethod || "wallet",
+        productId: order.productId,
+        quantity: order.quantity,
+        displayAmounts: this.getDisplayAmounts(order.amountCharged, "NGN"),
+      },
+    };
+    this.db.transactions.unshift(transaction);
+    return transaction;
+  }
+
+  getDigitalServiceOrderByPaymentReference(reference) {
+    this.ensureState();
+    const normalized = String(reference || "").trim();
+    if (!normalized) {
+      throw new Error("Payment reference is required.");
+    }
+    const order = this.db.digitalServiceOrders.find((item) => item.paymentReference === normalized || item.requestId === normalized);
+    if (!order) {
+      throw new Error("Digital service order not found for payment reference.");
+    }
+    return order;
+  }
+
+  confirmDigitalServicePaystackPayment(reference, eventData = {}, actor = { id: "paystack", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const order = this.getDigitalServiceOrderByPaymentReference(reference);
+    if (order.paymentMethod !== "paystack") {
+      throw new Error("This order is not awaiting Paystack payment.");
+    }
+    if (order.paymentStatus === "paid") {
+      return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+    }
+    const status = String(eventData.status || "").trim().toLowerCase();
+    if (status !== "success") {
+      throw new Error("Paystack payment was not successful.");
+    }
+    const eventReference = String(eventData.reference || "").trim();
+    if (eventReference && eventReference !== order.paymentReference) {
+      throw new Error("Paystack payment reference does not match order.");
+    }
+    if (String(eventData.currency || "NGN").trim().toUpperCase() !== "NGN") {
+      throw new Error("Paystack payment currency does not match order.");
+    }
+    const paidKobo = Number(eventData.amount);
+    if (!Number.isFinite(paidKobo) || paidKobo <= 0 || paidKobo !== toKobo(order.amountCharged)) {
+      throw new Error("Paystack payment amount does not match order.");
+    }
+    order.paymentStatus = "paid";
+    order.status = "paid";
+    order.paidAt = order.paidAt || this.clock();
+    order.updatedAt = this.clock();
+    order.paymentProviderResponse = {
+      reference: order.paymentReference,
+      status,
+      paidAt: String(eventData.paid_at || eventData.paidAt || ""),
+      channel: String(eventData.channel || ""),
+    };
+    this.recordDigitalServicePaymentLedger(order, actor, { status: "PROCESSING" });
+    this.createNotification({
+      userId: order.userId,
+      type: "DIGITAL_SERVICE",
+      title: "Payment confirmed",
+      message: `${order.productName} payment is confirmed and processing.`,
+      entityType: "DIGITAL_SERVICE",
+      entityId: order.id,
+      route: "/?tab=store",
+    });
+    this.audit(actor, "DIGITAL_SERVICE_PAYSTACK_PAYMENT_CONFIRMED", "DigitalServiceOrder", order.id, {
+      requestId: order.requestId,
+      paymentReference: order.paymentReference,
+      amountCharged: order.amountCharged,
+    }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
   }
 
   applyDigitalServiceOrderResult(orderId, payload = {}, actor = { id: "digital-services", role: "system" }, requestMeta = {}) {
@@ -5222,6 +5320,12 @@ class FinancialService {
 
   saveIdempotent(scope, userId, key, response) {
     if (!key) {
+      return;
+    }
+    const existing = this.db.idempotencyKeys.find((item) => item.scope === scope && item.userId === userId && item.key === key);
+    if (existing) {
+      existing.response = clone(response);
+      existing.updatedAt = this.clock();
       return;
     }
     this.db.idempotencyKeys.push({

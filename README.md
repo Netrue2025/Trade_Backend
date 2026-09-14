@@ -28,6 +28,14 @@ This backend exposes normal HTTP API routes plus websocket endpoints. If you dep
 
 Railway does not upload local `.env` files automatically. Add the variables in the service's **Variables** tab, and make sure the MongoDB connection URL is reachable from the backend service.
 
+Google sign-in and shop Paystack checkout use these backend variables:
+
+```bash
+GOOGLE_CLIENT_ID=
+PAYSTACK_SECRET_KEY=
+PAYSTACK_PUBLIC_KEY=
+```
+
 Recommended MongoDB backup settings:
 
 ```bash

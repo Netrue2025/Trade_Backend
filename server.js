@@ -44,6 +44,8 @@ function loadEnvFile() {
 loadEnvFile();
 
 const { loadDb, saveDb, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
+const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
+const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
@@ -51,7 +53,7 @@ const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
 const { QuestService } = require("./services/questService");
-const { PaystackService, maskAccountNumber } = require("./services/paystackService");
+const { PaystackService, maskAccountNumber, toKobo } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
 const { PushNotificationService } = require("./services/pushNotificationService");
 const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
@@ -138,6 +140,7 @@ let emmaResellerService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
+const digitalServiceOrderRequests = new Map();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
 const subscriberModel = new SubscriberModel();
@@ -1450,6 +1453,10 @@ function buildSignupName(body = {}) {
     lastName,
     name: `${firstName} ${lastName}`.replace(/\s+/g, " ").trim(),
   };
+}
+
+function getGoogleClientId() {
+  return String(getEnvValue("GOOGLE_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID") || "").trim();
 }
 
 function normalizeIdentityText(value) {
@@ -4951,6 +4958,7 @@ async function handleApi(req, res, url) {
       }
 
       let withdrawal = null;
+      let digitalOrder = null;
       const statusSettled = eventType.startsWith("transfer.")
         ? applyPaystackTransferStatus(reference, data, getRequestMeta(req))
         : null;
@@ -4974,9 +4982,21 @@ async function handleApi(req, res, url) {
       } else if (eventType === "transfer.reversed") {
         withdrawal = financialService.applyPaystackTransferReversed(reference, data, getRequestMeta(req));
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL REVERSED", ["Funds returned to wallet."]);
+      } else if (eventType === "charge.success") {
+        const paidOrder = financialService.confirmDigitalServicePaystackPayment(
+          reference,
+          data,
+          { id: "paystack", role: "system" },
+          getRequestMeta(req)
+        );
+        digitalOrder = await digitalServicesService.fulfillPaidOrder(
+          paidOrder.id,
+          { id: "paystack", role: "system" },
+          getRequestMeta(req)
+        );
       }
       financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
-      sendJson(res, 200, { received: true, processed: !!withdrawal });
+      sendJson(res, 200, { received: true, processed: !!(withdrawal || digitalOrder) });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -5038,6 +5058,12 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { user: user ? sanitizeUser(user) : null, exchanges: listExchanges() });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/auth/google/config") {
+    const clientId = getGoogleClientId();
+    sendJson(res, 200, { enabled: !!clientId, clientId });
     return true;
   }
 
@@ -5175,6 +5201,42 @@ async function handleApi(req, res, url) {
     const session = createSession(user.id, { remember });
     sendSessionCookie(req, res, session.id, { remember });
     sendJson(res, 201, { user: sanitizeUser(user), sessionToken: session.id });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/auth/google") {
+    try {
+      const body = await readBody(req);
+      const requestedRole = normalizeAuthRole(body.role, "user");
+      const profile = await verifyGoogleCredential({
+        credential: body.credential || body.idToken,
+        clientId: getGoogleClientId(),
+      });
+      const { user, isNewUser, linkedByEmail } = resolveGoogleAccount({
+        users: db.users,
+        profile,
+        requestedRole,
+        exchange: normalizeExchange(body.exchange, "bybit"),
+        allowAdminSignup: isAdminSelfSignupEnabled(),
+        idGenerator: () => randomId(12),
+        clock: nowIso,
+      });
+      if (isNewUser) {
+        financialService.ensureState();
+        financialService.registerReferralForSignup(user, String(body.referralCode || body.referral || body.ref || "").trim(), getRequestMeta(req));
+        financialService.audit(user, "USER_REGISTERED", "User", user.id, { provider: "google" }, getRequestMeta(req));
+      } else {
+        financialService.audit(user, "GOOGLE_LOGIN", "User", user.id, { linkedExistingEmail: !!linkedByEmail, isNewUser }, getRequestMeta(req));
+      }
+      clearUserFailedLoginAttempts(user, [profile.email]);
+      const remember = parseBooleanFlag(body.remember, false);
+      const session = createSession(user.id, { remember });
+      persist();
+      sendSessionCookie(req, res, session.id, { remember });
+      sendJson(res, isNewUser ? 201 : 200, { user: sanitizeUser(user), sessionToken: session.id, isNewUser });
+    } catch (error) {
+      sendJson(res, error.statusCode || 401, { error: error.message || "Google sign-in failed." });
+    }
     return true;
   }
 
@@ -5767,6 +5829,30 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/digital-services/orders/paystack/verify") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      const reference = String(body.reference || "").trim();
+      const existingOrder = financialService.getDigitalServiceOrderByPaymentReference(reference);
+      if (existingOrder.userId !== user.id) {
+        sendJson(res, 403, { error: "This payment reference does not belong to your account." });
+        return true;
+      }
+      const verification = await paystackService.verifyTransaction(reference);
+      const payment = verification.data || verification;
+      const paidOrder = financialService.confirmDigitalServicePaystackPayment(reference, payment, user, getRequestMeta(req));
+      const order = await digitalServicesService.fulfillPaidOrder(paidOrder.id, user, getRequestMeta(req));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/digital-services/orders") {
     const user = requireAuth(req, res, "user");
     if (!user) {
@@ -5777,22 +5863,67 @@ async function handleApi(req, res, url) {
       return true;
     }
     const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    if (!idempotencyKey) {
+      sendJson(res, 400, { error: "Idempotency key is required for store purchases." });
+      return true;
+    }
     const cachedResponse = financialService.findIdempotent("digital-service:order", user.id, idempotencyKey);
     if (cachedResponse) {
       sendJson(res, 200, cachedResponse);
       return true;
     }
     try {
-      const body = await readBody(req);
-      const order = await digitalServicesService.purchase(user, {
-        productId: body.productId,
-        quantity: body.quantity || 1,
-      }, getRequestMeta(req));
-      const responsePayload = { order };
-      financialService.saveIdempotent("digital-service:order", user.id, idempotencyKey, responsePayload);
-      sendJson(res, order.status === "delivered" ? 201 : 202, responsePayload);
+      const requestKey = `${user.id}:${idempotencyKey}`;
+      if (digitalServiceOrderRequests.has(requestKey)) {
+        const lockedResponse = await digitalServiceOrderRequests.get(requestKey);
+        sendJson(res, 200, lockedResponse);
+        return true;
+      }
+      const orderPromise = (async () => {
+        const body = await readBody(req);
+        const paymentMethod = String(body.paymentMethod || "wallet").trim().toLowerCase() === "paystack" ? "paystack" : "wallet";
+        const order = await digitalServicesService.purchase(user, {
+          productId: body.productId,
+          quantity: body.quantity || 1,
+          paymentMethod,
+        }, getRequestMeta(req));
+        const responsePayload = { order };
+        if (paymentMethod === "paystack") {
+          const paystack = await paystackService.initializeTransaction({
+            email: user.email,
+            amountKobo: toKobo(order.amountCharged),
+            reference: order.paymentReference,
+            callbackUrl: `${getFrontendUrl()}/shop?reference=${encodeURIComponent(order.paymentReference)}`,
+            metadata: {
+              type: "digital_service_order",
+              orderId: order.id,
+              requestId: order.requestId,
+              userId: user.id,
+              productId: order.productId,
+            },
+          });
+          responsePayload.payment = {
+            provider: "paystack",
+            reference: order.paymentReference,
+            authorizationUrl: paystack.authorization_url || "",
+            accessCode: paystack.access_code || "",
+          };
+        }
+        financialService.saveIdempotent("digital-service:order", user.id, idempotencyKey, responsePayload);
+        return responsePayload;
+      })();
+      digitalServiceOrderRequests.set(requestKey, orderPromise);
+      const responsePayload = await orderPromise.finally(() => {
+        digitalServiceOrderRequests.delete(requestKey);
+      });
+      sendJson(res, responsePayload.order?.status === "delivered" ? 201 : 202, responsePayload);
     } catch (error) {
-      sendJson(res, error.statusCode || 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        code: error.code || "",
+        currentBalance: error.currentBalance,
+        requiredAmount: error.requiredAmount,
+      });
     }
     return true;
   }

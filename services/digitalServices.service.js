@@ -501,6 +501,11 @@ class DigitalServicesService {
     if (!settings.enabled) {
       throw new Error("Digital Services is not available now.");
     }
+    const idempotencyKey = String(requestMeta.idempotencyKey || "").trim();
+    const cached = this.financialService.findIdempotent("digital-service:purchase", user?.id, idempotencyKey);
+    if (cached?.order) {
+      return cached.order;
+    }
     const product = this.financialService.getDigitalServiceProduct(input.productId, { admin: true });
     const provider = normalizeProviderKey(product.provider);
     const service = this.getProviderService(provider);
@@ -511,11 +516,43 @@ class DigitalServicesService {
     const order = this.financialService.createDigitalServiceOrder(user, {
       product,
       quantity,
+      paymentMethod: input.paymentMethod || "wallet",
     }, requestMeta);
+    this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order });
+    if (order.paymentMethod === "paystack") {
+      return order;
+    }
+    const fulfilled = await this.fulfillPaidOrder(order.id, user, requestMeta);
+    this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order: fulfilled });
+    return fulfilled;
+  }
+
+  async fulfillPaidOrder(orderId, actor, requestMeta = {}) {
+    const order = this.financialService.getDigitalServiceOrderRecord(actor, orderId);
+    if (order.status === "delivered") {
+      return this.financialService.getDigitalServiceOrder(actor, order.id);
+    }
+    if (!["paid", "payment_reserved", "processing", "submitted"].includes(String(order.status || "").toLowerCase())) {
+      throw new Error("Order payment is not confirmed.");
+    }
+    if (order.fulfillmentAttemptedAt) {
+      return this.financialService.getDigitalServiceOrder(actor, order.id);
+    }
+    order.fulfillmentAttemptedAt = new Date().toISOString();
+    const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
+    const provider = normalizeProviderKey(order.provider || product.provider);
+    const service = this.getProviderService(provider);
+    if (!service?.isConfigured?.()) {
+      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+        status: "processing",
+        supplierStatus: "supplier_unconfigured",
+        message: "Supplier fulfillment is pending configuration.",
+      }, actor, requestMeta);
+    }
     try {
       const providerResponse = await service.createOrder({
-        productId: product.supplierProductId,
-        quantity,
+        productId: order.supplierProductId || product.supplierProductId,
+        quantity: order.quantity || 1,
         idempotencyKey: order.requestId,
       });
       const supplierOrderId = extractSupplierOrderId(providerResponse);
@@ -523,10 +560,10 @@ class DigitalServicesService {
       if (supplierOrderId) {
         supplementalPayloads = await this.fetchSupplierOrderPayloads({ ...order, supplierOrderId }).catch(() => []);
       }
-      return this.applySupplierResult(order.id, mergeSupplierPayloads([providerResponse, ...supplementalPayloads]) || providerResponse, user, requestMeta);
+      return this.applySupplierResult(order.id, mergeSupplierPayloads([providerResponse, ...supplementalPayloads]) || providerResponse, actor, requestMeta);
     } catch (error) {
       if (extractDeliveryPayload(error.payload)) {
-        return this.applySupplierResult(order.id, error.payload, user, requestMeta);
+        return this.applySupplierResult(order.id, error.payload, actor, requestMeta);
       }
       const isFinalFailure = Number(error.statusCode || 0) > 0 && Number(error.statusCode || 0) < 500 && !["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code);
       const payload = {
@@ -534,7 +571,7 @@ class DigitalServicesService {
         supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code) ? "unknown" : "error",
         message: isFinalFailure ? error.message : "Supplier status is pending confirmation.",
       };
-      return this.financialService.applyDigitalServiceOrderResult(order.id, payload, user, requestMeta);
+      return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
     }
   }
 

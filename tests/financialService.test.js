@@ -945,6 +945,45 @@ test("Paystack kobo conversion and webhook signature verification", () => {
   assert.equal(service.verifyWebhookSignature(rawBody, "bad-signature"), false);
 });
 
+test("Paystack transaction initialization and verification use server references", async () => {
+  const calls = [];
+  const service = new PaystackService({
+    secretKey: "sk_test_example",
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (String(url).includes("/transaction/initialize")) {
+        return {
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: { authorization_url: "https://checkout.paystack.com/test", access_code: "acc", reference: "ref-1" },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          status: true,
+          data: { status: "success", amount: 400000, currency: "NGN", reference: "ref-1" },
+        }),
+      };
+    },
+  });
+  const initialized = await service.initializeTransaction({
+    email: "ada@example.com",
+    amountKobo: 400000,
+    reference: "ref-1",
+    callbackUrl: "https://netruefi.org/shop?reference=ref-1",
+  });
+  const verified = await service.verifyTransaction("ref-1");
+
+  assert.equal(initialized.authorization_url, "https://checkout.paystack.com/test");
+  assert.equal(verified.data.reference, "ref-1");
+  assert.match(calls[0].url, /\/transaction\/initialize$/);
+  assert.equal(JSON.parse(calls[0].options.body).reference, "ref-1");
+  assert.match(calls[1].url, /\/transaction\/verify\/ref-1$/);
+});
+
 test("NGN withdrawal requires a verified bank account", () => {
   const { service, user } = createHarness();
   setWallet(service, user.id, "NGN", "50000");
@@ -1983,6 +2022,206 @@ test("digital service order reserves wallet and delivery consumes reserve once",
 
     service.applyDigitalServiceOrderResult(order.id, { status: "delivered" }, user);
     assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("wallet digital service purchase uses authoritative server price and idempotency response", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "price-safe",
+      supplierProductId: "price-safe",
+      provider: "akunding",
+      name: "Gemini Pro",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        createOrder: async () => ({ data: { id: "AK-price", status: "delivered", activation_link: "https://example.com/activate" } }),
+      },
+    });
+
+    const order = await digitalServices.purchase(user, { productId: "price-safe", quantity: 1, amount: "1" });
+    const response = { order };
+    service.saveIdempotent("digital-service:order", user.id, "same-click", response);
+    const duplicate = service.findIdempotent("digital-service:order", user.id, "same-click");
+
+    assert.equal(order.amountCharged, "4000");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === order.requestId).length, 1);
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(duplicate.order.id, order.id);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("duplicate wallet digital service purchase key does not double debit or reorder", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "duplicate-safe",
+      supplierProductId: "duplicate-safe",
+      provider: "akunding",
+      name: "Gemini Pro",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          return { data: { id: "AK-duplicate", status: "delivered", activation_link: "https://example.com/duplicate" } };
+        },
+      },
+    });
+
+    const first = await digitalServices.purchase(user, { productId: "duplicate-safe", quantity: 1 }, { idempotencyKey: "dup-key" });
+    const second = await digitalServices.purchase(user, { productId: "duplicate-safe", quantity: 1 }, { idempotencyKey: "dup-key" });
+
+    assert.equal(first.id, second.id);
+    assert.equal(supplierCalls, 1);
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === first.requestId).length, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("wallet digital service purchase rejects insufficient balance without partial debit", () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "2000");
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+  service.replaceDigitalServiceProducts([{
+    id: "too-costly",
+    supplierProductId: "too-costly",
+    provider: "akunding",
+    name: "AI Tool",
+    category: "AI",
+    currency: "NGN",
+    providerCost: "4000",
+    stock: 10,
+    available: true,
+  }]);
+  const product = service.getDigitalServiceProduct("too-costly", { admin: true });
+
+  assert.throws(() => service.createDigitalServiceOrder(user, { product, quantity: 1 }), /insufficient wallet balance/i);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2000");
+  assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  assert.equal(service.listDigitalServiceOrders(user).length, 0);
+});
+
+test("Paystack digital service payment verifies amount and fulfills once", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "2500");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "paystack-product",
+      supplierProductId: "paystack-product",
+      provider: "akunding",
+      name: "Gemini Pro",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: {
+        baseUrl: "https://akunding.shop",
+        getPublicStatus: () => ({ configured: true }),
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          return { data: { id: "AK-paystack", status: "delivered", activation_link: "https://example.com/paystack" } };
+        },
+      },
+    });
+
+    const pending = await digitalServices.purchase(user, { productId: "paystack-product", paymentMethod: "paystack" });
+    assert.equal(pending.status, "pending_payment");
+    assert.equal(pending.paymentStatus, "pending");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+
+    assert.throws(
+      () => service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+        status: "success",
+        reference: pending.paymentReference,
+        currency: "NGN",
+        amount: toKobo("1"),
+      }, user),
+      /amount does not match/i
+    );
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
+
+    const paid = service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    const delivered = await digitalServices.fulfillPaidOrder(paid.id, user);
+    const duplicatePaid = service.confirmDigitalServicePaystackPayment(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    await digitalServices.fulfillPaidOrder(duplicatePaid.id, user);
+
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.delivery.activationLink, "https://example.com/paystack");
+    assert.equal(supplierCalls, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === pending.requestId).length, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "2500");
     assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
   } finally {
     if (previousKey === undefined) {

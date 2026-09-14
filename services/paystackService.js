@@ -188,6 +188,25 @@ class PaystackService {
     });
   }
 
+  async initializeTransaction({ email, amountKobo, reference, callbackUrl = "", metadata = {} }) {
+    const payload = await this.request("/transaction/initialize", {
+      method: "POST",
+      body: {
+        email: String(email || "").trim(),
+        amount: Number(amountKobo),
+        currency: "NGN",
+        reference: String(reference || "").trim(),
+        callback_url: String(callbackUrl || "").trim() || undefined,
+        metadata,
+      },
+    });
+    return payload.data || {};
+  }
+
+  async verifyTransaction(reference) {
+    return this.request(`/transaction/verify/${encodeURIComponent(String(reference || "").trim())}`);
+  }
+
   async finalizeTransfer({ transferCode, otp }) {
     if (!String(otp || "").trim()) {
       throw new Error("OTP is required.");
