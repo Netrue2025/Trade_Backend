@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
-const { DigitalServicesService, extractDeliveryPayload, mapSupplierStatus } = require("../services/digitalServices.service");
+const { DigitalServicesService, extractDeliveryPayload, mapSupplierStatus, validateSupplierUrl } = require("../services/digitalServices.service");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
@@ -2146,6 +2146,168 @@ test("digital service sync preserves products from other stores", () => {
   assert.equal(alabaProducts[0].id, "94");
   assert.equal(emmaProducts.length, 1);
   assert.equal(emmaProducts[0].id, "emma:94");
+});
+
+test("digital service products sort available first and preserve missing supplier products", () => {
+  const { service } = createHarness();
+  service.replaceDigitalServiceProducts([
+    {
+      id: "out",
+      supplierProductId: "out",
+      provider: "akunding",
+      name: "Out Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "1000",
+      available: false,
+      stock: 0,
+    },
+    {
+      id: "ready",
+      supplierProductId: "ready",
+      provider: "akunding",
+      name: "Ready Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "1000",
+      available: true,
+      stock: 5,
+    },
+  ], { provider: "akunding" });
+
+  assert.deepEqual(service.listDigitalServiceProducts({ includeInactive: true }).map((product) => product.id), ["ready", "out"]);
+
+  service.replaceDigitalServiceProducts([
+    {
+      id: "ready",
+      supplierProductId: "ready",
+      provider: "akunding",
+      name: "Ready Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "1000",
+      available: true,
+      stock: 5,
+    },
+  ], { provider: "akunding" });
+
+  const missing = service.getDigitalServiceProduct("out", { admin: true });
+  assert.equal(missing.sourceMissing, true);
+  assert.equal(missing.available, false);
+  assert.equal(missing.providerStatus, "source_missing");
+});
+
+test("generic supplier credentials are encrypted and masked, and disabled supplier blocks checkout", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    const supplier = service.saveDigitalServiceSupplier(admin, {
+      name: "Vendor API",
+      baseUrl: "https://vendor.example/api",
+      authType: "api_key",
+      apiKey: "secret-key-1234",
+      productEndpoint: "/products",
+      fieldMapping: {
+        supplierProductId: "id",
+        name: "name",
+        supplierCost: "price",
+      },
+    });
+
+    assert.equal(supplier.id, "vendor-api");
+    assert.equal(supplier.secrets.apiKey.includes("secret-key-1234"), false);
+    assert.equal(db.systemSettings.digitalServices.suppliers["vendor-api"].apiKeyEncrypted.includes("secret-key-1234"), false);
+    assert.equal(service.getDigitalServiceSupplierRuntimeConfig("vendor-api").apiKey, "secret-key-1234");
+
+    service.replaceDigitalServiceProducts([
+      {
+        id: "vendor-api:123",
+        supplierProductId: "123",
+        provider: "vendor-api",
+        name: "Vendor Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "1000",
+        available: true,
+        stock: 5,
+      },
+    ], { provider: "vendor-api" });
+
+    service.disableDigitalServiceSupplier(admin, "vendor-api");
+    const product = service.getDigitalServiceProduct("vendor-api:123", { admin: true });
+    assert.equal(product.available, false);
+    assert.throws(() => service.createDigitalServiceOrder(user, { productId: "vendor-api:123", quantity: 1 }), /not available/i);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("supplier URL validation rejects SSRF targets", async () => {
+  await assert.rejects(() => validateSupplierUrl("file:///etc/passwd"), /protocol/i);
+  await assert.rejects(() => validateSupplierUrl("https://localhost/products", { resolveDns: false }), /local or private/i);
+  await assert.rejects(() => validateSupplierUrl("https://127.0.0.1/products", { resolveDns: false }), /local or private/i);
+  await assert.rejects(() => validateSupplierUrl("https://169.254.169.254/latest", { resolveDns: false }), /local or private/i);
+  await assert.doesNotReject(() => validateSupplierUrl("https://supplier.example/products", { resolveDns: false }));
+});
+
+test("Emma 404 order endpoint remains retryable and traceable without a second charge", async () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "5000");
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+  service.replaceDigitalServiceProducts([
+    {
+      id: "emma:404",
+      supplierProductId: "404",
+      provider: "emma",
+      storeKey: "emma",
+      storeName: "Emma Store",
+      name: "Emma Endpoint Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      available: true,
+      stock: 2,
+    },
+  ], { provider: "emma" });
+
+  let supplierCalls = 0;
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    akundingService: { isConfigured: () => false },
+    emmaService: {
+      baseUrl: "https://ssondigitalworks.online/api/reseller",
+      isConfigured: () => true,
+      listOrders: async () => [],
+      createOrder: async () => {
+        supplierCalls += 1;
+        const error = new Error("Endpoint not found");
+        error.statusCode = 404;
+        throw error;
+      },
+    },
+  });
+
+  const order = await digitalServices.purchase(user, { productId: "emma:404", quantity: 1 }, { idempotencyKey: "emma-404" });
+  const wallet = service.ensureWallet(user.id, "NGN");
+  assert.equal(order.status, "processing");
+  assert.equal(order.paymentStatus, "paid");
+  assert.equal(order.fulfillmentStatus, "failed_retryable");
+  assert.equal(order.supplierStatus, "supplier_endpoint_unavailable");
+  assert.equal(wallet.availableBalance, "1000");
+  assert.equal(wallet.lockedBalance, "4000");
+  assert.equal(supplierCalls, 1);
+
+  const retried = await digitalServices.purchase(user, { productId: "emma:404", quantity: 1 }, { idempotencyKey: "emma-404" });
+  assert.equal(retried.id, order.id);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+  assert.equal(db.digitalServiceOrders.length, 1);
 });
 
 test("digital service order reserves wallet and delivery consumes reserve once", () => {

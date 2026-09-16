@@ -519,6 +519,20 @@ class FinancialService {
         customPriceNgn: normalizeNonNegativeAmount(override.customPriceNgn ?? "0", "Custom product price"),
       };
     }
+    const rawSuppliers = settings.suppliers && typeof settings.suppliers === "object" && !Array.isArray(settings.suppliers)
+      ? settings.suppliers
+      : {};
+    const suppliers = {};
+    for (const [id, supplier] of Object.entries(rawSuppliers)) {
+      const normalizedId = this.normalizeDigitalServiceSupplierId(id || supplier?.id);
+      if (!normalizedId || ["akunding", "emma"].includes(normalizedId) || !supplier || typeof supplier !== "object" || Array.isArray(supplier)) {
+        continue;
+      }
+      suppliers[normalizedId] = this.normalizeDigitalServiceSupplierConfig({
+        ...supplier,
+        id: normalizedId,
+      });
+    }
     return {
       provider: "akunding",
       enabled: settings.enabled !== undefined ? normalizeBoolean(settings.enabled) : false,
@@ -526,6 +540,7 @@ class FinancialService {
       fallbackImageUrl: settings.fallbackImageUrl || DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
       allowedImageDomains: allowedImageDomains.length ? allowedImageDomains : ["akunding.shop", "ssondigitalworks.online"],
       productOverrides,
+      suppliers,
       lastSyncAt: settings.lastSyncAt || null,
       lastSyncStatus: settings.lastSyncStatus || "",
       lastSyncError: settings.lastSyncError || "",
@@ -555,12 +570,205 @@ class FinancialService {
     if (admin) {
       summary.allowedImageDomains = normalized.allowedImageDomains;
       summary.productOverrides = clone(normalized.productOverrides);
+      summary.suppliers = this.listDigitalServiceSuppliers({ includeBuiltIns: true, settings: normalized });
       summary.supplierBalance = normalized.supplierBalance;
       summary.supplierBalanceCurrency = normalized.supplierBalanceCurrency;
       summary.lastBalanceCheckedAt = normalized.lastBalanceCheckedAt;
       summary.updatedBy = normalized.updatedBy;
     }
     return summary;
+  }
+
+  normalizeDigitalServiceSupplierId(value = "") {
+    return String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9:_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 64);
+  }
+
+  normalizeSupplierAuthType(value = "api_key") {
+    const authType = String(value || "api_key").trim().toLowerCase();
+    return ["api_key", "bearer", "basic", "custom_headers", "none"].includes(authType) ? authType : "api_key";
+  }
+
+  normalizeSupplierFieldMapping(mapping = {}) {
+    const allowed = ["supplierProductId", "name", "description", "category", "supplierCost", "availability", "image"];
+    const normalized = {};
+    if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
+      return normalized;
+    }
+    for (const key of allowed) {
+      const value = String(mapping[key] || "").trim();
+      if (/^[A-Za-z0-9_.-]+$/.test(value)) {
+        normalized[key] = value;
+      }
+    }
+    return normalized;
+  }
+
+  normalizeDigitalServiceSupplierConfig(supplier = {}) {
+    const id = this.normalizeDigitalServiceSupplierId(supplier.id || supplier.name);
+    const capabilities = supplier.capabilities && typeof supplier.capabilities === "object" && !Array.isArray(supplier.capabilities)
+      ? supplier.capabilities
+      : {};
+    return {
+      id,
+      name: String(supplier.name || id || "Supplier").trim().slice(0, 80),
+      type: "generic",
+      enabled: supplier.enabled !== undefined ? normalizeBoolean(supplier.enabled) : true,
+      baseUrl: String(supplier.baseUrl || "").trim().replace(/\/+$/, ""),
+      authType: this.normalizeSupplierAuthType(supplier.authType),
+      apiKeyEncrypted: supplier.apiKeyEncrypted || "",
+      bearerTokenEncrypted: supplier.bearerTokenEncrypted || "",
+      usernameEncrypted: supplier.usernameEncrypted || "",
+      passwordEncrypted: supplier.passwordEncrypted || "",
+      customHeadersEncrypted: supplier.customHeadersEncrypted || "",
+      productEndpoint: String(supplier.productEndpoint || "").trim() || "/products",
+      orderEndpoint: String(supplier.orderEndpoint || "").trim(),
+      orderStatusEndpoint: String(supplier.orderStatusEndpoint || "").trim(),
+      fieldMapping: this.normalizeSupplierFieldMapping(supplier.fieldMapping),
+      capabilities: {
+        productSync: capabilities.productSync !== undefined ? normalizeBoolean(capabilities.productSync) : true,
+        automaticFulfillment: capabilities.automaticFulfillment !== undefined ? normalizeBoolean(capabilities.automaticFulfillment) : false,
+        orderReconciliation: capabilities.orderReconciliation !== undefined ? normalizeBoolean(capabilities.orderReconciliation) : false,
+      },
+      lastConnectionTestAt: supplier.lastConnectionTestAt || null,
+      lastConnectionStatus: supplier.lastConnectionStatus || "",
+      lastConnectionError: supplier.lastConnectionError || "",
+      productCount: Number(supplier.productCount || 0),
+      availableCount: Number(supplier.availableCount || 0),
+      unavailableCount: Number(supplier.unavailableCount || 0),
+      lastSuccessfulSyncAt: supplier.lastSuccessfulSyncAt || null,
+      lastSyncAt: supplier.lastSyncAt || null,
+      lastSyncStatus: supplier.lastSyncStatus || "",
+      lastSyncError: supplier.lastSyncError || "",
+      disabledAt: supplier.disabledAt || null,
+      createdAt: supplier.createdAt || this.clock(),
+      updatedAt: supplier.updatedAt || this.clock(),
+      updatedBy: supplier.updatedBy || "",
+    };
+  }
+
+  sanitizeDigitalServiceSupplier(supplier = {}, { runtime = false } = {}) {
+    const normalized = this.normalizeDigitalServiceSupplierConfig(supplier);
+    const decryptOptional = (value) => {
+      if (!runtime || !value) {
+        return "";
+      }
+      try {
+        return decryptSetting(value);
+      } catch {
+        return "";
+      }
+    };
+    const customHeadersText = decryptOptional(normalized.customHeadersEncrypted);
+    let customHeaders = {};
+    if (customHeadersText) {
+      try {
+        customHeaders = JSON.parse(customHeadersText);
+      } catch {
+        customHeaders = {};
+      }
+    }
+    const publicSupplier = {
+      id: normalized.id,
+      name: normalized.name,
+      type: normalized.type,
+      enabled: normalized.enabled,
+      baseUrl: normalized.baseUrl,
+      authType: normalized.authType,
+      productEndpoint: normalized.productEndpoint,
+      orderEndpoint: normalized.orderEndpoint,
+      orderStatusEndpoint: normalized.orderStatusEndpoint,
+      fieldMapping: clone(normalized.fieldMapping),
+      capabilities: clone(normalized.capabilities),
+      productSync: normalized.capabilities.productSync,
+      automaticFulfillment: normalized.capabilities.automaticFulfillment,
+      orderReconciliation: normalized.capabilities.orderReconciliation,
+      configured: normalized.enabled && !!normalized.baseUrl && !!normalized.productEndpoint,
+      secrets: {
+        apiKey: maskSecret(decryptOptional(normalized.apiKeyEncrypted)),
+        bearerToken: maskSecret(decryptOptional(normalized.bearerTokenEncrypted)),
+        username: maskSecret(decryptOptional(normalized.usernameEncrypted)),
+        password: normalized.passwordEncrypted ? "********" : "",
+        customHeaders: normalized.customHeadersEncrypted ? "********" : "",
+      },
+      lastConnectionTestAt: normalized.lastConnectionTestAt,
+      lastConnectionStatus: normalized.lastConnectionStatus,
+      lastConnectionError: normalized.lastConnectionError,
+      productCount: normalized.productCount,
+      availableCount: normalized.availableCount,
+      unavailableCount: normalized.unavailableCount,
+      lastSuccessfulSyncAt: normalized.lastSuccessfulSyncAt,
+      lastSyncAt: normalized.lastSyncAt,
+      lastSyncStatus: normalized.lastSyncStatus,
+      lastSyncError: normalized.lastSyncError,
+      disabledAt: normalized.disabledAt,
+      updatedAt: normalized.updatedAt,
+    };
+    if (!runtime) {
+      return publicSupplier;
+    }
+    return {
+      ...publicSupplier,
+      apiKey: decryptOptional(normalized.apiKeyEncrypted),
+      bearerToken: decryptOptional(normalized.bearerTokenEncrypted),
+      username: decryptOptional(normalized.usernameEncrypted),
+      password: decryptOptional(normalized.passwordEncrypted),
+      customHeaders,
+      storeKey: normalized.id,
+    };
+  }
+
+  listDigitalServiceSuppliers({ includeBuiltIns = true, settings = this.db.systemSettings?.digitalServices || {} } = {}) {
+    const normalized = this.normalizeDigitalServiceSettings(settings);
+    const suppliers = [];
+    if (includeBuiltIns) {
+      suppliers.push(
+        {
+          id: "akunding",
+          name: "Alaba Store",
+          type: "akunding",
+          enabled: true,
+          configured: true,
+          productSync: true,
+          automaticFulfillment: true,
+          orderReconciliation: true,
+          capabilities: { productSync: true, automaticFulfillment: true, orderReconciliation: true },
+        },
+        {
+          id: "emma",
+          name: "Emma Store",
+          type: "emma",
+          enabled: true,
+          configured: true,
+          productSync: true,
+          automaticFulfillment: true,
+          orderReconciliation: true,
+          capabilities: { productSync: true, automaticFulfillment: true, orderReconciliation: true },
+        }
+      );
+    }
+    return suppliers.concat(Object.values(normalized.suppliers || {}).map((supplier) => this.sanitizeDigitalServiceSupplier(supplier)));
+  }
+
+  getDigitalServiceSupplier(supplierId) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const supplier = this.db.systemSettings.digitalServices.suppliers?.[id];
+    if (!supplier) {
+      throw new Error("Supplier not found.");
+    }
+    return this.sanitizeDigitalServiceSupplier(supplier);
+  }
+
+  getDigitalServiceSupplierRuntimeConfig(supplierId) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const supplier = this.db.systemSettings.digitalServices.suppliers?.[id];
+    return supplier ? this.sanitizeDigitalServiceSupplier(supplier, { runtime: true }) : null;
   }
 
   getDigitalServiceSettings() {
@@ -1228,6 +1436,201 @@ class FinancialService {
     });
     this.persist();
     return this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true });
+  }
+
+  saveDigitalServiceSupplier(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    const currentSettings = this.db.systemSettings.digitalServices || defaultSettings().digitalServices;
+    const suppliers = currentSettings.suppliers || {};
+    const id = this.normalizeDigitalServiceSupplierId(input.id || input.name);
+    if (!id) {
+      throw new Error("Supplier name is required.");
+    }
+    if (["akunding", "emma"].includes(id)) {
+      throw new Error("Built-in suppliers cannot be replaced here.");
+    }
+    const existing = suppliers[id] || {};
+    const authType = this.normalizeSupplierAuthType(input.authType ?? existing.authType);
+    const encryptOptional = (plainValue, encryptedValue = "") => {
+      const text = String(plainValue ?? "").trim();
+      return text ? encryptSetting(text) : encryptedValue || "";
+    };
+    let customHeadersEncrypted = existing.customHeadersEncrypted || "";
+    if (input.customHeaders !== undefined) {
+      const customHeaders = typeof input.customHeaders === "string"
+        ? JSON.parse(input.customHeaders || "{}")
+        : input.customHeaders;
+      if (customHeaders && (typeof customHeaders !== "object" || Array.isArray(customHeaders))) {
+        throw new Error("Custom headers must be an object.");
+      }
+      const cleanHeaders = {};
+      for (const [key, value] of Object.entries(customHeaders || {})) {
+        if (!/^[A-Za-z0-9-]+$/.test(key)) {
+          throw new Error(`Invalid custom header name: ${key}`);
+        }
+        if (value !== undefined && value !== null && String(value).trim()) {
+          cleanHeaders[key] = String(value);
+        }
+      }
+      customHeadersEncrypted = Object.keys(cleanHeaders).length ? encryptSetting(JSON.stringify(cleanHeaders)) : "";
+    }
+    const nextSupplier = this.normalizeDigitalServiceSupplierConfig({
+      ...existing,
+      id,
+      name: input.name ?? existing.name ?? id,
+      enabled: input.enabled !== undefined ? input.enabled : existing.enabled,
+      baseUrl: input.baseUrl ?? existing.baseUrl,
+      authType,
+      apiKeyEncrypted: encryptOptional(input.apiKey, existing.apiKeyEncrypted),
+      bearerTokenEncrypted: encryptOptional(input.bearerToken, existing.bearerTokenEncrypted),
+      usernameEncrypted: encryptOptional(input.username, existing.usernameEncrypted),
+      passwordEncrypted: encryptOptional(input.password, existing.passwordEncrypted),
+      customHeadersEncrypted,
+      productEndpoint: input.productEndpoint ?? existing.productEndpoint,
+      orderEndpoint: input.orderEndpoint ?? existing.orderEndpoint,
+      orderStatusEndpoint: input.orderStatusEndpoint ?? existing.orderStatusEndpoint,
+      fieldMapping: input.fieldMapping ?? existing.fieldMapping,
+      capabilities: {
+        ...(existing.capabilities || {}),
+        productSync: input.productSync !== undefined ? input.productSync : existing.capabilities?.productSync,
+        automaticFulfillment: input.automaticFulfillment !== undefined ? input.automaticFulfillment : existing.capabilities?.automaticFulfillment,
+        orderReconciliation: input.orderReconciliation !== undefined ? input.orderReconciliation : existing.capabilities?.orderReconciliation,
+      },
+      updatedBy: admin?.id || "admin",
+      updatedAt: this.clock(),
+      createdAt: existing.createdAt || this.clock(),
+    });
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...currentSettings,
+      suppliers: {
+        ...suppliers,
+        [id]: nextSupplier,
+      },
+      updatedBy: admin?.id || "admin",
+      updatedAt: this.clock(),
+    });
+    this.audit(admin, existing.id ? "DIGITAL_SERVICE_SUPPLIER_UPDATED" : "DIGITAL_SERVICE_SUPPLIER_CREATED", "DigitalServiceSupplier", id, {
+      supplierId: id,
+      authType,
+      automaticFulfillment: nextSupplier.capabilities.automaticFulfillment,
+    }, requestMeta);
+    this.persist();
+    return this.getDigitalServiceSupplier(id);
+  }
+
+  disableDigitalServiceSupplier(admin, supplierId, requestMeta = {}) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const current = this.db.systemSettings.digitalServices.suppliers?.[id];
+    if (!current) {
+      throw new Error("Supplier not found.");
+    }
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      suppliers: {
+        ...this.db.systemSettings.digitalServices.suppliers,
+        [id]: {
+          ...current,
+          enabled: false,
+          disabledAt: this.clock(),
+          updatedAt: this.clock(),
+          updatedBy: admin?.id || "admin",
+        },
+      },
+      updatedAt: this.clock(),
+    });
+    for (const product of this.db.digitalServiceProducts) {
+      if (String(product.provider || "").toLowerCase() === id) {
+        product.available = false;
+        product.providerStatus = "supplier_disabled";
+        product.syncedAt = this.clock();
+      }
+    }
+    this.audit(admin, "DIGITAL_SERVICE_SUPPLIER_DISABLED", "DigitalServiceSupplier", id, { supplierId: id }, requestMeta);
+    this.persist();
+    return this.getDigitalServiceSupplier(id);
+  }
+
+  updateDigitalServiceSupplierMapping(supplierId, fieldMapping = {}) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const current = this.db.systemSettings.digitalServices.suppliers?.[id];
+    if (!current) {
+      throw new Error("Supplier not found.");
+    }
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      suppliers: {
+        ...this.db.systemSettings.digitalServices.suppliers,
+        [id]: {
+          ...current,
+          fieldMapping,
+          updatedAt: this.clock(),
+        },
+      },
+      updatedAt: this.clock(),
+    });
+    this.persist();
+    return this.getDigitalServiceSupplier(id);
+  }
+
+  updateDigitalServiceSupplierStatus(supplierId, { status = "", error = "", connected = null } = {}) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const current = this.db.systemSettings.digitalServices.suppliers?.[id];
+    if (!current) {
+      return null;
+    }
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      suppliers: {
+        ...this.db.systemSettings.digitalServices.suppliers,
+        [id]: {
+          ...current,
+          lastConnectionTestAt: connected !== null ? this.clock() : current.lastConnectionTestAt,
+          lastConnectionStatus: connected === null ? current.lastConnectionStatus : (connected ? "connected" : "failed"),
+          lastConnectionError: error,
+          lastSyncAt: status ? this.clock() : current.lastSyncAt,
+          lastSyncStatus: status || current.lastSyncStatus,
+          lastSyncError: error,
+          updatedAt: this.clock(),
+        },
+      },
+      updatedAt: this.clock(),
+    });
+    this.persist();
+    return this.getDigitalServiceSupplier(id);
+  }
+
+  updateDigitalServiceSupplierSyncStats(supplierId, products = []) {
+    this.ensureState();
+    const id = this.normalizeDigitalServiceSupplierId(supplierId);
+    const current = this.db.systemSettings.digitalServices.suppliers?.[id];
+    if (!current) {
+      return null;
+    }
+    const availableCount = products.filter((product) => product.available !== false).length;
+    const unavailableCount = Math.max(0, products.length - availableCount);
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      suppliers: {
+        ...this.db.systemSettings.digitalServices.suppliers,
+        [id]: {
+          ...current,
+          productCount: products.length,
+          availableCount,
+          unavailableCount,
+          lastSuccessfulSyncAt: this.clock(),
+          lastSyncAt: this.clock(),
+          lastSyncStatus: "connected",
+          lastSyncError: "",
+          updatedAt: this.clock(),
+        },
+      },
+      updatedAt: this.clock(),
+    });
+    this.persist();
+    return this.getDigitalServiceSupplier(id);
   }
 
   convertAmount(amount, fromCurrency, toCurrency, rate = this.db.systemSettings.exchangeRate.usdtToNgn) {
@@ -4733,10 +5136,13 @@ class FinancialService {
     const displayPricing = this.getDigitalServiceDisplayPricing(product, pricing);
     const overrideExists = Object.prototype.hasOwnProperty.call(override, "enabled");
     const visible = overrideExists ? !!override.enabled : true;
-    const supplierAvailable = product.available !== false;
+    const supplierRuntime = this.getDigitalServiceSupplierRuntimeConfig(product.provider);
+    const supplierDisabled = supplierRuntime?.enabled === false;
+    const supplierAvailable = product.available !== false && !supplierDisabled && product.sourceMissing !== true;
     const stock = Number(product.stock || 0);
     const inStock = !Number.isFinite(stock) || stock > 0;
     const available = visible && supplierAvailable && inStock && compare(pricing.sellingPrice, "0") > 0;
+    const availabilityRank = available ? 0 : (supplierAvailable && visible ? 1 : 2);
     const response = {
       id: String(product.id || product.supplierProductId || "").trim(),
       name: override.displayName || product.name || "Digital Service",
@@ -4756,6 +5162,9 @@ class FinancialService {
       stock,
       visible,
       available,
+      availability: available ? "available" : availabilityRank === 1 ? "temporary_unavailable" : "unavailable",
+      availabilityRank,
+      sourceMissing: product.sourceMissing === true,
       featured: !!override.featured,
       order: Number(override.order || 0),
       imageUrl: this.getDigitalServiceImageUrl(product, override),
@@ -4767,6 +5176,7 @@ class FinancialService {
     if (admin) {
       response.supplierProductId = product.supplierProductId || product.id || "";
       response.provider = product.provider || "akunding";
+      response.automaticFulfillment = product.automaticFulfillment !== false;
       response.providerCost = product.providerCost || "0";
       response.supplierCurrency = product.currency || "NGN";
       response.providerCostNgn = pricing.providerCostNgn;
@@ -4803,7 +5213,12 @@ class FinancialService {
         }
         return `${product.name} ${product.description} ${product.category}`.toLowerCase().includes(normalizedQuery);
       })
-      .sort((a, b) => Number(b.featured) - Number(a.featured) || Number(a.order || 0) - Number(b.order || 0) || a.name.localeCompare(b.name));
+      .sort((a, b) =>
+        Number(a.availabilityRank || 0) - Number(b.availabilityRank || 0)
+        || Number(b.featured) - Number(a.featured)
+        || Number(a.order || 0) - Number(b.order || 0)
+        || a.name.localeCompare(b.name)
+      );
   }
 
   getDigitalServiceProduct(productId, { admin = false } = {}) {
@@ -4825,15 +5240,16 @@ class FinancialService {
 
   replaceDigitalServiceProducts(products = [], { provider = "akunding" } = {}) {
     this.ensureState();
-    const providerKey = String(provider || "akunding").trim().toLowerCase();
+    const providerKey = this.normalizeDigitalServiceSupplierId(provider) || "akunding";
+    const supplierRuntime = this.getDigitalServiceSupplierRuntimeConfig(providerKey);
     const normalizedProducts = products
       .map((product) => ({
         ...product,
         id: String(product.id || product.supplierProductId || "").trim(),
         supplierProductId: String(product.supplierProductId || product.id || "").trim(),
         provider: providerKey,
-        storeKey: product.storeKey || (providerKey === "emma" ? "emma" : "alaba"),
-        storeName: product.storeName || (providerKey === "emma" ? "Emma Store" : "Alaba Store"),
+        storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "akunding" ? "alaba" : providerKey),
+        storeName: product.storeName || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
         syncedAt: product.syncedAt || this.clock(),
       }))
       .filter((product) => product.id && product.supplierProductId);
@@ -4843,7 +5259,8 @@ class FinancialService {
         nextById.set(existing.id, {
           ...existing,
           available: false,
-          providerStatus: "unavailable",
+          providerStatus: "source_missing",
+          sourceMissing: true,
           syncedAt: this.clock(),
         });
       }
@@ -4860,14 +5277,16 @@ class FinancialService {
 
   upsertDigitalServiceProduct(product = {}, { provider = "akunding" } = {}) {
     this.ensureState();
-    const providerKey = String(provider || "akunding").trim().toLowerCase();
+    const providerKey = this.normalizeDigitalServiceSupplierId(provider) || "akunding";
+    const supplierRuntime = this.getDigitalServiceSupplierRuntimeConfig(providerKey);
     const normalized = {
       ...product,
       id: String(product.id || product.supplierProductId || "").trim(),
       supplierProductId: String(product.supplierProductId || product.id || "").trim(),
       provider: providerKey,
-      storeKey: product.storeKey || (providerKey === "emma" ? "emma" : "alaba"),
-      storeName: product.storeName || (providerKey === "emma" ? "Emma Store" : "Alaba Store"),
+      storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "akunding" ? "alaba" : providerKey),
+      storeName: product.storeName || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
+      sourceMissing: false,
       syncedAt: product.syncedAt || this.clock(),
     };
     if (!normalized.id || !normalized.supplierProductId) {

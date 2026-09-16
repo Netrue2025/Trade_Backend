@@ -1,3 +1,5 @@
+const dns = require("node:dns/promises");
+const net = require("node:net");
 const { add, compare, multiplyRatio, subtract } = require("../lib/money");
 const { decryptSetting, encryptSetting } = require("../lib/settingsCrypto");
 
@@ -49,6 +51,52 @@ const PROCESSING_STATUSES = new Set(["pending", "processing", "queued", "created
 const PROVIDER_LABELS = {
   akunding: "Alaba Store",
   emma: "Emma Store",
+};
+const GENERIC_TIMEOUT_MS = 25000;
+const PRODUCT_FIELD_MAPPING_KEYS = {
+  supplierProductId: ["id", "product_id", "productId", "variation_id", "sku"],
+  name: ["name", "title", "product_name", "service_name", "label"],
+  description: ["description", "details", "summary", "short_description"],
+  category: ["category", "category_name", "type", "service", "group"],
+  supplierCost: [
+    "reseller_price",
+    "resellerPrice",
+    "reseller_amount",
+    "resellerAmount",
+    "wholesale_price",
+    "wholesalePrice",
+    "cost",
+    "provider_cost",
+    "providerCost",
+    "api_cost",
+    "apiCost",
+    "price",
+    "unit_price",
+    "unitPrice",
+    "amount",
+    "rate",
+    "selling_price",
+    "sellingPrice",
+    "naira_price",
+    "ngn_price",
+    "usd_price",
+  ],
+  availability: ["status", "availability", "availability_status", "availabilityStatus", "state", "available", "stock"],
+  image: [
+    "image",
+    "image_url",
+    "imageUrl",
+    "product_image",
+    "productImage",
+    "photo_url",
+    "photoUrl",
+    "thumbnail",
+    "thumbnail_url",
+    "thumbnailUrl",
+    "icon",
+    "logo",
+    "photo",
+  ],
 };
 
 function clone(value) {
@@ -106,6 +154,29 @@ function firstValue(object = {}, keys = []) {
   return "";
 }
 
+function getPathValue(object = {}, path = "") {
+  const parts = String(path || "").split(".").map((part) => part.trim()).filter(Boolean);
+  let current = object;
+  for (const part of parts) {
+    if (!current || typeof current !== "object" || current[part] === undefined || current[part] === null) {
+      return "";
+    }
+    current = current[part];
+  }
+  return current === undefined || current === null ? "" : current;
+}
+
+function mappedValue(raw = {}, mapping = {}, field = "", fallbackKeys = []) {
+  const mappedKey = String(mapping?.[field] || "").trim();
+  if (mappedKey) {
+    const value = getPathValue(raw, mappedKey);
+    if (value !== undefined && value !== null && value !== "") {
+      return value;
+    }
+  }
+  return firstValue(raw, fallbackKeys);
+}
+
 function extractSupplierRows(payload) {
   if (Array.isArray(payload)) {
     return payload;
@@ -148,8 +219,8 @@ function extractSupplierRecord(payload) {
   return payload;
 }
 
-function normalizeProductId(raw = {}) {
-  return String(firstValue(raw, ["id", "product_id", "productId", "variation_id", "sku"]) || "").trim();
+function normalizeProductId(raw = {}, mapping = {}) {
+  return String(mappedValue(raw, mapping, "supplierProductId", PRODUCT_FIELD_MAPPING_KEYS.supplierProductId) || "").trim();
 }
 
 function normalizeNumber(value, fallback = 0) {
@@ -169,16 +240,16 @@ function normalizeAmountText(value, fallback = "0") {
   return /^-?\d+(?:\.\d+)?$/.test(text) ? text : String(fallback);
 }
 
-function normalizeCategory(raw = {}) {
-  return normalizeText(firstValue(raw, ["category", "category_name", "type", "service", "group"]), "Digital");
+function normalizeCategory(raw = {}, mapping = {}) {
+  return normalizeText(mappedValue(raw, mapping, "category", PRODUCT_FIELD_MAPPING_KEYS.category), "Digital");
 }
 
-function normalizeName(raw = {}) {
-  return normalizeText(firstValue(raw, ["name", "title", "product_name", "service_name", "label"]), "Digital Service");
+function normalizeName(raw = {}, mapping = {}) {
+  return normalizeText(mappedValue(raw, mapping, "name", PRODUCT_FIELD_MAPPING_KEYS.name), "Digital Service");
 }
 
-function normalizeDescription(raw = {}) {
-  return normalizeText(firstValue(raw, ["description", "details", "summary", "short_description"]), "");
+function normalizeDescription(raw = {}, mapping = {}) {
+  return normalizeText(mappedValue(raw, mapping, "description", PRODUCT_FIELD_MAPPING_KEYS.description), "");
 }
 
 function normalizeCurrency(raw = {}, fallback = "NGN") {
@@ -193,34 +264,12 @@ function normalizeCurrency(raw = {}, fallback = "NGN") {
   return value || fallback;
 }
 
-function normalizeProviderCost(raw = {}) {
-  return normalizeAmountText(firstValue(raw, [
-    "reseller_price",
-    "resellerPrice",
-    "reseller_amount",
-    "resellerAmount",
-    "wholesale_price",
-    "wholesalePrice",
-    "cost",
-    "provider_cost",
-    "providerCost",
-    "api_cost",
-    "apiCost",
-    "price",
-    "unit_price",
-    "unitPrice",
-    "amount",
-    "rate",
-    "selling_price",
-    "sellingPrice",
-    "naira_price",
-    "ngn_price",
-    "usd_price",
-  ]), "0");
+function normalizeProviderCost(raw = {}, mapping = {}) {
+  return normalizeAmountText(mappedValue(raw, mapping, "supplierCost", PRODUCT_FIELD_MAPPING_KEYS.supplierCost), "0");
 }
 
-function normalizeStock(raw = {}) {
-  const stock = firstValue(raw, ["stock", "available_quantity", "quantity_available", "quantityAvailable", "qty", "available_stock", "availableStock", "available"]);
+function normalizeStock(raw = {}, mapping = {}) {
+  const stock = mappedValue(raw, mapping, "availability", ["stock", "available_quantity", "quantity_available", "quantityAvailable", "qty", "available_stock", "availableStock", "available"]);
   if (stock === true) {
     return 999999;
   }
@@ -230,35 +279,21 @@ function normalizeStock(raw = {}) {
   return Math.max(0, Math.floor(normalizeNumber(stock, 999999)));
 }
 
-function normalizeStatus(raw = {}) {
-  const status = normalizeText(firstValue(raw, ["status", "availability", "availability_status", "availabilityStatus", "state", "available"]), "active").toLowerCase();
+function normalizeStatus(raw = {}, mapping = {}) {
+  const status = normalizeText(mappedValue(raw, mapping, "availability", ["status", "availability", "availability_status", "availabilityStatus", "state", "available"]), "active").toLowerCase();
   return status || "active";
 }
 
-function isProductAvailable(raw = {}) {
-  const status = normalizeStatus(raw);
+function isProductAvailable(raw = {}, mapping = {}) {
+  const status = normalizeStatus(raw, mapping);
   if (["false", "0", "inactive", "disabled", "unavailable", "temporary_unavailable", "temporarily_unavailable", "out_of_stock", "out of stock", "sold_out", "sold out"].includes(status)) {
     return false;
   }
-  return normalizeStock(raw) > 0;
+  return normalizeStock(raw, mapping) > 0;
 }
 
-function getImageCandidate(raw = {}) {
-  const image = firstValue(raw, [
-    "image",
-    "image_url",
-    "imageUrl",
-    "product_image",
-    "productImage",
-    "photo_url",
-    "photoUrl",
-    "thumbnail",
-    "thumbnail_url",
-    "thumbnailUrl",
-    "icon",
-    "logo",
-    "photo",
-  ]);
+function getImageCandidate(raw = {}, mapping = {}) {
+  const image = mappedValue(raw, mapping, "image", PRODUCT_FIELD_MAPPING_KEYS.image);
   if (Array.isArray(image)) {
     return image[0] || "";
   }
@@ -281,17 +316,208 @@ function normalizeSupplierImageUrl(value, baseUrl = "https://akunding.shop") {
 }
 
 function normalizeProviderKey(value = "akunding") {
-  const key = String(value || "akunding").trim().toLowerCase();
-  return key === "emma" ? "emma" : "akunding";
+  const key = String(value || "akunding").trim().toLowerCase().replace(/[^a-z0-9:_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return key || "akunding";
 }
 
-function getProviderStoreLabel(provider = "akunding") {
-  return PROVIDER_LABELS[normalizeProviderKey(provider)] || "Alaba Store";
+function getProviderStoreLabel(provider = "akunding", supplier = null) {
+  return supplier?.name || PROVIDER_LABELS[normalizeProviderKey(provider)] || "Supplier Store";
 }
 
 function createProviderProductId(provider, supplierProductId) {
   const id = String(supplierProductId || "").trim();
-  return normalizeProviderKey(provider) === "emma" ? `emma:${id}` : id;
+  const providerKey = normalizeProviderKey(provider);
+  return providerKey === "akunding" ? id : `${providerKey}:${id}`;
+}
+
+function isPrivateIp(address = "") {
+  const value = String(address || "").trim().toLowerCase();
+  if (!value) {
+    return true;
+  }
+  if (value === "::1" || value === "0:0:0:0:0:0:0:1") {
+    return true;
+  }
+  if (value.startsWith("fe80:") || value.startsWith("fc") || value.startsWith("fd")) {
+    return true;
+  }
+  if (net.isIP(value) === 4) {
+    const [a, b] = value.split(".").map((part) => Number(part));
+    return a === 10
+      || a === 127
+      || a === 0
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127);
+  }
+  return false;
+}
+
+function isBlockedSupplierHostname(hostname = "") {
+  const host = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return !host
+    || host === "localhost"
+    || host.endsWith(".localhost")
+    || host === "metadata.google.internal"
+    || host === "metadata"
+    || host === "169.254.169.254"
+    || isPrivateIp(host);
+}
+
+async function validateSupplierUrl(value = "", { allowHttp = process.env.NODE_ENV !== "production", resolveDns = true } = {}) {
+  let url;
+  try {
+    url = new URL(String(value || "").trim());
+  } catch {
+    throw new Error("Supplier URL is invalid.");
+  }
+  if (!["https:", "http:"].includes(url.protocol)) {
+    throw new Error("Supplier URL protocol is not supported.");
+  }
+  if (url.protocol !== "https:" && !allowHttp) {
+    throw new Error("Supplier URL must use HTTPS.");
+  }
+  if (isBlockedSupplierHostname(url.hostname)) {
+    throw new Error("Supplier URL cannot target local or private networks.");
+  }
+  if (resolveDns && !net.isIP(url.hostname)) {
+    const records = await dns.lookup(url.hostname, { all: true }).catch(() => []);
+    if (records.some((record) => isPrivateIp(record.address))) {
+      throw new Error("Supplier URL resolves to a private network.");
+    }
+  }
+  return url;
+}
+
+function joinSupplierUrl(baseUrl = "", endpoint = "") {
+  const cleanBase = String(baseUrl || "").replace(/\/+$/, "");
+  const cleanEndpoint = String(endpoint || "").trim();
+  return new URL(cleanEndpoint.startsWith("/") ? cleanEndpoint : `/${cleanEndpoint}`, `${cleanBase}/`).toString();
+}
+
+function inferProductMapping(rows = []) {
+  const sample = rows.find((row) => row && typeof row === "object" && !Array.isArray(row)) || {};
+  const keys = new Set(Object.keys(sample));
+  const mapping = {};
+  for (const [field, candidates] of Object.entries(PRODUCT_FIELD_MAPPING_KEYS)) {
+    const match = candidates.find((candidate) => keys.has(candidate));
+    if (match) {
+      mapping[field] = match;
+    }
+  }
+  return mapping;
+}
+
+class GenericSupplierService {
+  constructor({ config = {}, fetchImpl = global.fetch } = {}) {
+    this.config = config || {};
+    this.fetchImpl = fetchImpl;
+    this.baseUrl = String(config.baseUrl || "").replace(/\/+$/, "");
+    this.timeoutMs = Number(config.timeoutMs || GENERIC_TIMEOUT_MS);
+  }
+
+  isConfigured() {
+    return !!this.baseUrl && !!this.config.productEndpoint && this.config.enabled !== false;
+  }
+
+  getPublicStatus() {
+    return {
+      configured: this.isConfigured(),
+      enabled: this.config.enabled !== false,
+      baseUrl: this.baseUrl,
+      productSync: true,
+      automaticFulfillment: false,
+      orderReconciliation: false,
+    };
+  }
+
+  buildHeaders(idempotencyKey = "") {
+    const headers = { Accept: "application/json" };
+    const authType = String(this.config.authType || "none").toLowerCase();
+    if (idempotencyKey) {
+      headers["X-Idempotency-Key"] = String(idempotencyKey).slice(0, 120);
+    }
+    if (authType === "api_key" && this.config.apiKey) {
+      headers["X-API-Key"] = this.config.apiKey;
+    }
+    if (authType === "bearer" && this.config.bearerToken) {
+      headers.Authorization = `Bearer ${this.config.bearerToken}`;
+    }
+    if (authType === "basic" && (this.config.username || this.config.password)) {
+      headers.Authorization = `Basic ${Buffer.from(`${this.config.username || ""}:${this.config.password || ""}`).toString("base64")}`;
+    }
+    if (authType === "custom_headers" && this.config.customHeaders && typeof this.config.customHeaders === "object") {
+      for (const [key, value] of Object.entries(this.config.customHeaders)) {
+        if (/^[A-Za-z0-9-]+$/.test(key) && value !== undefined && value !== null) {
+          headers[key] = String(value);
+        }
+      }
+    }
+    return headers;
+  }
+
+  async request(endpoint = "", { method = "GET", body = null, idempotencyKey = "" } = {}) {
+    if (!this.fetchImpl) {
+      throw new Error("Fetch API is unavailable for supplier requests.");
+    }
+    const target = joinSupplierUrl(this.baseUrl, endpoint);
+    await validateSupplierUrl(target);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Number.isFinite(this.timeoutMs) ? this.timeoutMs : GENERIC_TIMEOUT_MS);
+    try {
+      const response = await this.fetchImpl(target, {
+        method,
+        redirect: "manual",
+        headers: {
+          ...this.buildHeaders(idempotencyKey),
+          ...(body ? { "Content-Type": "application/json" } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(Number(response.status))) {
+        const location = response.headers?.get?.("location") || "";
+        if (!location) {
+          throw new Error("Supplier redirected without a target.");
+        }
+        await validateSupplierUrl(new URL(location, target).toString());
+        throw new Error("Supplier redirects are not followed automatically.");
+      }
+      const text = await response.text();
+      let payload = {};
+      try {
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        payload = { message: text };
+      }
+      if (!response.ok) {
+        const error = new Error(String(payload.message || payload.detail || payload.error || `Supplier request failed with HTTP ${response.status}.`));
+        error.statusCode = response.status;
+        error.payload = payload;
+        throw error;
+      }
+      return payload;
+    } catch (error) {
+      if (error.name === "AbortError") {
+        const timeoutError = new Error("Supplier request timed out.");
+        timeoutError.code = "SUPPLIER_TIMEOUT";
+        timeoutError.statusCode = 504;
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  testConnection() {
+    return this.request(this.config.productEndpoint || "", { method: "GET" });
+  }
+
+  listProducts() {
+    return this.request(this.config.productEndpoint || "", { method: "GET" });
+  }
 }
 
 function normalizeMarkupMode(value) {
@@ -378,14 +604,47 @@ class DigitalServicesService {
   }
 
   getProviderService(provider = "akunding") {
-    return normalizeProviderKey(provider) === "emma" ? this.emmaService : this.akundingService;
+    const providerKey = normalizeProviderKey(provider);
+    if (providerKey === "akunding") {
+      return this.akundingService;
+    }
+    if (providerKey === "emma") {
+      return this.emmaService;
+    }
+    const config = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(providerKey);
+    return config ? new GenericSupplierService({ config }) : null;
   }
 
   getProviderStatuses() {
-    return {
-      akunding: this.akundingService?.getPublicStatus?.() || { configured: false },
-      emma: this.emmaService?.getPublicStatus?.() || { configured: false },
+    const statuses = {
+      akunding: {
+        id: "akunding",
+        name: "Alaba Store",
+        type: "akunding",
+        enabled: true,
+        productSync: true,
+        automaticFulfillment: true,
+        orderReconciliation: true,
+        ...(this.akundingService?.getPublicStatus?.() || { configured: false }),
+      },
+      emma: {
+        id: "emma",
+        name: "Emma Store",
+        type: "emma",
+        enabled: true,
+        productSync: true,
+        automaticFulfillment: true,
+        orderReconciliation: true,
+        ...(this.emmaService?.getPublicStatus?.() || { configured: false }),
+      },
     };
+    for (const supplier of this.financialService.listDigitalServiceSuppliers?.({ includeBuiltIns: false }) || []) {
+      statuses[supplier.id] = {
+        ...supplier,
+        configured: supplier.enabled !== false && !!supplier.baseUrl && !!supplier.productEndpoint,
+      };
+    }
+    return statuses;
   }
 
   getStatus() {
@@ -399,25 +658,32 @@ class DigitalServicesService {
     };
   }
 
-  normalizeSupplierProduct(raw = {}, { provider = "akunding", service = this.getProviderService(provider) } = {}) {
+  normalizeSupplierProduct(raw = {}, { provider = "akunding", service = this.getProviderService(provider), supplier = null, mapping = null } = {}) {
     const normalizedProvider = normalizeProviderKey(provider);
-    const supplierProductId = normalizeProductId(raw);
+    const supplierConfig = supplier || this.financialService.getDigitalServiceSupplierRuntimeConfig?.(normalizedProvider) || null;
+    const productMapping = mapping || supplierConfig?.fieldMapping || {};
+    const supplierProductId = normalizeProductId(raw, productMapping);
     const supplierCurrency = normalizeCurrency(raw, normalizedProvider === "emma" ? "USD" : "NGN");
+    const storeName = getProviderStoreLabel(normalizedProvider, supplierConfig);
+    const storeKey = supplierConfig?.storeKey || (normalizedProvider === "emma" ? "emma" : normalizedProvider === "akunding" ? "alaba" : normalizedProvider);
+    const automaticFulfillment = normalizedProvider === "akunding" || normalizedProvider === "emma" || supplierConfig?.capabilities?.automaticFulfillment === true;
     return {
       id: createProviderProductId(normalizedProvider, supplierProductId),
       supplierProductId,
       provider: normalizedProvider,
-      storeKey: normalizedProvider === "emma" ? "emma" : "alaba",
-      storeName: getProviderStoreLabel(normalizedProvider),
-      name: normalizeName(raw),
-      description: normalizeDescription(raw),
-      category: normalizeCategory(raw) || getProviderStoreLabel(normalizedProvider),
+      storeKey,
+      storeName,
+      name: normalizeName(raw, productMapping),
+      description: normalizeDescription(raw, productMapping),
+      category: normalizeCategory(raw, productMapping) || storeName,
       currency: normalizedProvider === "emma" && supplierCurrency === "NGN" ? "USD" : supplierCurrency,
-      providerCost: normalizeProviderCost(raw),
-      stock: normalizeStock(raw),
-      providerStatus: normalizeStatus(raw),
-      available: isProductAvailable(raw),
-      imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw), service?.baseUrl || "https://akunding.shop"),
+      providerCost: normalizeProviderCost(raw, productMapping),
+      stock: normalizeStock(raw, productMapping),
+      providerStatus: normalizeStatus(raw, productMapping),
+      available: automaticFulfillment && supplierConfig?.enabled !== false && isProductAvailable(raw, productMapping),
+      sourceMissing: false,
+      automaticFulfillment,
+      imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw, productMapping), service?.baseUrl || supplierConfig?.baseUrl || "https://akunding.shop"),
       deliveryLabel: normalizeText(firstValue(raw, ["delivery", "delivery_time", "delivery_label", "duration"]), "After purchase"),
       planLabel: normalizeText(firstValue(raw, ["plan", "duration", "validity"]), ""),
       raw,
@@ -432,25 +698,117 @@ class DigitalServicesService {
     }
     const synced = [];
     const errors = [];
-    for (const provider of ["akunding", "emma"]) {
+    for (const provider of this.getSyncProviderKeys()) {
       const service = this.getProviderService(provider);
       if (!service?.isConfigured?.()) {
         continue;
       }
       try {
         const products = await service.listProducts({ includeOutOfStock: true });
+        const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(provider) || null;
         const normalized = extractSupplierRows(products)
-          .map((product) => this.normalizeSupplierProduct(extractSupplierRecord(product), { provider, service }))
+          .map((product) => this.normalizeSupplierProduct(extractSupplierRecord(product), { provider, service, supplier }))
           .filter((product) => product.supplierProductId);
         synced.push(...this.financialService.replaceDigitalServiceProducts(normalized, { provider: normalizeProviderKey(provider) }));
+        this.financialService.updateDigitalServiceSupplierSyncStats?.(provider, normalized);
       } catch (error) {
         errors.push(`${getProviderStoreLabel(provider)}: ${error.message}`);
+        this.financialService.updateDigitalServiceSupplierStatus?.(provider, { status: "failed", error: error.message });
       }
     }
     if (!synced.length && errors.length) {
       throw new Error(errors.join(" | "));
     }
     return this.financialService.listDigitalServiceProducts({ includeInactive: true, admin: true });
+  }
+
+  getSyncProviderKeys() {
+    const keys = ["akunding", "emma"];
+    for (const supplier of this.financialService.listDigitalServiceSuppliers?.({ includeBuiltIns: false }) || []) {
+      if (supplier.enabled !== false && supplier.productSync !== false) {
+        keys.push(supplier.id);
+      }
+    }
+    return keys;
+  }
+
+  analyzeSupplierProducts(payload, { supplierId = "", mapping = null } = {}) {
+    const rows = extractSupplierRows(payload).map((row) => extractSupplierRecord(row));
+    const detectedMapping = mapping || inferProductMapping(rows);
+    const missing = ["supplierProductId", "name", "supplierCost"].filter((field) => !detectedMapping[field]);
+    return {
+      rows,
+      mapping: detectedMapping,
+      missing,
+      canImport: missing.length === 0,
+      products: rows.slice(0, 50).map((row) => this.normalizeSupplierProduct(row, {
+        provider: supplierId,
+        supplier: this.financialService.getDigitalServiceSupplierRuntimeConfig?.(supplierId),
+        mapping: detectedMapping,
+        service: this.getProviderService(supplierId),
+      })).filter((product) => product.supplierProductId),
+    };
+  }
+
+  async testSupplierConnection(input = {}) {
+    const service = new GenericSupplierService({ config: input });
+    const payload = await service.testConnection();
+    const rows = extractSupplierRows(payload);
+    return {
+      connected: true,
+      productCount: rows.length,
+      mapping: inferProductMapping(rows.map((row) => extractSupplierRecord(row))),
+    };
+  }
+
+  async previewSupplierProducts(supplierId) {
+    const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+    if (!supplier || supplier.enabled === false) {
+      throw new Error("Supplier is disabled or unavailable.");
+    }
+    const service = this.getProviderService(supplier.id);
+    const payload = await service.listProducts();
+    const preview = this.analyzeSupplierProducts(payload, { supplierId: supplier.id, mapping: supplier.fieldMapping });
+    return {
+      supplier: this.financialService.getDigitalServiceSupplier(supplier.id),
+      productCount: preview.rows.length,
+      availableCount: preview.products.filter((product) => product.available).length,
+      unavailableCount: preview.products.filter((product) => !product.available).length,
+      mapping: preview.mapping,
+      missing: preview.missing,
+      canImport: preview.canImport,
+      products: preview.products,
+    };
+  }
+
+  async importSupplierProducts(supplierId, { mapping = null } = {}) {
+    const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+    if (!supplier || supplier.enabled === false) {
+      throw new Error("Supplier is disabled or unavailable.");
+    }
+    const service = this.getProviderService(supplier.id);
+    const payload = await service.listProducts();
+    const preview = this.analyzeSupplierProducts(payload, { supplierId: supplier.id, mapping: mapping || supplier.fieldMapping });
+    if (!preview.canImport) {
+      const error = new Error(`Map required fields before import: ${preview.missing.join(", ")}`);
+      error.statusCode = 400;
+      error.mapping = preview.mapping;
+      error.missing = preview.missing;
+      throw error;
+    }
+    if (mapping) {
+      this.financialService.updateDigitalServiceSupplierMapping(supplier.id, preview.mapping);
+    }
+    const imported = this.financialService.replaceDigitalServiceProducts(preview.products, { provider: supplier.id });
+    this.financialService.updateDigitalServiceSupplierSyncStats?.(supplier.id, preview.products);
+    return {
+      products: imported,
+      summary: {
+        importedCount: preview.products.length,
+        availableCount: preview.products.filter((product) => product.available).length,
+        unavailableCount: preview.products.filter((product) => !product.available).length,
+      },
+    };
   }
 
   async refreshProduct(productId) {
@@ -461,6 +819,10 @@ class DigitalServicesService {
     const current = this.financialService.getDigitalServiceProduct(productId, { admin: true });
     const provider = normalizeProviderKey(current.provider);
     const service = this.getProviderService(provider);
+    const supplierConfig = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(provider);
+    if (supplierConfig?.enabled === false) {
+      throw new Error("Digital Services supplier is disabled.");
+    }
     if (!service?.isConfigured?.()) {
       throw new Error("Digital Services supplier is not configured.");
     }
@@ -584,6 +946,15 @@ class DigitalServicesService {
     const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
     const provider = normalizeProviderKey(order.provider || product.provider);
     const service = this.getProviderService(provider);
+    const supplierConfig = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(provider);
+    if (supplierConfig?.enabled === false || supplierConfig?.capabilities?.automaticFulfillment === false) {
+      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+        status: "processing",
+        supplierStatus: supplierConfig?.enabled === false ? "supplier_disabled" : "manual_fulfillment_required",
+        fulfillmentStatus: "failed_retryable",
+        message: supplierConfig?.enabled === false ? "Supplier is disabled." : "Supplier requires manual fulfillment/reconciliation.",
+      }, actor, requestMeta);
+    }
     if (!service?.isConfigured?.()) {
       return this.financialService.applyDigitalServiceOrderResult(order.id, {
         status: "processing",
@@ -597,6 +968,14 @@ class DigitalServicesService {
       const reconciled = mergeSupplierPayloads(reconciledPayloads);
       if (reconciled) {
         return this.applySupplierResult(order.id, reconciled, actor, requestMeta);
+      }
+      if (typeof service.createOrder !== "function") {
+        return this.financialService.applyDigitalServiceOrderResult(order.id, {
+          status: "processing",
+          supplierStatus: "manual_fulfillment_required",
+          fulfillmentStatus: "failed_retryable",
+          message: "Supplier does not support automatic fulfillment.",
+        }, actor, requestMeta);
       }
       const providerResponse = await service.createOrder({
         productId: order.supplierProductId || product.supplierProductId,
@@ -613,12 +992,21 @@ class DigitalServicesService {
       if (extractDeliveryPayload(error.payload)) {
         return this.applySupplierResult(order.id, error.payload, actor, requestMeta);
       }
-      const isFinalFailure = Number(error.statusCode || 0) > 0 && Number(error.statusCode || 0) < 500 && !["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code);
+      const statusCode = Number(error.statusCode || 0);
+      const supplierRouteIssue = provider !== "akunding" && [404, 405].includes(statusCode);
+      const isFinalFailure = statusCode > 0
+        && statusCode < 500
+        && !supplierRouteIssue
+        && !["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"].includes(error.code);
       const payload = {
         status: isFinalFailure ? "failed" : "processing",
-        supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT"].includes(error.code) ? "unknown" : "error",
+        supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"].includes(error.code)
+          ? "unknown"
+          : supplierRouteIssue
+            ? "supplier_endpoint_unavailable"
+            : "error",
         fulfillmentStatus: isFinalFailure ? "failed_final" : "failed_retryable",
-        message: isFinalFailure ? error.message : "Supplier status is pending confirmation.",
+        message: isFinalFailure ? error.message : supplierRouteIssue ? "Supplier order endpoint needs review before retry." : "Supplier status is pending confirmation.",
       };
       return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
     }
@@ -730,8 +1118,11 @@ class DigitalServicesService {
 
 module.exports = {
   DigitalServicesService,
+  GenericSupplierService,
   PRODUCT_CACHE_TTL_MS,
   extractDeliveryPayload,
   extractSupplierRows,
+  inferProductMapping,
   mapSupplierStatus,
+  validateSupplierUrl,
 };

@@ -936,3 +936,43 @@ test("mongo snapshot merge keeps newer conflicting Store override", () => {
   assert.equal(merged.systemSettings.digitalServices.productOverrides["94"].displayName, "Gemini Pro");
   assert.equal(merged.systemSettings.digitalServices.productOverrides["94"].customPriceNgn, "2500");
 });
+
+test("mongo snapshot merge preserves newer Store supplier settings", () => {
+  const staleSave = {
+    systemSettings: {
+      digitalServices: {
+        enabled: true,
+        updatedAt: "2026-09-11T08:00:00.000Z",
+        suppliers: {
+          vendor: {
+            id: "vendor",
+            name: "Old Vendor",
+            baseUrl: "https://old.example/api",
+          },
+        },
+      },
+    },
+  };
+  const currentMongo = {
+    systemSettings: {
+      digitalServices: {
+        enabled: true,
+        updatedAt: "2026-09-11T10:00:00.000Z",
+        suppliers: {
+          vendor: {
+            id: "vendor",
+            name: "Live Vendor",
+            baseUrl: "https://live.example/api",
+            productEndpoint: "/products",
+          },
+        },
+      },
+    },
+  };
+
+  const merged = mergeMongoSnapshots(staleSave, currentMongo);
+
+  assert.equal(merged.systemSettings.digitalServices.suppliers.vendor.name, "Live Vendor");
+  assert.equal(merged.systemSettings.digitalServices.suppliers.vendor.baseUrl, "https://live.example/api");
+  assert.equal(merged.systemSettings.digitalServices.suppliers.vendor.productEndpoint, "/products");
+});

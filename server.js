@@ -58,7 +58,7 @@ const { TelegramService } = require("./services/telegramService");
 const { PushNotificationService } = require("./services/pushNotificationService");
 const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
 const { EmmaResellerService, DEFAULT_EMMA_RESELLER_BASE_URL } = require("./services/emmaReseller.service");
-const { DigitalServicesService } = require("./services/digitalServices.service");
+const { DigitalServicesService, validateSupplierUrl } = require("./services/digitalServices.service");
 const {
   VtuService,
   VTU_BASE_URL,
@@ -5765,13 +5765,17 @@ async function handleApi(req, res, url) {
       });
       const categories = [...new Set(financialService.listDigitalServiceProducts({ store }).map((product) => product.category).filter(Boolean))].sort((a, b) => a.localeCompare(b));
       const status = digitalServicesService.getStatus();
+      const stores = [
+        { id: "alaba", name: "Alaba Store" },
+        { id: "emma", name: "Emma Store" },
+        ...Object.values(status.suppliers || {})
+          .filter((supplier) => !["akunding", "emma"].includes(String(supplier.id || "")) && supplier.enabled !== false)
+          .map((supplier) => ({ id: supplier.id, name: supplier.name || "Supplier Store" })),
+      ];
       sendJson(res, 200, {
         products,
         categories,
-        stores: [
-          { id: "alaba", name: "Alaba Store" },
-          { id: "emma", name: "Emma Store" },
-        ],
+        stores,
         status: {
           settings: {
             enabled: status.settings.enabled,
@@ -6771,6 +6775,134 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, { settings, supplier: akundingService.getPublicStatus(), suppliers: digitalServicesService.getProviderStatuses() });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/digital-services/suppliers") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const body = await readBody(req);
+      await validateSupplierUrl(body.baseUrl);
+      const supplier = financialService.saveDigitalServiceSupplier(admin, body, getRequestMeta(req));
+      sendJson(res, 201, {
+        supplier,
+        settings: financialService.getDigitalServiceSettings(),
+        suppliers: digitalServicesService.getProviderStatuses(),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/digital-services/suppliers/test") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    let supplierId = "";
+    try {
+      const body = await readBody(req);
+      supplierId = String(body.id || "").trim();
+      const config = supplierId
+        ? financialService.getDigitalServiceSupplierRuntimeConfig(supplierId)
+        : body;
+      if (!config) {
+        throw new Error("Supplier not found.");
+      }
+      const result = await digitalServicesService.testSupplierConnection(config);
+      if (supplierId) {
+        financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: true, error: "" });
+      }
+      sendJson(res, 200, { result, supplier: supplierId ? financialService.getDigitalServiceSupplier(supplierId) : null });
+    } catch (error) {
+      if (supplierId) {
+        financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: false, error: error.message });
+      }
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalSupplierMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/suppliers\/([^/]+)$/);
+  if ((req.method === "PATCH" || req.method === "PUT") && adminDigitalSupplierMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const supplierId = decodeURIComponent(adminDigitalSupplierMatch[1] || "");
+      const body = await readBody(req);
+      const current = financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+      if (!current) {
+        throw new Error("Supplier not found.");
+      }
+      if (body.baseUrl || current.baseUrl) {
+        await validateSupplierUrl(body.baseUrl || current.baseUrl);
+      }
+      const supplier = financialService.saveDigitalServiceSupplier(admin, { ...body, id: supplierId }, getRequestMeta(req));
+      sendJson(res, 200, {
+        supplier,
+        settings: financialService.getDigitalServiceSettings(),
+        suppliers: digitalServicesService.getProviderStatuses(),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalSupplierActionMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/suppliers\/([^/]+)\/(disable|test|preview|import|sync)$/);
+  if (req.method === "POST" && adminDigitalSupplierActionMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    const supplierId = decodeURIComponent(adminDigitalSupplierActionMatch[1] || "");
+    const action = adminDigitalSupplierActionMatch[2];
+    try {
+      if (action === "disable") {
+        const supplier = financialService.disableDigitalServiceSupplier(admin, supplierId, getRequestMeta(req));
+        sendJson(res, 200, {
+          supplier,
+          products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
+          summary: financialService.getDigitalServiceAdminSummary(),
+        });
+        return true;
+      }
+      if (action === "test") {
+        const config = financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+        if (!config) {
+          throw new Error("Supplier not found.");
+        }
+        const result = await digitalServicesService.testSupplierConnection(config);
+        const supplier = financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: true, error: "" }) || financialService.getDigitalServiceSupplier(supplierId);
+        sendJson(res, 200, { result, supplier });
+        return true;
+      }
+      if (action === "preview") {
+        const preview = await digitalServicesService.previewSupplierProducts(supplierId);
+        sendJson(res, 200, preview);
+        return true;
+      }
+      if (action === "import" || action === "sync") {
+        const body = await readBody(req).catch(() => ({}));
+        const imported = await digitalServicesService.importSupplierProducts(supplierId, { mapping: body.mapping || null });
+        sendJson(res, 200, {
+          ...imported,
+          products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
+          suppliers: digitalServicesService.getProviderStatuses(),
+          summary: financialService.getDigitalServiceAdminSummary(),
+        });
+        return true;
+      }
+    } catch (error) {
+      financialService.updateDigitalServiceSupplierStatus(supplierId, { status: "failed", error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
