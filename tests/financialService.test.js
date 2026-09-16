@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
-const { DigitalServicesService, extractDeliveryPayload, mapSupplierStatus, validateSupplierUrl } = require("../services/digitalServices.service");
+const { DigitalServicesService, classifySupplierFulfillmentError, extractDeliveryPayload, mapSupplierStatus, validateSupplierUrl } = require("../services/digitalServices.service");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
@@ -2257,7 +2257,65 @@ test("supplier URL validation rejects SSRF targets", async () => {
   await assert.doesNotReject(() => validateSupplierUrl("https://supplier.example/products", { resolveDns: false }));
 });
 
-test("Emma 404 order endpoint remains retryable and traceable without a second charge", async () => {
+test("supplier fulfillment errors are classified without treating configuration faults as simple retries", () => {
+  const timeout = new Error("timeout");
+  timeout.code = "EMMA_TIMEOUT";
+  timeout.statusCode = 504;
+  assert.equal(classifySupplierFulfillmentError(timeout).fulfillmentStatus, "failed_retryable");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 429 }).supplierStatus, "rate_limited");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 502 }).fulfillmentStatus, "failed_retryable");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 503 }).fulfillmentStatus, "failed_retryable");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 504 }).fulfillmentStatus, "failed_retryable");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 401 }).fulfillmentStatus, "configuration_error");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 403 }).supplierStatus, "supplier_auth_error");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 404 }).supplierStatus, "supplier_endpoint_unavailable");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 405 }).supplierStatus, "supplier_method_not_allowed");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 400 }).fulfillmentStatus, "manual_review");
+  assert.equal(classifySupplierFulfillmentError({ statusCode: 422 }).supplierStatus, "supplier_payload_error");
+});
+
+test("supplier settings add and edit preserve unrelated system settings", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service } = createHarness();
+    db.systemSettings.general.platformName = "NetrueFi Production";
+    db.systemSettings.deposit.bankName = "Preserve Bank";
+    db.systemSettings.trading.minJoinUsdt = "75";
+    service.saveDigitalServiceSupplier(admin, {
+      id: "vendor-keep",
+      name: "Vendor Keep",
+      baseUrl: "https://vendor.example/api",
+      productEndpoint: "/products",
+      apiKey: "secret-one",
+    });
+    service.ensureState();
+    assert.equal(db.systemSettings.general.platformName, "NetrueFi Production");
+    assert.equal(db.systemSettings.deposit.bankName, "Preserve Bank");
+    assert.equal(db.systemSettings.trading.minJoinUsdt, "75");
+    assert.ok(db.systemSettings.digitalServices.suppliers["vendor-keep"]);
+
+    service.saveDigitalServiceSupplier(admin, {
+      id: "vendor-keep",
+      name: "Vendor Keep Edited",
+      baseUrl: "https://vendor.example/api",
+      productEndpoint: "/catalog",
+    });
+    service.ensureState();
+    assert.equal(db.systemSettings.general.platformName, "NetrueFi Production");
+    assert.equal(db.systemSettings.deposit.bankName, "Preserve Bank");
+    assert.equal(db.systemSettings.trading.minJoinUsdt, "75");
+    assert.equal(db.systemSettings.digitalServices.suppliers["vendor-keep"].productEndpoint, "/catalog");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Emma 404 order endpoint is configuration error and traceable without a second charge", async () => {
   const { admin, db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "5000");
   service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
@@ -2298,8 +2356,9 @@ test("Emma 404 order endpoint remains retryable and traceable without a second c
   const wallet = service.ensureWallet(user.id, "NGN");
   assert.equal(order.status, "processing");
   assert.equal(order.paymentStatus, "paid");
-  assert.equal(order.fulfillmentStatus, "failed_retryable");
+  assert.equal(order.fulfillmentStatus, "configuration_error");
   assert.equal(order.supplierStatus, "supplier_endpoint_unavailable");
+  assert.match(order.lastFulfillmentError, /HTTP 404/i);
   assert.equal(wallet.availableBalance, "1000");
   assert.equal(wallet.lockedBalance, "4000");
   assert.equal(supplierCalls, 1);
@@ -2308,6 +2367,77 @@ test("Emma 404 order endpoint remains retryable and traceable without a second c
   assert.equal(retried.id, order.id);
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
   assert.equal(db.digitalServiceOrders.length, 1);
+});
+
+test("Emma 405 configuration error can retry the same paid order after correction", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:405",
+        supplierProductId: "405",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "Emma Method Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "4000",
+        available: true,
+        stock: 2,
+      },
+    ], { provider: "emma" });
+
+    let supplierCalls = 0;
+    const requestIds = [];
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: {
+        baseUrl: "https://ssondigitalworks.online/api/reseller",
+        isConfigured: () => true,
+        listOrders: async () => [],
+        createOrder: async ({ idempotencyKey }) => {
+          supplierCalls += 1;
+          requestIds.push(idempotencyKey);
+          if (supplierCalls === 1) {
+            const error = new Error("Method not allowed");
+            error.statusCode = 405;
+            throw error;
+          }
+          return { data: { id: "EMMA-405-OK", status: "delivered", activation_link: "https://example.com/emma-405" } };
+        },
+      },
+    });
+
+    const failed = await digitalServices.purchase(user, { productId: "emma:405", quantity: 1 }, { idempotencyKey: "emma-405" });
+    assert.equal(failed.paymentStatus, "paid");
+    assert.equal(failed.status, "processing");
+    assert.equal(failed.fulfillmentStatus, "configuration_error");
+    assert.equal(failed.supplierStatus, "supplier_method_not_allowed");
+    assert.match(failed.lastFulfillmentError, /HTTP 405/i);
+
+    const delivered = await digitalServices.fulfillPaidOrder(failed.id, admin);
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.fulfillmentStatus, "fulfilled");
+    assert.equal(delivered.delivery.activationLink, "https://example.com/emma-405");
+    assert.equal(supplierCalls, 2);
+    assert.equal(requestIds[1], requestIds[0]);
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === failed.requestId).length, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
 });
 
 test("digital service order reserves wallet and delivery consumes reserve once", () => {

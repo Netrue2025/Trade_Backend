@@ -543,6 +543,74 @@ function mapSupplierStatus(payload = {}) {
   return "processing";
 }
 
+function classifySupplierFulfillmentError(error = {}) {
+  const statusCode = Number(error.statusCode || 0);
+  const timeoutCodes = ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"];
+  const message = normalizeText(error.message || "Supplier fulfillment failed.");
+  if (timeoutCodes.includes(error.code)) {
+    return {
+      status: "processing",
+      supplierStatus: "unknown",
+      fulfillmentStatus: "failed_retryable",
+      message: "Supplier status is pending confirmation.",
+    };
+  }
+  if (statusCode === 429) {
+    return {
+      status: "processing",
+      supplierStatus: "rate_limited",
+      fulfillmentStatus: "failed_retryable",
+      message: `HTTP ${statusCode}: Supplier rate limit reached. Retry after the supplier cooldown.`,
+    };
+  }
+  if ([502, 503, 504].includes(statusCode)) {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_unavailable",
+      fulfillmentStatus: "failed_retryable",
+      message: `HTTP ${statusCode}: Supplier service is temporarily unavailable.`,
+    };
+  }
+  if ([401, 403].includes(statusCode)) {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_auth_error",
+      fulfillmentStatus: "configuration_error",
+      message: `HTTP ${statusCode}: Supplier authentication rejected the request. Check supplier credentials before retrying.`,
+    };
+  }
+  if (statusCode === 404) {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_endpoint_unavailable",
+      fulfillmentStatus: "configuration_error",
+      message: `HTTP ${statusCode}: Supplier order endpoint rejected the request. Check the endpoint before retrying.`,
+    };
+  }
+  if (statusCode === 405) {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_method_not_allowed",
+      fulfillmentStatus: "configuration_error",
+      message: `HTTP ${statusCode}: Supplier order endpoint rejected the request method. Check the endpoint and method before retrying.`,
+    };
+  }
+  if ([400, 422].includes(statusCode)) {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_payload_error",
+      fulfillmentStatus: "manual_review",
+      message: `HTTP ${statusCode}: Supplier rejected the order payload. Review product mapping and request details before retrying.`,
+    };
+  }
+  return {
+    status: "processing",
+    supplierStatus: "error",
+    fulfillmentStatus: "failed_retryable",
+    message: statusCode ? `HTTP ${statusCode}: ${message}` : "Supplier status is pending confirmation.",
+  };
+}
+
 function extractSupplierOrderId(payload = {}) {
   const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
   return String(firstValue(source, ["id", "order_id", "orderId", "reference", "request_id"]) || "").trim();
@@ -992,22 +1060,7 @@ class DigitalServicesService {
       if (extractDeliveryPayload(error.payload)) {
         return this.applySupplierResult(order.id, error.payload, actor, requestMeta);
       }
-      const statusCode = Number(error.statusCode || 0);
-      const supplierRouteIssue = provider !== "akunding" && [404, 405].includes(statusCode);
-      const isFinalFailure = statusCode > 0
-        && statusCode < 500
-        && !supplierRouteIssue
-        && !["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"].includes(error.code);
-      const payload = {
-        status: isFinalFailure ? "failed" : "processing",
-        supplierStatus: ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"].includes(error.code)
-          ? "unknown"
-          : supplierRouteIssue
-            ? "supplier_endpoint_unavailable"
-            : "error",
-        fulfillmentStatus: isFinalFailure ? "failed_final" : "failed_retryable",
-        message: isFinalFailure ? error.message : supplierRouteIssue ? "Supplier order endpoint needs review before retry." : "Supplier status is pending confirmation.",
-      };
+      const payload = classifySupplierFulfillmentError(error);
       return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
     }
   }
@@ -1120,6 +1173,7 @@ module.exports = {
   DigitalServicesService,
   GenericSupplierService,
   PRODUCT_CACHE_TTL_MS,
+  classifySupplierFulfillmentError,
   extractDeliveryPayload,
   extractSupplierRows,
   inferProductMapping,
