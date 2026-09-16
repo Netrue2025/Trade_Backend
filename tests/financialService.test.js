@@ -2560,6 +2560,222 @@ test("existing paid Emma order retries documented endpoint without a second debi
   }
 });
 
+test("Emma delivery_items response fulfills order with encrypted account credentials", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:31",
+        supplierProductId: "31",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "LEONARDO AI VIDEO GEN",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "1755",
+        available: true,
+        stock: 3,
+      },
+    ], { provider: "emma" });
+
+    const emma = {
+      isConfigured: () => true,
+      createOrder: async ({ idempotencyKey }) => ({
+        ok: true,
+        order_id: 8644,
+        product_id: "31",
+        product_name: "LEONARDO AI VIDEO GEN",
+        quantity: 1,
+        amount: 0.9,
+        delivery_items: ["customer@example.com:secret-pass"],
+        external_order_id: idempotencyKey,
+        status: "completed",
+      }),
+    };
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: emma,
+    });
+
+    const order = await digitalServices.purchase(user, { productId: "emma:31", quantity: 1 }, { idempotencyKey: "emma-real-shape" });
+    const stored = db.digitalServiceOrders[0];
+
+    assert.equal(order.status, "delivered");
+    assert.equal(order.fulfillmentStatus, "fulfilled");
+    assert.equal(stored.supplierOrderId, "8644");
+    assert.equal(order.delivery.email, "customer@example.com");
+    assert.equal(order.delivery.password, "secret-pass");
+    assert.equal(order.delivery.deliveryItems[0].email, "customer@example.com");
+    assert.equal(stored.deliveryEncrypted.includes("secret-pass"), false);
+    assert.equal(JSON.stringify(stored.supplierResponse).includes("secret-pass"), false);
+    assert.equal(stored.supplierResponse.data.delivery_items, "[stored_in_encrypted_delivery]");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "3245");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+    assert.equal(db.transactions.filter((item) => item.reference === order.requestId).length, 1);
+    assert.equal(service.listNotifications(user).some((item) => item.dedupeKey === `digital-service-delivered:${order.id}`), true);
+    assert.equal(JSON.stringify(service.listNotifications(user)).includes("secret-pass"), false);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("delivered Emma order with stored delivery_items can be repaired without supplier retry", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:31",
+        supplierProductId: "31",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "LEONARDO AI VIDEO GEN",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "1755",
+        available: true,
+        stock: 3,
+      },
+    ], { provider: "emma" });
+    const product = service.getDigitalServiceProduct("emma:31", { admin: true });
+    const paid = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const record = db.digitalServiceOrders[0];
+    record.status = "delivered";
+    record.paymentStatus = "paid";
+    record.fulfillmentStatus = "fulfilled";
+    record.supplierStatus = "delivered";
+    record.supplierOrderId = "8644";
+    record.supplierResponse = {
+      data: {
+        ok: true,
+        order_id: 8644,
+        product_id: "31",
+        product_name: "LEONARDO AI VIDEO GEN",
+        quantity: 1,
+        amount: 0.9,
+        delivery_items: ["customer@example.com:secret-pass"],
+        external_order_id: paid.requestId,
+        status: "completed",
+      },
+    };
+    record.deliveryEncrypted = "";
+    record.balanceReserved = false;
+    record.completedAt = "2026-08-30T10:01:00.000Z";
+    service.ensureWallet(user.id, "NGN").lockedBalance = "0";
+    service.updateDigitalServiceLedgerStatus(record.requestId, "SUCCESSFUL", service.ensureWallet(user.id, "NGN").availableBalance);
+
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: {
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          throw new Error("must not call supplier");
+        },
+      },
+    });
+    const beforeWallet = { ...service.ensureWallet(user.id, "NGN") };
+    const beforeTransactions = db.transactions.length;
+
+    const repaired = await digitalServices.fulfillPaidOrder(record.id, admin);
+
+    assert.equal(supplierCalls, 0);
+    assert.equal(repaired.status, "delivered");
+    assert.equal(repaired.delivery.email, "customer@example.com");
+    assert.equal(repaired.delivery.password, "secret-pass");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, beforeWallet.availableBalance);
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, beforeWallet.lockedBalance);
+    assert.equal(db.transactions.length, beforeTransactions);
+    assert.equal(JSON.stringify(db.digitalServiceOrders[0].supplierResponse).includes("secret-pass"), false);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Emma success without delivery is manual review and does not create duplicate debit on retry", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:ASYNC",
+        supplierProductId: "ASYNC",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "Emma Async Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "4000",
+        available: true,
+        stock: 2,
+      },
+    ], { provider: "emma" });
+
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: {
+        isConfigured: () => true,
+        createOrder: async ({ idempotencyKey }) => {
+          supplierCalls += 1;
+          return {
+            ok: true,
+            order_id: "EMMA-ASYNC-1",
+            external_order_id: idempotencyKey,
+            status: "completed",
+          };
+        },
+      },
+    });
+
+    const order = await digitalServices.purchase(user, { productId: "emma:ASYNC", quantity: 1 }, { idempotencyKey: "emma-async" });
+    const retried = await digitalServices.fulfillPaidOrder(order.id, admin);
+
+    assert.equal(order.status, "processing");
+    assert.equal(order.paymentStatus, "paid");
+    assert.equal(order.fulfillmentStatus, "manual_review");
+    assert.equal(db.digitalServiceOrders[0].supplierOrderId, "EMMA-ASYNC-1");
+    assert.match(order.lastFulfillmentError, /delivery details were not recognized/i);
+    assert.equal(retried.id, order.id);
+    assert.equal(supplierCalls, 1);
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === order.requestId).length, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "4000");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
 test("Emma 404 order endpoint is configuration error and traceable without a second charge", async () => {
   const { admin, db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "5000");

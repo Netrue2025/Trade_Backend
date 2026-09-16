@@ -5348,6 +5348,10 @@ class FinancialService {
   }
 
   sanitizeDigitalServiceOrder(order = {}, { admin = false } = {}) {
+    const delivery = this.decryptDigitalServiceDelivery(order);
+    const fallbackDelivery = !delivery && order.supplierResponse
+      ? require("./digitalServices.service").extractDeliveryPayload(order.supplierResponse)
+      : null;
     const response = {
       id: order.id,
       userId: order.userId,
@@ -5377,7 +5381,7 @@ class FinancialService {
       completedAt: order.completedAt || null,
       refundedAt: order.refundedAt || null,
       user: admin ? this.enrichUserRecord(order).user : undefined,
-      delivery: ["delivered", "refunded"].includes(order.status) || admin ? this.decryptDigitalServiceDelivery(order) : null,
+      delivery: ["delivered", "refunded"].includes(order.status) || admin ? delivery || fallbackDelivery : null,
     };
     if (admin) {
       response.providerCost = order.providerCost;
@@ -5634,7 +5638,8 @@ class FinancialService {
     if (!order) {
       throw new Error("Digital service order not found.");
     }
-    if (DIGITAL_SERVICE_FINAL_STATUSES.includes(order.status) && !order.balanceReserved) {
+    const canRepairMissingDelivery = payload.delivery && !this.decryptDigitalServiceDelivery(order);
+    if (DIGITAL_SERVICE_FINAL_STATUSES.includes(order.status) && !order.balanceReserved && !canRepairMissingDelivery) {
       return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
     }
     const nextStatus = String(payload.status || "processing").trim().toLowerCase();
@@ -5666,6 +5671,7 @@ class FinancialService {
         entityType: "DIGITAL_SERVICE",
         entityId: order.id,
         route: "/?tab=store",
+        dedupeKey: `digital-service-delivered:${order.id}`,
       });
       const user = this.db.users.find((item) => item.id === order.userId);
       this.notifyAdmins({

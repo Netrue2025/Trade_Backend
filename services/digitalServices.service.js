@@ -6,6 +6,8 @@ const { decryptSetting, encryptSetting } = require("../lib/settingsCrypto");
 const PRODUCT_CACHE_TTL_MS = 1000 * 60 * 15;
 const DELIVERY_KEYS = [
   "delivery",
+  "delivery_items",
+  "deliveryItems",
   "credentials",
   "codes",
   "pin",
@@ -152,6 +154,114 @@ function firstValue(object = {}, keys = []) {
     }
   }
   return "";
+}
+
+function normalizeDeliveryItems(value) {
+  const rows = Array.isArray(value) ? value : value !== undefined && value !== null && value !== "" ? [value] : [];
+  return rows
+    .map((item, index) => {
+      if (typeof item === "string") {
+        const raw = item.trim();
+        if (!raw) {
+          return null;
+        }
+        const separatorIndex = raw.indexOf(":");
+        if (separatorIndex > 0) {
+          return {
+            label: `Account ${index + 1}`,
+            email: raw.slice(0, separatorIndex).trim(),
+            password: raw.slice(separatorIndex + 1).trim(),
+          };
+        }
+        return { label: `Delivery ${index + 1}`, value: raw };
+      }
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        const email = normalizeText(firstValue(item, ["email", "username", "user", "login"]), "");
+        const password = normalizeText(firstValue(item, ["password", "pass"]), "");
+        const activationLink = normalizeText(firstValue(item, ["activation_link", "activationLink", "activation_url", "activationUrl", "link", "url"]), "");
+        const normalized = {
+          label: normalizeText(firstValue(item, ["label", "name", "title"]), `Account ${index + 1}`),
+        };
+        if (email) normalized.email = email;
+        if (password) normalized.password = password;
+        if (activationLink) normalized.activationLink = activationLink;
+        for (const key of ["pin", "code", "license", "instructions"]) {
+          if (item[key] !== undefined && item[key] !== null && item[key] !== "") {
+            normalized[key] = item[key];
+          }
+        }
+        return Object.keys(normalized).length > 1 ? normalized : null;
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function extractEmmaDeliveryPayload(source = {}) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return null;
+  }
+  const rawItems = firstValue(source, ["delivery_items", "deliveryItems"]);
+  const deliveryItems = normalizeDeliveryItems(rawItems);
+  if (!deliveryItems.length) {
+    return null;
+  }
+  const delivery = { deliveryItems };
+  if (deliveryItems.length === 1) {
+    const [first] = deliveryItems;
+    for (const key of ["email", "password", "activationLink", "pin", "code", "license", "instructions", "value"]) {
+      if (first[key] !== undefined && first[key] !== null && first[key] !== "") {
+        delivery[key] = first[key];
+      }
+    }
+  }
+  return delivery;
+}
+
+function responseHasSupplierSuccess(payload = {}) {
+  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return false;
+  }
+  const status = normalizeText(firstValue(source, ["status", "order_status", "state"]), "").toLowerCase();
+  return source.ok === true || source.success === true || SUCCESS_STATUSES.has(status);
+}
+
+function sanitizeSupplierResponseForStorage(payload, delivery = null) {
+  const sensitiveKeys = new Set([
+    "password",
+    "pass",
+    "pin",
+    "pins",
+    "code",
+    "codes",
+    "license",
+    "licenses",
+    "credentials",
+    "delivery",
+    "delivery_items",
+    "deliveryItems",
+    "account",
+    "accounts",
+  ]);
+  const sanitize = (value) => {
+    if (Array.isArray(value)) {
+      return value.map((item) => sanitize(item));
+    }
+    if (value && typeof value === "object") {
+      const output = {};
+      for (const [key, item] of Object.entries(value)) {
+        if (sensitiveKeys.has(key)) {
+          output[key] = delivery ? "[stored_in_encrypted_delivery]" : "[redacted]";
+        } else {
+          output[key] = sanitize(item);
+        }
+      }
+      return output;
+    }
+    return value;
+  };
+  return sanitize(payload || {});
 }
 
 function getPathValue(object = {}, path = "") {
@@ -627,6 +737,10 @@ function extractSupplierOrderId(payload = {}) {
 
 function extractDeliveryPayload(payload = {}) {
   const source = extractSupplierRecord(payload);
+  const emmaDelivery = extractEmmaDeliveryPayload(source);
+  if (emmaDelivery) {
+    return emmaDelivery;
+  }
   const delivery = {};
   if (typeof payload === "string") {
     const activationLink = findHttpUrl(payload);
@@ -1003,13 +1117,18 @@ class DigitalServicesService {
 
   async fulfillPaidOrderUnlocked(orderId, actor, requestMeta = {}) {
     const order = this.financialService.getDigitalServiceOrderRecord(actor, orderId);
+    const storedDelivery = extractDeliveryPayload(order.supplierResponse);
+    const decryptedDelivery = this.financialService.decryptDigitalServiceDelivery?.(order);
+    if (order.status === "delivered" && storedDelivery && !decryptedDelivery) {
+      return this.applySupplierResult(order.id, order.supplierResponse, actor, requestMeta);
+    }
     if (order.status === "delivered") {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
     }
     if (!["paid", "payment_reserved", "processing", "submitted"].includes(String(order.status || "").toLowerCase())) {
       throw new Error("Order payment is not confirmed.");
     }
-    if (order.supplierOrderId || extractDeliveryPayload(this.financialService.decryptDigitalServiceDelivery?.(order))) {
+    if (order.supplierOrderId || extractDeliveryPayload(decryptedDelivery)) {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
     }
     if (["fulfilled", "failed_final"].includes(String(order.fulfillmentStatus || "").toLowerCase())) {
@@ -1155,12 +1274,23 @@ class DigitalServicesService {
   }
 
   applySupplierResult(orderId, providerResponse, actor, requestMeta = {}) {
+    const delivery = extractDeliveryPayload(providerResponse);
+    const supplierOrderId = extractSupplierOrderId(providerResponse);
+    const mappedStatus = mapSupplierStatus(providerResponse);
+    const status = mappedStatus === "delivered" && !delivery && responseHasSupplierSuccess(providerResponse)
+      ? "processing"
+      : mappedStatus;
+    const fulfillmentStatus = mappedStatus === "delivered" && !delivery && responseHasSupplierSuccess(providerResponse)
+      ? "manual_review"
+      : undefined;
     return this.financialService.applyDigitalServiceOrderResult(orderId, {
-      status: mapSupplierStatus(providerResponse),
+      status,
       supplierStatus: normalizeText(firstValue(providerResponse?.data && typeof providerResponse.data === "object" ? providerResponse.data : providerResponse, ["status", "order_status", "state"]), "processing"),
-      supplierOrderId: extractSupplierOrderId(providerResponse),
-      delivery: extractDeliveryPayload(providerResponse),
-      providerResponse,
+      supplierOrderId,
+      delivery,
+      fulfillmentStatus,
+      message: fulfillmentStatus ? "Supplier accepted the order, but delivery details were not recognized yet. Review the supplier response before retrying." : "",
+      providerResponse: sanitizeSupplierResponseForStorage(providerResponse, delivery),
     }, actor, requestMeta);
   }
 
