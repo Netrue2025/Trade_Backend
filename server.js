@@ -7025,6 +7025,21 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const adminDigitalOrderRecoverDeliveryMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/recover-delivery$/);
+  if (req.method === "POST" && adminDigitalOrderRecoverDeliveryMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const order = await digitalServicesService.recoverOrderDelivery(adminDigitalOrderRecoverDeliveryMatch[1] ? decodeURIComponent(adminDigitalOrderRecoverDeliveryMatch[1]) : "", admin, getRequestMeta(req));
+      sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/admin/audit-logs") {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {

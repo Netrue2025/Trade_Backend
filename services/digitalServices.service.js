@@ -165,15 +165,16 @@ function normalizeDeliveryItems(value) {
         if (!raw) {
           return null;
         }
-        const separatorIndex = raw.indexOf(":");
-        if (separatorIndex > 0) {
+        const emailCredentialMatch = raw.match(/^\s*([^\s:@|]+@[^\s:@|]+\.[^\s:@|]+)\s*(:|\|)\s*(.+?)\s*$/);
+        if (emailCredentialMatch) {
           return {
             label: `Account ${index + 1}`,
-            email: raw.slice(0, separatorIndex).trim(),
-            password: raw.slice(separatorIndex + 1).trim(),
+            rawItem: raw,
+            email: emailCredentialMatch[1].trim(),
+            password: emailCredentialMatch[3].trim(),
           };
         }
-        return { label: `Delivery ${index + 1}`, value: raw };
+        return { label: `Delivery ${index + 1}`, rawItem: raw, value: raw };
       }
       if (item && typeof item === "object" && !Array.isArray(item)) {
         const email = normalizeText(firstValue(item, ["email", "username", "user", "login"]), "");
@@ -182,6 +183,8 @@ function normalizeDeliveryItems(value) {
         const normalized = {
           label: normalizeText(firstValue(item, ["label", "name", "title"]), `Account ${index + 1}`),
         };
+        const rawItem = firstValue(item, ["rawItem", "raw_item", "raw", "value"]);
+        if (rawItem !== undefined && rawItem !== null && rawItem !== "") normalized.rawItem = rawItem;
         if (email) normalized.email = email;
         if (password) normalized.password = password;
         if (activationLink) normalized.activationLink = activationLink;
@@ -209,7 +212,7 @@ function extractEmmaDeliveryPayload(source = {}) {
   const delivery = { deliveryItems };
   if (deliveryItems.length === 1) {
     const [first] = deliveryItems;
-    for (const key of ["email", "password", "activationLink", "pin", "code", "license", "instructions", "value"]) {
+    for (const key of ["rawItem", "email", "password", "activationLink", "pin", "code", "license", "instructions", "value"]) {
       if (first[key] !== undefined && first[key] !== null && first[key] !== "") {
         delivery[key] = first[key];
       }
@@ -1113,6 +1116,53 @@ class DigitalServicesService {
         this.fulfillmentRequests.delete(lockKey);
       }
     }
+  }
+
+  async recoverOrderDelivery(orderId, actor, requestMeta = {}) {
+    const lockKey = `recover:${String(orderId || "").trim()}`;
+    if (lockKey && this.fulfillmentRequests.has(lockKey)) {
+      return this.fulfillmentRequests.get(lockKey);
+    }
+    const promise = this.recoverOrderDeliveryUnlocked(orderId, actor, requestMeta);
+    if (lockKey) {
+      this.fulfillmentRequests.set(lockKey, promise);
+    }
+    try {
+      return await promise;
+    } finally {
+      if (lockKey) {
+        this.fulfillmentRequests.delete(lockKey);
+      }
+    }
+  }
+
+  async recoverOrderDeliveryUnlocked(orderId, actor, requestMeta = {}) {
+    const order = this.financialService.getDigitalServiceOrderRecord(actor, orderId);
+    const decryptedDelivery = this.financialService.decryptDigitalServiceDelivery?.(order);
+    if (extractDeliveryPayload(decryptedDelivery)) {
+      return this.financialService.getDigitalServiceOrder(actor, order.id);
+    }
+    const storedDelivery = extractDeliveryPayload(order.supplierResponse);
+    if (storedDelivery) {
+      return this.applySupplierResult(order.id, order.supplierResponse, actor, requestMeta);
+    }
+    if (String(order.provider || "").toLowerCase() !== "emma") {
+      throw new Error("Delivery recovery is only available for Emma Store orders.");
+    }
+    if (String(order.paymentStatus || "").toLowerCase() !== "paid") {
+      throw new Error("Order payment is not confirmed.");
+    }
+    const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
+    const service = this.getProviderService("emma");
+    if (!service?.isConfigured?.() || typeof service.createOrder !== "function") {
+      throw new Error("Emma delivery recovery is pending supplier configuration.");
+    }
+    const providerResponse = await service.createOrder({
+      productId: order.supplierProductId || product.supplierProductId,
+      quantity: order.quantity || 1,
+      idempotencyKey: order.requestId,
+    });
+    return this.applySupplierResult(order.id, providerResponse, actor, requestMeta);
   }
 
   async fulfillPaidOrderUnlocked(orderId, actor, requestMeta = {}) {

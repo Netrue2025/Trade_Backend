@@ -2560,6 +2560,73 @@ test("existing paid Emma order retries documented endpoint without a second debi
   }
 });
 
+test("Emma exact provider delivery_items contract is normalized safely", () => {
+  const fixture = {
+    ok: true,
+    order_id: 8644,
+    product_id: 31,
+    product_name: "LEONARDO AI VIDEO GEN",
+    quantity: 1,
+    amount: 0.9,
+    delivery_items: [
+      "test@example.com:ExamplePassword",
+    ],
+    external_order_id: "digital_test_order",
+    status: "delivered",
+  };
+
+  const delivery = extractDeliveryPayload(fixture);
+
+  assert.equal(mapSupplierStatus(fixture), "delivered");
+  assert.equal(delivery.deliveryItems.length, 1);
+  assert.equal(delivery.deliveryItems[0].rawItem, "test@example.com:ExamplePassword");
+  assert.equal(delivery.deliveryItems[0].email, "test@example.com");
+  assert.equal(delivery.deliveryItems[0].password, "ExamplePassword");
+  assert.equal(delivery.rawItem, "test@example.com:ExamplePassword");
+  assert.equal(delivery.email, "test@example.com");
+  assert.equal(delivery.password, "ExamplePassword");
+});
+
+test("Emma delivery_items supports pipe, multiple, and unstructured delivery values", () => {
+  const pipeDelivery = extractDeliveryPayload({
+    ok: true,
+    order_id: 8645,
+    status: "delivered",
+    delivery_items: ["test@example.com | ExamplePassword"],
+  });
+  assert.equal(pipeDelivery.deliveryItems[0].rawItem, "test@example.com | ExamplePassword");
+  assert.equal(pipeDelivery.deliveryItems[0].email, "test@example.com");
+  assert.equal(pipeDelivery.deliveryItems[0].password, "ExamplePassword");
+
+  const multipleDelivery = extractDeliveryPayload({
+    ok: true,
+    order_id: 8646,
+    quantity: 2,
+    status: "delivered",
+    delivery_items: [
+      "one@example.com:Password1",
+      "two@example.com | Password2",
+    ],
+  });
+  assert.equal(multipleDelivery.deliveryItems.length, 2);
+  assert.equal(multipleDelivery.deliveryItems[0].rawItem, "one@example.com:Password1");
+  assert.equal(multipleDelivery.deliveryItems[1].rawItem, "two@example.com | Password2");
+  assert.equal(multipleDelivery.deliveryItems[1].email, "two@example.com");
+  assert.equal(multipleDelivery.deliveryItems[1].password, "Password2");
+
+  const unstructuredDelivery = extractDeliveryPayload({
+    ok: true,
+    order_id: 8647,
+    status: "delivered",
+    delivery_items: ["LICENSE-ABC-123-XYZ"],
+  });
+  assert.equal(mapSupplierStatus({ ok: true, status: "delivered", delivery_items: ["LICENSE-ABC-123-XYZ"] }), "delivered");
+  assert.equal(unstructuredDelivery.deliveryItems[0].rawItem, "LICENSE-ABC-123-XYZ");
+  assert.equal(unstructuredDelivery.deliveryItems[0].value, "LICENSE-ABC-123-XYZ");
+  assert.equal(unstructuredDelivery.deliveryItems[0].email, undefined);
+  assert.equal(unstructuredDelivery.deliveryItems[0].password, undefined);
+});
+
 test("Emma delivery_items response fulfills order with encrypted account credentials", async () => {
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
@@ -2588,13 +2655,13 @@ test("Emma delivery_items response fulfills order with encrypted account credent
       createOrder: async ({ idempotencyKey }) => ({
         ok: true,
         order_id: 8644,
-        product_id: "31",
+        product_id: 31,
         product_name: "LEONARDO AI VIDEO GEN",
         quantity: 1,
         amount: 0.9,
-        delivery_items: ["customer@example.com:secret-pass"],
+        delivery_items: ["customer@example.com | secret-pass"],
         external_order_id: idempotencyKey,
-        status: "completed",
+        status: "delivered",
       }),
     };
     const digitalServices = new DigitalServicesService({
@@ -2611,15 +2678,110 @@ test("Emma delivery_items response fulfills order with encrypted account credent
     assert.equal(stored.supplierOrderId, "8644");
     assert.equal(order.delivery.email, "customer@example.com");
     assert.equal(order.delivery.password, "secret-pass");
+    assert.equal(order.delivery.rawItem, "customer@example.com | secret-pass");
+    assert.equal(order.delivery.deliveryItems[0].rawItem, "customer@example.com | secret-pass");
     assert.equal(order.delivery.deliveryItems[0].email, "customer@example.com");
     assert.equal(stored.deliveryEncrypted.includes("secret-pass"), false);
     assert.equal(JSON.stringify(stored.supplierResponse).includes("secret-pass"), false);
     assert.equal(stored.supplierResponse.data.delivery_items, "[stored_in_encrypted_delivery]");
+    assert.equal(stored.supplierResponse.data.external_order_id, stored.requestId);
     assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "3245");
     assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
     assert.equal(db.transactions.filter((item) => item.reference === order.requestId).length, 1);
     assert.equal(service.listNotifications(user).some((item) => item.dedupeKey === `digital-service-delivered:${order.id}`), true);
     assert.equal(JSON.stringify(service.listNotifications(user)).includes("secret-pass"), false);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Emma delivery recovery reuses the same external_order_id without new debit or order", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:RECOVER",
+        supplierProductId: "31",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "LEONARDO AI VIDEO GEN",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "1755",
+        available: true,
+        stock: 3,
+      },
+    ], { provider: "emma" });
+    const product = service.getDigitalServiceProduct("emma:RECOVER", { admin: true });
+    const paid = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const record = db.digitalServiceOrders[0];
+    record.requestId = "digital_existing_123";
+    record.status = "delivered";
+    record.paymentStatus = "paid";
+    record.fulfillmentStatus = "fulfilled";
+    record.supplierStatus = "delivered";
+    record.supplierOrderId = "8644";
+    record.deliveryEncrypted = "";
+    record.supplierResponse = null;
+    record.balanceReserved = false;
+    record.completedAt = "2026-08-30T10:01:00.000Z";
+    service.ensureWallet(user.id, "NGN").lockedBalance = "0";
+    service.updateDigitalServiceLedgerStatus(paid.requestId, "SUCCESSFUL", service.ensureWallet(user.id, "NGN").availableBalance);
+    service.db.transactions.find((item) => item.reference === paid.requestId).reference = record.requestId;
+
+    const bodies = [];
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: {
+        isConfigured: () => true,
+        createOrder: async (input) => {
+          bodies.push(input);
+          return {
+            ok: true,
+            order_id: 8644,
+            product_id: 31,
+            product_name: "LEONARDO AI VIDEO GEN",
+            quantity: 1,
+            amount: 0.9,
+            delivery_items: ["existing@example.com:RecoveredPassword"],
+            external_order_id: input.idempotencyKey,
+            status: "delivered",
+          };
+        },
+      },
+    });
+    const walletBefore = { ...service.ensureWallet(user.id, "NGN") };
+    const orderCountBefore = db.digitalServiceOrders.length;
+    const transactionCountBefore = db.transactions.length;
+
+    const [recovered, duplicate] = await Promise.all([
+      digitalServices.recoverOrderDelivery(record.id, admin),
+      digitalServices.recoverOrderDelivery(record.id, admin),
+    ]);
+
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0].idempotencyKey, "digital_existing_123");
+    assert.equal(bodies[0].productId, "31");
+    assert.equal(recovered.id, duplicate.id);
+    assert.equal(recovered.status, "delivered");
+    assert.equal(recovered.delivery.email, "existing@example.com");
+    assert.equal(recovered.delivery.rawItem, "existing@example.com:RecoveredPassword");
+    assert.equal(db.digitalServiceOrders.length, orderCountBefore);
+    assert.equal(db.transactions.length, transactionCountBefore);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, walletBefore.availableBalance);
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, walletBefore.lockedBalance);
+    assert.equal(db.digitalServiceOrders[0].requestId, "digital_existing_123");
+    assert.equal(JSON.stringify(db.digitalServiceOrders[0].supplierResponse).includes("RecoveredPassword"), false);
   } finally {
     if (previousKey === undefined) {
       delete process.env.SETTINGS_ENCRYPTION_KEY;
