@@ -1496,6 +1496,89 @@ test("user support message publishes message push notification", async () => {
   assert.equal(published[0].entityType, "ChatMessage");
 });
 
+test("admin operational notifications are admin-only, pushed, and idempotent", async () => {
+  const published = [];
+  const { admin, db, service, user } = createHarness({
+    notificationPublisher: (notification) => {
+      published.push(notification);
+    },
+  });
+  setWallet(service, user.id, "NGN", "50000");
+  setVerifiedBank(service, user);
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+  service.replaceDigitalServiceProducts([{
+    id: "emma-31",
+    supplierProductId: "31",
+    provider: "emma",
+    name: "LEONARDO AI VIDEO GEN",
+    category: "AI",
+    currency: "NGN",
+    providerCost: "1755",
+    providerCostNgn: "1755",
+    stock: 10,
+    available: true,
+  }]);
+
+  const deposit = service.createDeposit(user, { amount: "25000", currency: "NGN", depositorName: "Ada User" }, { idempotencyKey: "deposit-once" });
+  const duplicateDeposit = service.createDeposit(user, { amount: "25000", currency: "NGN", depositorName: "Ada User" }, { idempotencyKey: "deposit-once" });
+  const withdrawal = service.createWithdrawal(user, { amount: "10000", currency: "NGN" }, { idempotencyKey: "withdrawal-once" });
+  const product = service.getDigitalServiceProduct("emma-31", { admin: true });
+  const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+  service.notifyAdminShopOrderPlaced(user, order);
+  const vtu = service.createVtuTransaction(user, {
+    productType: "airtime",
+    requestId: "airtime_admin_notice",
+    phone: "08012345678",
+    network: "mtn",
+    faceValue: "1000",
+    providerCost: "1000",
+    amountCharged: "1000",
+    markupAmount: "0",
+  });
+  service.notifyAdminTradeJoined(user, {
+    id: "investment-1",
+    tradeId: "trade-1",
+    amountUsdt: "50",
+    joinedAt: "2026-08-30T10:00:00.000Z",
+  }, {
+    id: "trade-1",
+    symbol: "BTCUSDT",
+  });
+  service.notifyAdminTradeJoined(user, { id: "investment-1", tradeId: "trade-1", amountUsdt: "50" }, { id: "trade-1", symbol: "BTCUSDT" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(duplicateDeposit.id, deposit.id);
+  const adminEvents = db.notifications.filter((item) => item.userId === admin.id && item.category === "adminEvents");
+  assert.equal(adminEvents.filter((item) => item.dedupeKey === `admin:deposit-created:${deposit.id}`).length, 1);
+  assert.equal(adminEvents.filter((item) => item.dedupeKey === `admin:withdrawal-created:${withdrawal.id}`).length, 1);
+  assert.equal(adminEvents.filter((item) => item.dedupeKey === `admin:shop-order:${order.id}`).length, 1);
+  assert.equal(adminEvents.filter((item) => item.dedupeKey === `admin:vtu-purchase:${vtu.id}`).length, 1);
+  assert.equal(adminEvents.filter((item) => item.dedupeKey === "admin:trade-joined:investment-1").length, 1);
+  assert.equal(db.notifications.filter((item) => item.userId === user.id && item.category === "adminEvents").length, 0);
+  assert.equal(adminEvents.some((item) => item.message.includes("08012345678")), false);
+  assert.deepEqual(
+    ["New Deposit Request", "New Withdrawal Request", "New Shop Order", "New VTU Purchase", "User Joined Trade"].every((title) =>
+      adminEvents.some((item) => item.title === title)
+    ),
+    true
+  );
+  assert.equal(published.filter((item) => item.userId === admin.id && item.category === "adminEvents").length, 5);
+});
+
+test("admin notification push failure does not reverse the business transaction", async () => {
+  const { db, service, user } = createHarness({
+    notificationPublisher: () => Promise.reject(new Error("push transport unavailable")),
+  });
+
+  const deposit = service.createDeposit(user, { amount: "5000", currency: "NGN", depositorName: "Ada User" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(db.deposits.length, 1);
+  assert.equal(db.deposits[0].id, deposit.id);
+  assert.equal(db.deposits[0].status, "PENDING");
+  assert.equal(db.notifications.some((item) => item.dedupeKey === `admin:deposit-created:${deposit.id}`), true);
+});
+
 test("admin reply creates a temporary user chat message", () => {
   const { admin, service, user } = createHarness();
 
@@ -1615,7 +1698,7 @@ test("VTU purchase reserves wallet and success consumes reserve once", () => {
   assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "1000");
   const adminNotification = db.notifications.find((item) => item.userId === admin.id && item.entityId === transaction.id);
   assert.equal(adminNotification?.type, "VTU");
-  assert.match(adminNotification?.title || "", /airtime/i);
+  assert.equal(adminNotification?.title, "New VTU Purchase");
   assert.equal(adminNotification?.metadata?.requestId, "airtime_test_1");
 
   const settled = service.applyVtuProviderResult("airtime_test_1", {

@@ -8050,6 +8050,7 @@ async function handleApi(req, res, url) {
         category: "tradingSignals",
         route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
       });
+      financialService.notifyAdminTradeJoined(targetUser, investment, trade);
       persist();
       scheduleSettingsUsersBroadcast("admin_user_trade_joined");
       sendJson(res, 201, {
@@ -8389,6 +8390,7 @@ async function handleApi(req, res, url) {
         category: "tradingSignals",
         route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
       });
+      financialService.notifyAdminTradeJoined(user, investment, trade);
       financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
       persist();
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });

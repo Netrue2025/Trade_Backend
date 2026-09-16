@@ -2042,21 +2042,7 @@ class FinancialService {
       entityType: "VTU",
       entityId: transaction.id,
     });
-    this.notifyAdmins({
-      type: "VTU",
-      title: productType === "data" ? "Data recharge" : "Airtime recharge",
-      message: `${user.name || user.email || "A user"} bought ${productType === "data" ? transaction.planName || "data" : transaction.faceValue} for ${transaction.phone}.`,
-      entityType: "VTU",
-      entityId: transaction.id,
-      route: "/?tab=history",
-      dedupeKey: `vtu-admin-purchase:${transaction.id}`,
-      metadata: {
-        category: "transactions",
-        productType,
-        requestId,
-        userId: user.id,
-      },
-    });
+    this.notifyAdminVtuPurchase(user, transaction);
     this.audit(user, "VTU_PURCHASE_CREATED", "VtuTransaction", transaction.id, {
       productType,
       amountCharged,
@@ -2321,6 +2307,138 @@ class FinancialService {
     for (const admin of this.db.users.filter((user) => user.role === "admin")) {
       this.createNotification({ ...input, userId: admin.id });
     }
+  }
+
+  formatAdminNotificationAmount(amount, currency = "NGN") {
+    const normalizedCurrency = normalizeCurrency(currency || "NGN");
+    const numericAmount = Number(String(amount || "0").replace(/,/g, ""));
+    const formatted = Number.isFinite(numericAmount)
+      ? numericAmount.toLocaleString(undefined, {
+          minimumFractionDigits: 0,
+          maximumFractionDigits: normalizedCurrency === "USDT" ? 8 : 2,
+        })
+      : String(amount || "0");
+    return `${formatted} ${normalizedCurrency}`;
+  }
+
+  buildAdminEventMetadata(user = {}, extra = {}) {
+    return {
+      category: "adminEvents",
+      userId: user.id || "",
+      userName: user.name || "",
+      userEmail: user.email || "",
+      ...extra,
+    };
+  }
+
+  notifyAdminDepositSubmitted(user = {}, deposit = {}) {
+    this.notifyAdmins({
+      type: "DEPOSIT",
+      category: "adminEvents",
+      title: "New Deposit Request",
+      message: `A user submitted a ${this.formatAdminNotificationAmount(deposit.amount, deposit.currency)} deposit request.`,
+      entityType: "Deposit",
+      entityId: deposit.id,
+      route: `/?tab=history&section=deposits&deposit=${encodeURIComponent(deposit.id || "")}`,
+      dedupeKey: `admin:deposit-created:${deposit.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        amount: deposit.amount,
+        currency: deposit.currency,
+        depositReference: deposit.transactionHash || deposit.id || "",
+        submittedAt: deposit.submittedAt || "",
+      }),
+    });
+  }
+
+  notifyAdminWithdrawalRequested(user = {}, withdrawal = {}) {
+    this.notifyAdmins({
+      type: "WITHDRAWAL_REQUEST",
+      category: "adminEvents",
+      title: "New Withdrawal Request",
+      message: `A user requested a ${this.formatAdminNotificationAmount(withdrawal.amount, withdrawal.currency)} withdrawal.`,
+      entityType: "Withdrawal",
+      entityId: withdrawal.id,
+      route: `/?tab=history&section=withdrawals&withdrawal=${encodeURIComponent(withdrawal.id || "")}`,
+      dedupeKey: `admin:withdrawal-created:${withdrawal.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        amount: withdrawal.amount,
+        currency: withdrawal.currency,
+        netAmount: withdrawal.netAmount || withdrawal.amount || "",
+        fee: withdrawal.fee || "0",
+        fraudReviewStatus: withdrawal.fraudReview?.status || "",
+        submittedAt: withdrawal.submittedAt || "",
+      }),
+    });
+  }
+
+  notifyAdminShopOrderPlaced(user = {}, order = {}) {
+    this.notifyAdmins({
+      type: "DIGITAL_SERVICE",
+      category: "adminEvents",
+      title: "New Shop Order",
+      message: `A user purchased ${order.productName || "a digital service"} for ${this.formatAdminNotificationAmount(order.amountCharged, "NGN")}.`,
+      entityType: "DIGITAL_SERVICE",
+      entityId: order.id,
+      route: `/?tab=store&order=${encodeURIComponent(order.id || "")}`,
+      dedupeKey: `admin:shop-order:${order.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        orderId: order.id || "",
+        requestId: order.requestId || "",
+        productId: order.productId || "",
+        productName: order.productName || "",
+        storeKey: order.storeKey || "",
+        provider: order.provider || "",
+        amountCharged: order.amountCharged || "",
+        paymentMethod: order.paymentMethod || "",
+        paidAt: order.paidAt || "",
+      }),
+    });
+  }
+
+  notifyAdminVtuPurchase(user = {}, transaction = {}) {
+    const productType = String(transaction.productType || "").trim().toLowerCase();
+    const network = String(transaction.network || "").trim().toUpperCase();
+    const purchaseLabel = productType === "data"
+      ? `${network ? `${network} ` : ""}data bundle`
+      : `${this.formatAdminNotificationAmount(transaction.faceValue || transaction.providerCost || transaction.amountCharged, "NGN")}${network ? ` ${network}` : ""} airtime`;
+    this.notifyAdmins({
+      type: "VTU",
+      category: "adminEvents",
+      title: "New VTU Purchase",
+      message: `A user purchased ${productType === "data" ? "an " : ""}${purchaseLabel}.`,
+      entityType: "VTU",
+      entityId: transaction.id,
+      route: `/?tab=history&section=vtu&vtu=${encodeURIComponent(transaction.id || "")}`,
+      dedupeKey: `admin:vtu-purchase:${transaction.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        productType,
+        requestId: transaction.requestId || "",
+        network: transaction.network || "",
+        amountCharged: transaction.amountCharged || "",
+        createdAt: transaction.createdAt || "",
+      }),
+    });
+  }
+
+  notifyAdminTradeJoined(user = {}, investment = {}, trade = {}) {
+    const symbol = String(trade.symbol || trade.pair || "a trade").trim().replace(/USDT$/i, "/USDT");
+    this.notifyAdmins({
+      type: "TRADE",
+      category: "adminEvents",
+      title: "User Joined Trade",
+      message: `A user joined a ${symbol} trade with ${this.formatAdminNotificationAmount(investment.amountUsdt || "0", "USDT")}.`,
+      entityType: "TradeInvestment",
+      entityId: investment.id,
+      route: `/?tab=signals&trade=${encodeURIComponent(trade.id || investment.tradeId || "")}`,
+      dedupeKey: `admin:trade-joined:${investment.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        investmentId: investment.id || "",
+        tradeId: trade.id || investment.tradeId || "",
+        symbol: trade.symbol || trade.pair || "",
+        amountUsdt: investment.amountUsdt || "",
+        joinedAt: investment.joinedAt || "",
+      }),
+    });
   }
 
   scanDuplicateUserReviews({ persistChanges = true } = {}) {
@@ -2854,13 +2972,7 @@ class FinancialService {
       adminNote: "",
     };
     this.db.deposits.unshift(deposit);
-    this.notifyAdmins({
-      type: "DEPOSIT",
-      title: "Deposit request",
-      message: `${user.name || "User"} submitted ${amount} ${currency}.`,
-      entityType: "Deposit",
-      entityId: deposit.id,
-    });
+    this.notifyAdminDepositSubmitted(user, deposit);
     this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency }, requestMeta);
     this.saveIdempotent("deposit:create", user.id, requestMeta.idempotencyKey, deposit);
     this.persist();
@@ -3724,15 +3836,7 @@ class FinancialService {
     const withdrawalSplitMessage = currency === "NGN" && compare(fee, "0") > 0
       ? ` Fee: ${fee} ${currency}. Payout: ${netAmount} ${currency}.`
       : "";
-    this.notifyAdmins({
-      type: fraudReview.status === "SUSPICIOUS" ? "WITHDRAWAL_FRAUD_REVIEW" : "WITHDRAWAL_REQUEST",
-      title: fraudReview.status === "SUSPICIOUS" ? "Suspicious Withdrawal" : "New Withdrawal Request",
-      message: fraudReview.status === "SUSPICIOUS"
-        ? `${user.name || "User"} requested ${amount} ${currency} with a bank name mismatch.${withdrawalSplitMessage}`
-        : `${user.name || "User"} requested ${amount} ${currency}.${withdrawalSplitMessage}`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
-    });
+    this.notifyAdminWithdrawalRequested(user, withdrawal);
     this.createNotification({
       userId: user.id,
       type: "WITHDRAWAL",
@@ -5526,6 +5630,9 @@ class FinancialService {
       entityId: order.id,
       route: "/?tab=store",
     });
+    if (paymentMethod === "wallet") {
+      this.notifyAdminShopOrderPlaced(user, order);
+    }
     this.audit(user, "DIGITAL_SERVICE_ORDER_CREATED", "DigitalServiceOrder", order.id, {
       productId: order.productId,
       quantity,
@@ -5623,6 +5730,7 @@ class FinancialService {
       entityId: order.id,
       route: "/?tab=store",
     });
+    this.notifyAdminShopOrderPlaced(this.db.users.find((item) => item.id === order.userId) || {}, order);
     this.audit(actor, "DIGITAL_SERVICE_PAYSTACK_PAYMENT_CONFIRMED", "DigitalServiceOrder", order.id, {
       requestId: order.requestId,
       paymentReference: order.paymentReference,
