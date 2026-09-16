@@ -6925,6 +6925,13 @@ async function handleApi(req, res, url) {
       } catch {
         supplierAccount = null;
       }
+      if (emmaResellerService?.isConfigured?.()) {
+        try {
+          await emmaResellerService.getBalance();
+        } catch {
+          // Emma balance is admin-only metadata; product sync and user shop must not fail when balance is unavailable.
+        }
+      }
       sendJson(res, 200, {
         products,
         supplierAccount: supplierAccount ? { connected: true } : null,

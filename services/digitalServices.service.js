@@ -613,7 +613,16 @@ function classifySupplierFulfillmentError(error = {}) {
 
 function extractSupplierOrderId(payload = {}) {
   const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
-  return String(firstValue(source, ["id", "order_id", "orderId", "reference", "request_id"]) || "").trim();
+  return String(firstValue(source, [
+    "id",
+    "order_id",
+    "orderId",
+    "reference",
+    "request_id",
+    "requestId",
+    "external_order_id",
+    "externalOrderId",
+  ]) || "").trim();
 }
 
 function extractDeliveryPayload(payload = {}) {
@@ -1133,6 +1142,8 @@ class DigitalServicesService {
             "idempotencyKey",
             "external_reference",
             "externalReference",
+            "external_order_id",
+            "externalOrderId",
           ]) || "").trim();
           return (supplierOrderId && supplierId === supplierOrderId) || (requestId && clientReference === requestId);
         });

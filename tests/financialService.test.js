@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
 const { DigitalServicesService, classifySupplierFulfillmentError, extractDeliveryPayload, mapSupplierStatus, validateSupplierUrl } = require("../services/digitalServices.service");
+const { EmmaResellerService } = require("../services/emmaReseller.service");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
@@ -54,6 +55,15 @@ function setVerifiedBank(service, user) {
     accountNumber: "1234567890",
     accountName: "ADA USER",
   });
+}
+
+function jsonResponse(payload, { ok = true, status = 200 } = {}) {
+  return {
+    ok,
+    status,
+    text: async () => JSON.stringify(payload),
+    headers: { get: () => "" },
+  };
 }
 
 test("deposit approval credits once and submission does not change balance", () => {
@@ -2311,6 +2321,241 @@ test("supplier settings add and edit preserve unrelated system settings", () => 
       delete process.env.SETTINGS_ENCRYPTION_KEY;
     } else {
       process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("Emma adapter uses documented catalog balance and order endpoints", async () => {
+  const previousKey = process.env.EMMA_RESELLER_API_KEY;
+  process.env.EMMA_RESELLER_API_KEY = "emma-test-key";
+  try {
+    const calls = [];
+    const emma = new EmmaResellerService({
+      fetchImpl: async (url, options = {}) => {
+        calls.push({ url: String(url), options });
+        const parsed = new URL(String(url));
+        const action = parsed.searchParams.get("action");
+        if (action === "products") {
+          return jsonResponse({ data: [{ id: "EMMA-PROD-1", name: "Gemini", price: 2, status: "available" }] });
+        }
+        if (action === "balance") {
+          return jsonResponse({ data: { balance: 25000, currency: "NGN" } });
+        }
+        if (action === "order") {
+          return jsonResponse({
+            data: {
+              id: "EMMA-ORDER-1",
+              status: "delivered",
+              external_order_id: "REQ-123",
+              activation_link: "https://example.com/emma",
+            },
+          });
+        }
+        return jsonResponse({ error: "Unexpected action" }, { ok: false, status: 404 });
+      },
+    });
+
+    await emma.listProducts();
+    await emma.getBalance();
+    await emma.createOrder({ productId: "EMMA-PROD-1", quantity: 1, idempotencyKey: "REQ-123" });
+
+    const [catalogCall, balanceCall, orderCall] = calls;
+    assert.equal(new URL(catalogCall.url).pathname, "/api/reseller");
+    assert.equal(new URL(catalogCall.url).searchParams.get("action"), "products");
+    assert.equal(catalogCall.options.method, "GET");
+
+    assert.equal(new URL(balanceCall.url).pathname, "/api/reseller");
+    assert.equal(new URL(balanceCall.url).searchParams.get("action"), "balance");
+    assert.equal(balanceCall.options.method, "GET");
+
+    const orderUrl = new URL(orderCall.url);
+    assert.equal(orderUrl.pathname, "/api/reseller");
+    assert.equal(orderUrl.searchParams.get("action"), "order");
+    assert.equal(orderCall.options.method, "POST");
+    assert.equal(orderCall.options.headers.Authorization, "Bearer emma-test-key");
+    assert.equal(orderCall.options.headers["Content-Type"], "application/json");
+    assert.equal(orderCall.options.headers["X-API-Key"], undefined);
+    assert.equal(orderCall.options.headers.apiKey, undefined);
+    assert.deepEqual(JSON.parse(orderCall.options.body), {
+      product_id: "EMMA-PROD-1",
+      quantity: 1,
+      external_order_id: "REQ-123",
+    });
+    for (const call of calls) {
+      assert.doesNotMatch(new URL(call.url).pathname, /\/(?:orders|purchase|v1\/orders)/);
+    }
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.EMMA_RESELLER_API_KEY;
+    } else {
+      process.env.EMMA_RESELLER_API_KEY = previousKey;
+    }
+  }
+});
+
+test("Emma fulfillment retries reuse external_order_id and different orders get different IDs", async () => {
+  const previousEmmaKey = process.env.EMMA_RESELLER_API_KEY;
+  const previousSettingsKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.EMMA_RESELLER_API_KEY = "emma-test-key";
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:IDEMP",
+        supplierProductId: "IDEMP",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "Emma Idempotent Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "4000",
+        available: true,
+        stock: 10,
+      },
+    ], { provider: "emma" });
+
+    const orderBodies = [];
+    const emma = new EmmaResellerService({
+      fetchImpl: async (url, options = {}) => {
+        const action = new URL(String(url)).searchParams.get("action");
+        if (action !== "order") {
+          return jsonResponse({ data: [] });
+        }
+        const body = JSON.parse(options.body || "{}");
+        orderBodies.push(body);
+        if (orderBodies.length === 1) {
+          const timeout = new Error("timeout");
+          timeout.name = "AbortError";
+          throw timeout;
+        }
+        return jsonResponse({
+          data: {
+            id: `EMMA-${orderBodies.length}`,
+            status: "delivered",
+            external_order_id: body.external_order_id,
+            activation_link: `https://example.com/emma-${orderBodies.length}`,
+          },
+        });
+      },
+    });
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: emma,
+    });
+
+    const failed = await digitalServices.purchase(user, { productId: "emma:IDEMP", quantity: 1 }, { idempotencyKey: "emma-idem-1" });
+    assert.equal(failed.paymentStatus, "paid");
+    assert.equal(failed.fulfillmentStatus, "failed_retryable");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "4000");
+
+    const delivered = await digitalServices.fulfillPaidOrder(failed.id, admin);
+    assert.equal(delivered.status, "delivered");
+    assert.equal(orderBodies[1].external_order_id, orderBodies[0].external_order_id);
+    assert.equal(orderBodies[0].product_id, "IDEMP");
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === failed.requestId).length, 1);
+
+    const second = await digitalServices.purchase(user, { productId: "emma:IDEMP", quantity: 1 }, { idempotencyKey: "emma-idem-2" });
+    assert.equal(second.status, "delivered");
+    assert.notEqual(orderBodies[2].external_order_id, orderBodies[0].external_order_id);
+    assert.equal(db.digitalServiceOrders.length, 2);
+  } finally {
+    if (previousEmmaKey === undefined) {
+      delete process.env.EMMA_RESELLER_API_KEY;
+    } else {
+      process.env.EMMA_RESELLER_API_KEY = previousEmmaKey;
+    }
+    if (previousSettingsKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousSettingsKey;
+    }
+  }
+});
+
+test("existing paid Emma order retries documented endpoint without a second debit", async () => {
+  const previousEmmaKey = process.env.EMMA_RESELLER_API_KEY;
+  const previousSettingsKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.EMMA_RESELLER_API_KEY = "emma-test-key";
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([
+      {
+        id: "emma:PAID",
+        supplierProductId: "PAID",
+        provider: "emma",
+        storeKey: "emma",
+        storeName: "Emma Store",
+        name: "Emma Existing Paid Tool",
+        category: "AI",
+        currency: "NGN",
+        providerCost: "4000",
+        available: true,
+        stock: 5,
+      },
+    ], { provider: "emma" });
+
+    const product = service.getDigitalServiceProduct("emma:PAID", { admin: true });
+    const paid = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const existingRecord = db.digitalServiceOrders[0];
+    existingRecord.fulfillmentStatus = "configuration_error";
+    existingRecord.supplierStatus = "supplier_endpoint_unavailable";
+    existingRecord.lastFulfillmentError = "HTTP 404: old guessed endpoint failed.";
+    existingRecord.supplierOrderId = "";
+    const availableAfterDebit = service.ensureWallet(user.id, "NGN").availableBalance;
+    const lockedAfterDebit = service.ensureWallet(user.id, "NGN").lockedBalance;
+    const transactionCount = db.transactions.length;
+
+    const calls = [];
+    const emma = new EmmaResellerService({
+      fetchImpl: async (url, options = {}) => {
+        calls.push({ url: String(url), options, body: JSON.parse(options.body || "{}") });
+        return jsonResponse({
+          data: {
+            id: "EMMA-EXISTING-1",
+            status: "delivered",
+            external_order_id: paid.requestId,
+            activation_link: "https://example.com/existing-paid",
+          },
+        });
+      },
+    });
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      emmaService: emma,
+    });
+
+    const delivered = await digitalServices.fulfillPaidOrder(paid.id, admin);
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.delivery.activationLink, "https://example.com/existing-paid");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, availableAfterDebit);
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+    assert.equal(lockedAfterDebit, "4000");
+    assert.equal(db.transactions.length, transactionCount);
+    assert.equal(db.digitalServiceOrders.length, 1);
+    assert.equal(new URL(calls[0].url).searchParams.get("action"), "order");
+    assert.equal(calls[0].body.external_order_id, paid.requestId);
+    assert.equal(calls[0].body.product_id, "PAID");
+  } finally {
+    if (previousEmmaKey === undefined) {
+      delete process.env.EMMA_RESELLER_API_KEY;
+    } else {
+      process.env.EMMA_RESELLER_API_KEY = previousEmmaKey;
+    }
+    if (previousSettingsKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousSettingsKey;
     }
   }
 });
