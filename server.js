@@ -6812,7 +6812,7 @@ async function handleApi(req, res, url) {
       const body = await readBody(req);
       supplierId = String(body.id || "").trim();
       const config = supplierId
-        ? financialService.getDigitalServiceSupplierRuntimeConfig(supplierId)
+        ? digitalServicesService.getSupplierRuntimeConfig(supplierId)
         : body;
       if (!config) {
         throw new Error("Supplier not found.");
@@ -6821,7 +6821,7 @@ async function handleApi(req, res, url) {
       if (supplierId) {
         financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: true, error: "" });
       }
-      sendJson(res, 200, { result, supplier: supplierId ? financialService.getDigitalServiceSupplier(supplierId) : null });
+      sendJson(res, 200, { result, supplier: supplierId ? digitalServicesService.getSupplierPublicConfig(supplierId) : null });
     } catch (error) {
       if (supplierId) {
         financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: false, error: error.message });
@@ -6878,12 +6878,12 @@ async function handleApi(req, res, url) {
         return true;
       }
       if (action === "test") {
-        const config = financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+        const config = digitalServicesService.getSupplierRuntimeConfig(supplierId);
         if (!config) {
           throw new Error("Supplier not found.");
         }
         const result = await digitalServicesService.testSupplierConnection(config);
-        const supplier = financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: true, error: "" }) || financialService.getDigitalServiceSupplier(supplierId);
+        const supplier = financialService.updateDigitalServiceSupplierStatus(supplierId, { connected: true, error: "" }) || digitalServicesService.getSupplierPublicConfig(supplierId);
         sendJson(res, 200, { result, supplier });
         return true;
       }

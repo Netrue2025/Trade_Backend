@@ -856,6 +856,39 @@ class DigitalServicesService {
     return config ? new GenericSupplierService({ config }) : null;
   }
 
+  getSupplierRuntimeConfig(provider) {
+    const providerKey = normalizeProviderKey(provider);
+    const saved = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(providerKey);
+    if (saved) {
+      return saved;
+    }
+    if (providerKey === "efem" && this.efemService?.isConfigured?.()) {
+      return {
+        id: "efem",
+        type: "efem",
+        name: "Efem Store",
+        storeKey: "efem",
+        enabled: true,
+        productSync: true,
+        automaticFulfillment: true,
+        orderReconciliation: true,
+        baseUrl: this.efemService.baseUrl,
+        fieldMapping: null,
+        capabilities: { productSync: true, automaticFulfillment: true, orderReconciliation: true },
+      };
+    }
+    return null;
+  }
+
+  getSupplierPublicConfig(provider) {
+    const providerKey = normalizeProviderKey(provider);
+    try {
+      return this.financialService.getDigitalServiceSupplier?.(providerKey);
+    } catch {
+      return this.getProviderStatuses()[providerKey] || null;
+    }
+  }
+
   getProviderStatuses() {
     const statuses = {
       akunding: {
@@ -1007,7 +1040,9 @@ class DigitalServicesService {
   async testSupplierConnection(input = {}) {
     const providerKey = normalizeProviderKey(input.id || input.type || input.provider || "");
     if (providerKey === "efem" && this.efemService) {
-      const service = typeof this.efemService.withConfig === "function" ? this.efemService.withConfig(input) : this.efemService;
+      const service = input.apiKey && typeof this.efemService.withConfig === "function"
+        ? this.efemService.withConfig(input)
+        : this.getProviderService("efem");
       const payload = await service.testConnection();
       return {
         connected: true,
@@ -1027,7 +1062,7 @@ class DigitalServicesService {
   }
 
   async previewSupplierProducts(supplierId) {
-    const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+    const supplier = this.getSupplierRuntimeConfig(supplierId);
     if (!supplier || supplier.enabled === false) {
       throw new Error("Supplier is disabled or unavailable.");
     }
@@ -1035,7 +1070,7 @@ class DigitalServicesService {
     const payload = await service.listProducts();
     const preview = this.analyzeSupplierProducts(payload, { supplierId: supplier.id, mapping: supplier.fieldMapping });
     return {
-      supplier: this.financialService.getDigitalServiceSupplier(supplier.id),
+      supplier: this.getSupplierPublicConfig(supplier.id),
       productCount: preview.rows.length,
       availableCount: preview.products.filter((product) => product.available).length,
       unavailableCount: preview.products.filter((product) => !product.available).length,
@@ -1047,7 +1082,7 @@ class DigitalServicesService {
   }
 
   async importSupplierProducts(supplierId, { mapping = null, selectedProductIds = [] } = {}) {
-    const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
+    const supplier = this.getSupplierRuntimeConfig(supplierId);
     if (!supplier || supplier.enabled === false) {
       throw new Error("Supplier is disabled or unavailable.");
     }
@@ -1061,7 +1096,7 @@ class DigitalServicesService {
       error.missing = preview.missing;
       throw error;
     }
-    if (mapping) {
+    if (mapping && this.financialService.getDigitalServiceSupplierRuntimeConfig?.(supplier.id)) {
       this.financialService.updateDigitalServiceSupplierMapping(supplier.id, preview.mapping);
     }
     const selectedIds = new Set((Array.isArray(selectedProductIds) ? selectedProductIds : []).map((value) => String(value)));

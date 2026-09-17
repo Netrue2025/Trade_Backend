@@ -4004,6 +4004,37 @@ test("selected supplier product import upserts only selected products", async ()
   assert.equal(service.listDigitalServiceProducts({ includeInactive: true, admin: true }).some((product) => product.supplierProductId === "102"), false);
 });
 
+test("environment-configured Efem supports admin test preview and import without saved supplier row", async () => {
+  const { service } = createHarness();
+  service.getDigitalServiceSupplierRuntimeConfig = () => null;
+  let safeTestCalls = 0;
+  const efemService = {
+    baseUrl: "https://api-geminipro.ignorelist.com/api/reseller/v1",
+    isConfigured: () => true,
+    getPublicStatus: () => ({ configured: true, baseUrl: "https://api-geminipro.ignorelist.com/api/reseller/v1" }),
+    testConnection: async () => {
+      safeTestCalls += 1;
+      return { ok: true, status: "active" };
+    },
+    listProducts: async () => ({ products: [{ id: 201, name: "Environment Product", price: 12, currency: "USD", stock: 3 }] }),
+  };
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    efemService,
+  });
+
+  const tested = await digitalServices.testSupplierConnection({ id: "efem" });
+  const preview = await digitalServices.previewSupplierProducts("efem");
+  const imported = await digitalServices.importSupplierProducts("efem", { selectedProductIds: ["201"] });
+
+  assert.equal(tested.connected, true);
+  assert.equal(safeTestCalls, 1);
+  assert.equal(preview.productCount, 1);
+  assert.equal(preview.supplier.id, "efem");
+  assert.equal(imported.summary.importedCount, 1);
+  assert.equal(imported.products[0].supplierProductId, "201");
+});
+
 test("Efem completed order encrypts value delivery and charges wallet once", async () => {
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
