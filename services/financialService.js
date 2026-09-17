@@ -325,7 +325,7 @@ function defaultSettings() {
       enabled: false,
       globalMarkupPercent: getEnvValue("AKUNDING_GLOBAL_MARKUP_PERCENT") || DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT,
       fallbackImageUrl: DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE,
-      allowedImageDomains: ["akunding.shop", "ssondigitalworks.online"],
+      allowedImageDomains: ["akunding.shop", "ssondigitalworks.online", "api-geminipro.ignorelist.com"],
       productOverrides: {},
       lastSyncAt: null,
       lastSyncStatus: "",
@@ -748,7 +748,18 @@ class FinancialService {
           automaticFulfillment: true,
           orderReconciliation: true,
           capabilities: { productSync: true, automaticFulfillment: true, orderReconciliation: true },
-        }
+        },
+        ...(!normalized.suppliers?.efem ? [{
+          id: "efem",
+          name: "Efem Store",
+          type: "efem",
+          enabled: true,
+          configured: false,
+          productSync: true,
+          automaticFulfillment: true,
+          orderReconciliation: true,
+          capabilities: { productSync: true, automaticFulfillment: true, orderReconciliation: true },
+        }] : [])
       );
     }
     return suppliers.concat(Object.values(normalized.suppliers || {}).map((supplier) => this.sanitizeDigitalServiceSupplier(supplier)));
@@ -2391,6 +2402,54 @@ class FinancialService {
         amountCharged: order.amountCharged || "",
         paymentMethod: order.paymentMethod || "",
         paidAt: order.paidAt || "",
+      }),
+    });
+  }
+
+  notifyAdminManualOrderRequiresFulfillment(user = {}, order = {}) {
+    this.notifyAdmins({
+      type: "DIGITAL_SERVICE",
+      category: "adminEvents",
+      title: "Manual Order Requires Fulfillment",
+      message: `A user purchased ${order.productName || "a manual product"}.`,
+      entityType: "DIGITAL_SERVICE",
+      entityId: order.id,
+      route: `/?tab=store&order=${encodeURIComponent(order.id || "")}`,
+      dedupeKey: `admin:manual-order:${order.id}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        orderId: order.id || "",
+        requestId: order.requestId || "",
+        productId: order.productId || "",
+        productName: order.productName || "",
+        storeKey: order.storeKey || "",
+        fulfillmentMode: order.fulfillmentMode || "manual",
+        amountCharged: order.amountCharged || "",
+        paymentMethod: order.paymentMethod || "",
+        paidAt: order.paidAt || "",
+      }),
+    });
+  }
+
+  notifyAdminSupplierActionRequired(user = {}, order = {}, payload = {}) {
+    const supplierStatus = String(payload.supplierStatus || order.supplierStatus || "supplier_action_required").trim();
+    const title = supplierStatus === "supplier_balance_required" ? "Efem Store Balance Required" : "Supplier Action Required";
+    this.notifyAdmins({
+      type: "DIGITAL_SERVICE",
+      category: "adminEvents",
+      title,
+      message: `${order.productName || "A shop order"} needs supplier review before delivery.`,
+      entityType: "DIGITAL_SERVICE",
+      entityId: order.id,
+      route: `/?tab=store&order=${encodeURIComponent(order.id || "")}`,
+      dedupeKey: `admin:supplier-action:${order.id}:${supplierStatus}`,
+      metadata: this.buildAdminEventMetadata(user, {
+        orderId: order.id || "",
+        requestId: order.requestId || "",
+        productId: order.productId || "",
+        productName: order.productName || "",
+        provider: order.provider || "",
+        supplierStatus,
+        fulfillmentStatus: payload.fulfillmentStatus || order.fulfillmentStatus || "",
       }),
     });
   }
@@ -5252,8 +5311,9 @@ class FinancialService {
       name: override.displayName || product.name || "Digital Service",
       description: product.description || "",
       category: override.displayCategory || product.category || "Digital",
-      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : "alaba"),
-      storeName: product.storeName || (product.provider === "emma" ? "Emma Store" : "Alaba Store"),
+      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : product.provider === "efem" ? "efem" : product.provider === "manual" ? "manual" : "alaba"),
+      storeName: product.storeName || product.storefrontLabel || (product.provider === "emma" ? "Emma Store" : product.provider === "efem" ? "Efem Store" : product.provider === "manual" ? "Manual Store" : "Alaba Store"),
+      storefrontLabel: product.storefrontLabel || product.storeName || (product.provider === "manual" ? "Manual Store" : ""),
       currency: "NGN",
       walletCurrency: displayPricing.walletCurrency,
       priceCurrency: displayPricing.priceCurrency,
@@ -5264,6 +5324,8 @@ class FinancialService {
       exchangeRate: displayPricing.exchangeRate,
       supplierAvailable,
       stock,
+      fulfillmentMode: product.fulfillmentMode || (product.provider === "manual" ? "manual" : "automatic"),
+      automaticFulfillment: product.automaticFulfillment !== false && product.provider !== "manual",
       visible,
       available,
       availability: available ? "available" : availabilityRank === 1 ? "temporary_unavailable" : "unavailable",
@@ -5280,7 +5342,7 @@ class FinancialService {
     if (admin) {
       response.supplierProductId = product.supplierProductId || product.id || "";
       response.provider = product.provider || "akunding";
-      response.automaticFulfillment = product.automaticFulfillment !== false;
+      response.automaticFulfillment = response.automaticFulfillment;
       response.providerCost = product.providerCost || "0";
       response.supplierCurrency = product.currency || "NGN";
       response.providerCostNgn = pricing.providerCostNgn;
@@ -5352,8 +5414,11 @@ class FinancialService {
         id: String(product.id || product.supplierProductId || "").trim(),
         supplierProductId: String(product.supplierProductId || product.id || "").trim(),
         provider: providerKey,
-        storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "akunding" ? "alaba" : providerKey),
-        storeName: product.storeName || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
+        storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "efem" ? "efem" : providerKey === "manual" ? "manual" : providerKey === "akunding" ? "alaba" : providerKey),
+        storeName: product.storeName || product.storefrontLabel || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "efem" ? "Efem Store" : providerKey === "manual" ? "Manual Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
+        storefrontLabel: product.storefrontLabel || product.storeName || supplierRuntime?.name || "",
+        fulfillmentMode: product.fulfillmentMode || (providerKey === "manual" ? "manual" : "automatic"),
+        automaticFulfillment: product.automaticFulfillment !== undefined ? product.automaticFulfillment : providerKey !== "manual",
         syncedAt: product.syncedAt || this.clock(),
       }))
       .filter((product) => product.id && product.supplierProductId);
@@ -5388,8 +5453,11 @@ class FinancialService {
       id: String(product.id || product.supplierProductId || "").trim(),
       supplierProductId: String(product.supplierProductId || product.id || "").trim(),
       provider: providerKey,
-      storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "akunding" ? "alaba" : providerKey),
-      storeName: product.storeName || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
+      storeKey: product.storeKey || supplierRuntime?.storeKey || (providerKey === "emma" ? "emma" : providerKey === "efem" ? "efem" : providerKey === "manual" ? "manual" : providerKey === "akunding" ? "alaba" : providerKey),
+      storeName: product.storeName || product.storefrontLabel || supplierRuntime?.name || (providerKey === "emma" ? "Emma Store" : providerKey === "efem" ? "Efem Store" : providerKey === "manual" ? "Manual Store" : providerKey === "akunding" ? "Alaba Store" : "Supplier Store"),
+      storefrontLabel: product.storefrontLabel || product.storeName || supplierRuntime?.name || "",
+      fulfillmentMode: product.fulfillmentMode || (providerKey === "manual" ? "manual" : "automatic"),
+      automaticFulfillment: product.automaticFulfillment !== undefined ? product.automaticFulfillment : providerKey !== "manual",
       sourceMissing: false,
       syncedAt: product.syncedAt || this.clock(),
     };
@@ -5433,6 +5501,149 @@ class FinancialService {
     return this.getDigitalServiceProduct(product.id, { admin: true });
   }
 
+  createManualDigitalServiceProduct(admin, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (admin?.role !== "admin") {
+      const error = new Error("Admin access is required.");
+      error.statusCode = 403;
+      throw error;
+    }
+    const name = String(input.name || input.displayName || "").trim();
+    const description = String(input.description || "").trim();
+    if (!name) {
+      throw new Error("Product name is required.");
+    }
+    if (!description) {
+      throw new Error("Product description is required.");
+    }
+    const sellingPrice = normalizeAmount(input.sellingPrice || input.price || input.customPriceNgn, "Selling price");
+    const stockInput = input.unlimitedStock === true || input.stock === "" || input.stock === undefined || input.stock === null
+      ? 999999
+      : normalizeWholeNumber(input.stock, 0, "Stock");
+    const storeKey = this.normalizeDigitalServiceSupplierId(input.storeKey || input.storefront || "manual") || "manual";
+    const storeName = String(input.storefrontLabel || input.storeName || (storeKey === "efem" ? "Efem Store" : storeKey === "emma" ? "Emma Store" : "Manual Store")).trim().slice(0, 80);
+    const imageUrl = normalizeOptionalUrl(input.imageUrl || input.image || "");
+    const id = `manual:${this.idGenerator(10).toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+    const product = {
+      id,
+      supplierProductId: id,
+      provider: "manual",
+      supplierId: "manual",
+      fulfillmentMode: "manual",
+      automaticFulfillment: false,
+      storeKey,
+      storeName,
+      storefrontLabel: storeName,
+      name,
+      description,
+      category: String(input.category || storeName || "Manual").trim(),
+      currency: "NGN",
+      providerCost: "0",
+      stock: stockInput,
+      providerStatus: input.available === false || input.status === "unavailable" ? "unavailable" : "active",
+      available: input.available !== false && String(input.status || "available").toLowerCase() !== "unavailable" && stockInput > 0,
+      sourceMissing: false,
+      imageUrl,
+      deliveryLabel: "Manual delivery",
+      planLabel: String(input.planLabel || "").trim(),
+      manualCreated: true,
+      createdAt: this.clock(),
+      updatedAt: this.clock(),
+      syncedAt: this.clock(),
+    };
+    this.db.digitalServiceProducts.unshift(product);
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      productOverrides: {
+        ...this.db.systemSettings.digitalServices.productOverrides,
+        [id]: {
+          enabled: product.available,
+          displayName: name,
+          displayCategory: product.category,
+          customImageUrl: imageUrl,
+          markupMode: "custom",
+          markupValue: "0",
+          customPriceNgn: sellingPrice,
+        },
+      },
+      updatedBy: admin.id,
+      updatedAt: this.clock(),
+    });
+    this.audit(admin, "DIGITAL_SERVICE_MANUAL_PRODUCT_CREATED", "DigitalServiceProduct", id, {
+      productId: id,
+      storeKey,
+    }, requestMeta);
+    this.persist();
+    return this.getDigitalServiceProduct(id, { admin: true });
+  }
+
+  updateManualDigitalServiceProduct(admin, productId, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (admin?.role !== "admin") {
+      const error = new Error("Admin access is required.");
+      error.statusCode = 403;
+      throw error;
+    }
+    const id = String(productId || "").trim();
+    const index = this.db.digitalServiceProducts.findIndex((item) => String(item.id || item.supplierProductId || "") === id);
+    const product = this.db.digitalServiceProducts[index];
+    if (!product) {
+      throw new Error("Digital service product not found.");
+    }
+    if (String(product.fulfillmentMode || "").toLowerCase() !== "manual" && String(product.provider || "").toLowerCase() !== "manual") {
+      throw new Error("Only manual products can be edited with this endpoint.");
+    }
+    if (input.fulfillmentMode && String(input.fulfillmentMode).toLowerCase() !== "manual") {
+      throw new Error("Manual products cannot be reassigned to API fulfillment here.");
+    }
+    const next = { ...product };
+    if (input.name !== undefined || input.displayName !== undefined) next.name = String(input.name || input.displayName || "").trim() || next.name;
+    if (input.description !== undefined) next.description = String(input.description || "").trim();
+    if (input.category !== undefined) next.category = String(input.category || "").trim() || next.category;
+    if (input.imageUrl !== undefined || input.image !== undefined) next.imageUrl = normalizeOptionalUrl(input.imageUrl || input.image || "");
+    if (input.storeKey !== undefined || input.storefront !== undefined || input.storefrontLabel !== undefined || input.storeName !== undefined) {
+      next.storeKey = this.normalizeDigitalServiceSupplierId(input.storeKey || input.storefront || next.storeKey || "manual") || "manual";
+      next.storeName = String(input.storefrontLabel || input.storeName || next.storeName || "Manual Store").trim().slice(0, 80);
+      next.storefrontLabel = next.storeName;
+    }
+    if (input.stock !== undefined || input.unlimitedStock !== undefined) {
+      next.stock = input.unlimitedStock === true || input.stock === "" ? 999999 : normalizeWholeNumber(input.stock, 0, "Stock");
+    }
+    if (input.available !== undefined || input.status !== undefined) {
+      next.available = input.available !== false && String(input.status || "available").toLowerCase() !== "unavailable";
+      next.providerStatus = next.available ? "active" : "unavailable";
+    }
+    next.updatedAt = this.clock();
+    this.db.digitalServiceProducts[index] = next;
+    const currentOverride = this.db.systemSettings.digitalServices.productOverrides[next.id] || {};
+    const overridePatch = {};
+    if (input.name !== undefined || input.displayName !== undefined) overridePatch.displayName = next.name;
+    if (input.category !== undefined) overridePatch.displayCategory = next.category;
+    if (input.imageUrl !== undefined || input.image !== undefined) overridePatch.customImageUrl = next.imageUrl;
+    if (input.available !== undefined || input.status !== undefined) overridePatch.enabled = next.available;
+    if (input.sellingPrice !== undefined || input.price !== undefined || input.customPriceNgn !== undefined) {
+      overridePatch.markupMode = "custom";
+      overridePatch.customPriceNgn = normalizeAmount(input.sellingPrice || input.price || input.customPriceNgn, "Selling price");
+    }
+    this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings({
+      ...this.db.systemSettings.digitalServices,
+      productOverrides: {
+        ...this.db.systemSettings.digitalServices.productOverrides,
+        [next.id]: {
+          ...currentOverride,
+          ...overridePatch,
+        },
+      },
+      updatedBy: admin.id,
+      updatedAt: this.clock(),
+    });
+    this.audit(admin, "DIGITAL_SERVICE_MANUAL_PRODUCT_UPDATED", "DigitalServiceProduct", next.id, {
+      productId: next.id,
+    }, requestMeta);
+    this.persist();
+    return this.getDigitalServiceProduct(next.id, { admin: true });
+  }
+
   encryptDigitalServiceDelivery(delivery) {
     if (!delivery || typeof delivery !== "object" || !Object.keys(delivery).length) {
       return "";
@@ -5461,6 +5672,10 @@ class FinancialService {
       userId: order.userId,
       requestId: order.requestId,
       provider: order.provider || "akunding",
+      storeKey: order.storeKey || "",
+      storeName: order.storeName || order.storefrontLabel || "",
+      storefrontLabel: order.storefrontLabel || order.storeName || "",
+      fulfillmentMode: order.fulfillmentMode || (order.provider === "manual" ? "manual" : "automatic"),
       productId: order.productId,
       productName: order.productName,
       category: order.category,
@@ -5483,6 +5698,7 @@ class FinancialService {
       createdAt: order.createdAt,
       updatedAt: order.updatedAt,
       completedAt: order.completedAt || null,
+      deliveredAt: order.deliveredAt || order.completedAt || null,
       refundedAt: order.refundedAt || null,
       user: admin ? this.enrichUserRecord(order).user : undefined,
       delivery: ["delivered", "refunded"].includes(order.status) || admin ? delivery || fallbackDelivery : null,
@@ -5557,6 +5773,7 @@ class FinancialService {
     const providerCostNgn = multiplyRatio(product.providerCostNgn || "0", String(quantity), "1");
     const markupAmount = compare(amountCharged, providerCostNgn) > 0 ? subtract(amountCharged, providerCostNgn) : "0";
     const paymentMethod = String(input.paymentMethod || "wallet").trim().toLowerCase() === "paystack" ? "paystack" : "wallet";
+    const fulfillmentMode = String(product.fulfillmentMode || (product.provider === "manual" ? "manual" : "automatic")).toLowerCase() === "manual" ? "manual" : "automatic";
     const wallet = paymentMethod === "wallet" ? this.ensureWallet(user.id, "NGN") : null;
     let balanceBefore = "";
     let balanceAfter = "";
@@ -5582,8 +5799,10 @@ class FinancialService {
       userId: user.id,
       requestId,
       provider: product.provider || "akunding",
-      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : "alaba"),
-      storeName: product.storeName || (product.provider === "emma" ? "Emma Store" : "Alaba Store"),
+      storeKey: product.storeKey || (product.provider === "emma" ? "emma" : product.provider === "efem" ? "efem" : product.provider === "manual" ? "manual" : "alaba"),
+      storeName: product.storeName || product.storefrontLabel || (product.provider === "emma" ? "Emma Store" : product.provider === "efem" ? "Efem Store" : product.provider === "manual" ? "Manual Store" : "Alaba Store"),
+      storefrontLabel: product.storefrontLabel || product.storeName || "",
+      fulfillmentMode,
       productId: product.id,
       supplierProductId: product.supplierProductId || product.id,
       productName: product.name,
@@ -5599,13 +5818,13 @@ class FinancialService {
       status: paymentMethod === "wallet" ? "payment_reserved" : "pending_payment",
       paymentMethod,
       paymentStatus: paymentMethod === "wallet" ? "paid" : "pending",
-      fulfillmentStatus: "pending",
+      fulfillmentStatus: fulfillmentMode === "manual" && paymentMethod === "wallet" ? "awaiting_manual_fulfillment" : "pending",
       fulfillmentAttemptCount: 0,
       lastFulfillmentAttemptAt: null,
       lastFulfillmentError: "",
       paymentReference: paymentMethod === "paystack" ? requestId : "",
       paidAt: paymentMethod === "wallet" ? this.clock() : null,
-      supplierStatus: "queued",
+      supplierStatus: fulfillmentMode === "manual" && paymentMethod === "wallet" ? "manual_fulfillment_required" : "queued",
       supplierOrderId: "",
       supplierResponse: null,
       deliveryEncrypted: "",
@@ -5632,6 +5851,9 @@ class FinancialService {
     });
     if (paymentMethod === "wallet") {
       this.notifyAdminShopOrderPlaced(user, order);
+      if (fulfillmentMode === "manual") {
+        this.notifyAdminManualOrderRequiresFulfillment(user, order);
+      }
     }
     this.audit(user, "DIGITAL_SERVICE_ORDER_CREATED", "DigitalServiceOrder", order.id, {
       productId: order.productId,
@@ -5712,6 +5934,10 @@ class FinancialService {
     }
     order.paymentStatus = "paid";
     order.status = "paid";
+    if (String(order.fulfillmentMode || "").toLowerCase() === "manual") {
+      order.fulfillmentStatus = "awaiting_manual_fulfillment";
+      order.supplierStatus = "manual_fulfillment_required";
+    }
     order.paidAt = order.paidAt || this.clock();
     order.updatedAt = this.clock();
     order.paymentProviderResponse = {
@@ -5731,6 +5957,9 @@ class FinancialService {
       route: "/?tab=store",
     });
     this.notifyAdminShopOrderPlaced(this.db.users.find((item) => item.id === order.userId) || {}, order);
+    if (String(order.fulfillmentMode || "").toLowerCase() === "manual") {
+      this.notifyAdminManualOrderRequiresFulfillment(this.db.users.find((item) => item.id === order.userId) || {}, order);
+    }
     this.audit(actor, "DIGITAL_SERVICE_PAYSTACK_PAYMENT_CONFIRMED", "DigitalServiceOrder", order.id, {
       requestId: order.requestId,
       paymentReference: order.paymentReference,
@@ -5770,12 +5999,13 @@ class FinancialService {
       }
       order.status = "delivered";
       order.completedAt = order.completedAt || this.clock();
+      order.deliveredAt = order.deliveredAt || order.completedAt || this.clock();
       this.updateDigitalServiceLedgerStatus(order.requestId, "SUCCESSFUL", wallet.availableBalance);
       this.createNotification({
         userId: order.userId,
         type: "DIGITAL_SERVICE",
-        title: "Order delivered",
-        message: `${order.productName} is ready.`,
+        title: "Order Ready",
+        message: `Your ${order.productName} order is ready.`,
         entityType: "DIGITAL_SERVICE",
         entityId: order.id,
         route: "/?tab=store",
@@ -5855,6 +6085,110 @@ class FinancialService {
     }, requestMeta);
     this.persist();
     return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+  }
+
+  markManualDigitalServiceOrderAwaiting(orderId, actor = { id: "digital-services", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const order = this.db.digitalServiceOrders.find((item) => item.id === orderId || item.requestId === orderId);
+    if (!order) {
+      throw new Error("Digital service order not found.");
+    }
+    if (String(order.fulfillmentMode || "").toLowerCase() !== "manual") {
+      return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+    }
+    if (String(order.paymentStatus || "").toLowerCase() !== "paid") {
+      throw new Error("Order payment is not confirmed.");
+    }
+    if (order.status !== "delivered") {
+      order.status = order.status === "payment_reserved" ? "payment_reserved" : "paid";
+      order.fulfillmentStatus = "awaiting_manual_fulfillment";
+      order.supplierStatus = "manual_fulfillment_required";
+      order.lastFulfillmentError = "";
+      order.updatedAt = this.clock();
+      this.notifyAdminManualOrderRequiresFulfillment(this.db.users.find((item) => item.id === order.userId) || {}, order);
+      this.audit(actor, "DIGITAL_SERVICE_MANUAL_ORDER_AWAITING", "DigitalServiceOrder", order.id, {
+        requestId: order.requestId,
+      }, requestMeta);
+      this.persist();
+    }
+    return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
+  }
+
+  normalizeManualDelivery(input = {}) {
+    const sourceItems = Array.isArray(input.deliveryItems) ? input.deliveryItems : [];
+    const items = sourceItems
+      .map((item, index) => {
+        if (typeof item === "string") {
+          const value = item.trim();
+          return value ? { type: "Text", label: `Delivery ${index + 1}`, value, rawItem: value } : null;
+        }
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return null;
+        }
+        const type = String(item.type || item.label || "Text").trim().slice(0, 40) || "Text";
+        const value = String(item.value ?? item.rawItem ?? item.text ?? item.code ?? item.pin ?? item.license ?? "").trim();
+        if (!value) {
+          return null;
+        }
+        return {
+          type,
+          label: type,
+          value,
+          rawItem: value,
+        };
+      })
+      .filter(Boolean);
+    const text = String(input.deliveryText || input.value || input.instructions || "").trim();
+    if (text) {
+      items.push({ type: "Text", label: "Delivery", value: text, rawItem: text });
+    }
+    if (!items.length) {
+      throw new Error("Delivery details are required.");
+    }
+    const delivery = {
+      deliveryItems: items,
+      value: items.map((item) => item.value).join("\n"),
+    };
+    if (input.instructions) {
+      delivery.instructions = String(input.instructions).trim();
+    }
+    return delivery;
+  }
+
+  fulfillManualDigitalServiceOrder(admin, orderId, input = {}, requestMeta = {}) {
+    this.ensureState();
+    if (admin?.role !== "admin") {
+      const error = new Error("Admin access is required.");
+      error.statusCode = 403;
+      throw error;
+    }
+    const order = this.getDigitalServiceOrderRecord(admin, orderId);
+    if (String(order.fulfillmentMode || "").toLowerCase() !== "manual") {
+      throw new Error("This order is not a manual fulfillment order.");
+    }
+    if (String(order.paymentStatus || "").toLowerCase() !== "paid") {
+      throw new Error("Order payment is not confirmed.");
+    }
+    if (order.status === "delivered" && this.decryptDigitalServiceDelivery(order)) {
+      return this.sanitizeDigitalServiceOrder(order, { admin: true });
+    }
+    const delivery = this.normalizeManualDelivery(input);
+    const fulfilled = this.applyDigitalServiceOrderResult(order.id, {
+      status: "delivered",
+      supplierStatus: "manual_fulfilled",
+      fulfillmentStatus: "fulfilled",
+      delivery,
+      providerResponse: {
+        status: "delivered",
+        fulfillmentMode: "manual",
+        delivery: "[stored_in_encrypted_delivery]",
+      },
+    }, admin, requestMeta);
+    this.audit(admin, "DIGITAL_SERVICE_MANUAL_ORDER_DELIVERED", "DigitalServiceOrder", order.id, {
+      requestId: order.requestId,
+      deliveryItemCount: delivery.deliveryItems.length,
+    }, requestMeta);
+    return fulfilled;
   }
 
   getDigitalServiceAdminSummary() {

@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 
 const { DigitalServicesService, classifySupplierFulfillmentError, extractDeliveryPayload, mapSupplierStatus, validateSupplierUrl } = require("../services/digitalServices.service");
 const { EmmaResellerService } = require("../services/emmaReseller.service");
+const { EfemResellerService } = require("../services/efemReseller.service");
 const { FinancialService } = require("../services/financialService");
 const { PaystackService, toKobo } = require("../services/paystackService");
 
@@ -3928,6 +3929,379 @@ test("admin can delete selected finance history records", () => {
   assert.equal(result.deletedCount, 2);
   assert.equal(service.listDeposits(admin).some((item) => item.id === deposit.id), false);
   assert.equal(service.listTransactions(admin).some((item) => item.id === transactionId), false);
+});
+
+test("Efem adapter uses documented reseller endpoints and X-API-Key auth", async () => {
+  const calls = [];
+  const efem = new EfemResellerService({
+    config: { apiKey: "efem-key", baseUrl: "https://api-geminipro.ignorelist.com/api/reseller/v1" },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), method: options.method, headers: options.headers, body: options.body ? JSON.parse(options.body) : null });
+      const path = new URL(String(url)).pathname.replace("/api/reseller/v1", "");
+      if (path === "/account/info") return jsonResponse({ ok: true, account: { id: "acct" } });
+      if (path === "/account/balance") return jsonResponse({ ok: true, balance: "0.00", currency: "USD" });
+      if (path === "/products") return jsonResponse({ ok: true, products: [{ productId: 1, title: "Gemini Pro", price: "0.90", currency: "USD", stock: 5, inStock: true }] });
+      if (path === "/products/1") return jsonResponse({ ok: true, product: { productId: 1, title: "Gemini Pro" } });
+      if (path === "/orders") return jsonResponse({ ok: true, order: { orderCode: "rs_test", status: "completed", value: "TEST_DELIVERY" } });
+      if (path === "/orders/rs_test") return jsonResponse({ ok: true, order: { orderCode: "rs_test", status: "completed", value: "TEST_DELIVERY" } });
+      return jsonResponse({ error: "not_found" }, { ok: false, status: 404 });
+    },
+  });
+
+  await efem.getAccountInfo();
+  await efem.getBalance();
+  await efem.listProducts();
+  await efem.getProduct(1);
+  await efem.createOrder({ productId: 1, quantity: 1 });
+  await efem.listOrders();
+  await efem.getOrder("rs_test");
+
+  assert.deepEqual(calls.map((call) => `${call.method} ${new URL(call.url).pathname.replace("/api/reseller/v1", "")}`), [
+    "GET /account/info",
+    "GET /account/balance",
+    "GET /products",
+    "GET /products/1",
+    "POST /orders",
+    "GET /orders",
+    "GET /orders/rs_test",
+  ]);
+  assert.equal(calls.every((call) => call.headers["X-API-Key"] === "efem-key"), true);
+  assert.deepEqual(calls[4].body, { productId: 1, quantity: 1 });
+});
+
+test("selected supplier product import upserts only selected products", async () => {
+  const { service } = createHarness();
+  const supplierConfig = {
+    id: "efem",
+    type: "efem",
+    name: "Efem Store",
+    storeKey: "efem",
+    enabled: true,
+    apiKey: "test-only",
+    baseUrl: "https://api-geminipro.ignorelist.com/api/reseller/v1",
+  };
+  service.getDigitalServiceSupplierRuntimeConfig = () => supplierConfig;
+  service.updateDigitalServiceSupplierSyncStats = () => undefined;
+  const digitalServices = new DigitalServicesService({
+    financialService: service,
+    efemService: {
+      baseUrl: supplierConfig.baseUrl,
+      isConfigured: () => true,
+      listProducts: async () => ({
+        products: [
+          { id: 101, name: "Selected", price: 10, currency: "USD", stock: 5 },
+          { id: 102, name: "Not selected", price: 20, currency: "USD", stock: 5 },
+        ],
+      }),
+    },
+  });
+
+  const result = await digitalServices.importSupplierProducts("efem", { selectedProductIds: ["101"] });
+
+  assert.equal(result.summary.importedCount, 1);
+  assert.equal(result.products.length, 1);
+  assert.equal(result.products[0].supplierProductId, "101");
+  assert.equal(service.listDigitalServiceProducts({ includeInactive: true, admin: true }).some((product) => product.supplierProductId === "102"), false);
+});
+
+test("Efem completed order encrypts value delivery and charges wallet once", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "efem:1",
+      supplierProductId: "1",
+      provider: "efem",
+      storeKey: "efem",
+      storeName: "Efem Store",
+      fulfillmentMode: "automatic",
+      name: "Gemini Pro",
+      description: "Premium Gemini access",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 5,
+      available: true,
+    }], { provider: "efem" });
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      efemService: {
+        isConfigured: () => true,
+        getPublicStatus: () => ({ configured: true }),
+        createOrder: async () => {
+          supplierCalls += 1;
+          return { ok: true, order: { orderCode: "rs_test", productId: 1, status: "completed", value: "TEST_DELIVERY" } };
+        },
+        getOrder: async () => ({ ok: true, order: { orderCode: "rs_test", status: "completed", value: "TEST_DELIVERY" } }),
+      },
+    });
+
+    const order = await digitalServices.purchase(user, { productId: "efem:1", quantity: 1 }, { idempotencyKey: "efem-ok" });
+    const stored = db.digitalServiceOrders[0];
+
+    assert.equal(order.status, "delivered");
+    assert.equal(order.supplierOrderId, "");
+    assert.equal(stored.supplierOrderId, "rs_test");
+    assert.equal(order.delivery.value, "TEST_DELIVERY");
+    assert.equal(stored.deliveryEncrypted.includes("TEST_DELIVERY"), false);
+    assert.equal(JSON.stringify(stored.supplierResponse).includes("TEST_DELIVERY"), false);
+    assert.equal(stored.supplierResponse.data.value, "[stored_in_encrypted_delivery]");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === order.requestId).length, 1);
+    assert.equal(service.listNotifications(user).some((item) => item.dedupeKey === `digital-service-delivered:${order.id}`), true);
+    assert.equal(supplierCalls, 1);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("Efem concurrent fulfillment posts only once", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "efem:2",
+      supplierProductId: "2",
+      provider: "efem",
+      storeKey: "efem",
+      storeName: "Efem Store",
+      fulfillmentMode: "automatic",
+      name: "Efem Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 5,
+      available: true,
+    }], { provider: "efem" });
+    const product = service.getDigitalServiceProduct("efem:2", { admin: true });
+    const paid = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      efemService: {
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return { ok: true, order: { orderCode: "rs_once", status: "completed", value: "ONE_DELIVERY" } };
+        },
+      },
+    });
+
+    const [first, second] = await Promise.all([
+      digitalServices.fulfillPaidOrder(paid.id, admin),
+      digitalServices.fulfillPaidOrder(paid.id, admin),
+    ]);
+
+    assert.equal(first.status, "delivered");
+    assert.equal(second.status, "delivered");
+    assert.equal(supplierCalls, 1);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("Efem timeout after dispatch enters manual review and does not blind retry", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "efem:3",
+      supplierProductId: "3",
+      provider: "efem",
+      storeKey: "efem",
+      storeName: "Efem Store",
+      fulfillmentMode: "automatic",
+      name: "Efem Timeout Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 5,
+      available: true,
+    }], { provider: "efem" });
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      efemService: {
+        isConfigured: () => true,
+        listOrders: async () => [],
+        createOrder: async () => {
+          supplierCalls += 1;
+          const error = new Error("Efem Store request timed out.");
+          error.code = "EFEM_TIMEOUT";
+          error.statusCode = 504;
+          error.ambiguousSupplierPurchase = true;
+          throw error;
+        },
+      },
+    });
+
+    const failed = await digitalServices.purchase(user, { productId: "efem:3", quantity: 1 }, { idempotencyKey: "efem-timeout" });
+    const retried = await digitalServices.fulfillPaidOrder(failed.id, admin);
+
+    assert.equal(failed.fulfillmentStatus, "manual_review");
+    assert.equal(retried.fulfillmentStatus, "manual_review");
+    assert.equal(supplierCalls, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "4000");
+    assert.equal(db.transactions.filter((item) => item.type === "DIGITAL_SERVICE" && item.reference === failed.requestId).length, 1);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("Efem recovery uses known orderCode without POST or second debit", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "efem:4",
+      supplierProductId: "4",
+      provider: "efem",
+      storeKey: "efem",
+      storeName: "Efem Store",
+      fulfillmentMode: "automatic",
+      name: "Efem Recover Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 5,
+      available: true,
+    }], { provider: "efem" });
+    const product = service.getDigitalServiceProduct("efem:4", { admin: true });
+    const paid = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const record = service.db.digitalServiceOrders[0];
+    record.supplierOrderId = "rs_test";
+    record.supplierStatus = "completed";
+    record.fulfillmentStatus = "manual_review";
+    let postCalls = 0;
+    let getCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false },
+      efemService: {
+        isConfigured: () => true,
+        createOrder: async () => {
+          postCalls += 1;
+          return {};
+        },
+        getOrder: async (orderCode) => {
+          getCalls += 1;
+          return { ok: true, order: { orderCode, status: "completed", value: "RECOVERED_DELIVERY" } };
+        },
+      },
+    });
+
+    const recovered = await digitalServices.recoverOrderDelivery(paid.id, admin);
+
+    assert.equal(recovered.status, "delivered");
+    assert.equal(recovered.delivery.value, "RECOVERED_DELIVERY");
+    assert.equal(postCalls, 0);
+    assert.equal(getCalls, 1);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("manual products checkout waits for encrypted admin fulfillment and is idempotent", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    const product = service.createManualDigitalServiceProduct(admin, {
+      name: "Custom Premium Account",
+      description: "Delivered manually by admin",
+      imageUrl: "https://example.com/product.png",
+      storefrontLabel: "Manual Store",
+      sellingPrice: "2500",
+      stock: 2,
+      available: true,
+    });
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      akundingService: { isConfigured: () => false, createOrder: async () => { supplierCalls += 1; } },
+    });
+
+    const walletOrder = await digitalServices.purchase(user, { productId: product.id, quantity: 1 }, { idempotencyKey: "manual-wallet" });
+    const pendingPaystack = await digitalServices.purchase(user, { productId: product.id, quantity: 1, paymentMethod: "paystack" }, { idempotencyKey: "manual-paystack" });
+    const paidPaystack = service.confirmDigitalServicePaystackPayment(pendingPaystack.paymentReference, {
+      status: "success",
+      reference: pendingPaystack.paymentReference,
+      currency: "NGN",
+      amount: toKobo("2500"),
+    }, user);
+    const delivered = service.fulfillManualDigitalServiceOrder(admin, walletOrder.id, {
+      deliveryItems: [
+        { type: "Email", value: "customer@example.com" },
+        { type: "Password", value: "ManualSecret" },
+      ],
+      instructions: "Login and change your password.",
+    });
+    const duplicate = service.fulfillManualDigitalServiceOrder(admin, walletOrder.id, {
+      deliveryItems: [{ type: "Password", value: "DifferentSecret" }],
+    });
+
+    assert.equal(walletOrder.fulfillmentMode, "manual");
+    assert.equal(walletOrder.fulfillmentStatus, "awaiting_manual_fulfillment");
+    assert.equal(paidPaystack.fulfillmentStatus, "awaiting_manual_fulfillment");
+    assert.equal(delivered.status, "delivered");
+    assert.equal(duplicate.delivery.deliveryItems[1].value, "ManualSecret");
+    assert.equal(supplierCalls, 0);
+    assert.equal(JSON.stringify(db.digitalServiceOrders.find((item) => item.id === walletOrder.id).supplierResponse).includes("ManualSecret"), false);
+    assert.equal(service.listNotifications(user).filter((item) => item.dedupeKey === `digital-service-delivered:${walletOrder.id}`).length, 1);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("manual product admin APIs reject non-admin and cross-user delivery access stays denied", () => {
+  const { admin, db, service, user } = createHarness();
+  const userB = { id: "user-2", name: "Ben User", email: "ben@example.com", role: "user" };
+  db.users.push(userB);
+  setWallet(service, user.id, "NGN", "5000");
+  service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+
+  assert.throws(
+    () => service.createManualDigitalServiceProduct(user, { name: "Bad", description: "No", sellingPrice: "1000" }),
+    /Admin access is required/
+  );
+  const product = service.createManualDigitalServiceProduct(admin, { name: "Manual", description: "Manual desc", sellingPrice: "1000" });
+  const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+  assert.throws(
+    () => service.fulfillManualDigitalServiceOrder(user, order.id, { deliveryItems: [{ type: "Code", value: "ABC" }] }),
+    /Admin access is required/
+  );
+  assert.throws(
+    () => service.getDigitalServiceOrder(userB, order.id),
+    /not found/
+  );
 });
 
 test("48-hour cleanup deletes only disposable history older than cutoff", () => {

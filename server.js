@@ -58,6 +58,7 @@ const { TelegramService } = require("./services/telegramService");
 const { PushNotificationService } = require("./services/pushNotificationService");
 const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
 const { EmmaResellerService, DEFAULT_EMMA_RESELLER_BASE_URL } = require("./services/emmaReseller.service");
+const { EfemResellerService, DEFAULT_EFEM_RESELLER_BASE_URL } = require("./services/efemReseller.service");
 const { DigitalServicesService, validateSupplierUrl } = require("./services/digitalServices.service");
 const {
   VtuService,
@@ -137,6 +138,7 @@ let questService = null;
 let vtuService = null;
 let akundingService = null;
 let emmaResellerService = null;
+let efemResellerService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
@@ -6743,6 +6745,7 @@ async function handleApi(req, res, url) {
       orders: financialService.listDigitalServiceOrders(admin, { limit: 300 }),
       apiBaseUrl: DEFAULT_AKUNDING_BASE_URL,
       emmaApiBaseUrl: DEFAULT_EMMA_RESELLER_BASE_URL,
+      efemApiBaseUrl: DEFAULT_EFEM_RESELLER_BASE_URL,
     });
     return true;
   }
@@ -6891,7 +6894,10 @@ async function handleApi(req, res, url) {
       }
       if (action === "import" || action === "sync") {
         const body = await readBody(req).catch(() => ({}));
-        const imported = await digitalServicesService.importSupplierProducts(supplierId, { mapping: body.mapping || null });
+        const imported = await digitalServicesService.importSupplierProducts(supplierId, {
+          mapping: body.mapping || null,
+          selectedProductIds: Array.isArray(body.selectedProductIds) ? body.selectedProductIds : [],
+        });
         sendJson(res, 200, {
           ...imported,
           products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
@@ -6932,6 +6938,13 @@ async function handleApi(req, res, url) {
           // Emma balance is admin-only metadata; product sync and user shop must not fail when balance is unavailable.
         }
       }
+      if (digitalServicesService.getProviderService("efem")?.isConfigured?.()) {
+        try {
+          await digitalServicesService.getProviderService("efem").getBalance();
+        } catch {
+          // Efem balance is admin-only metadata; product sync and user shop must not fail when balance is unavailable.
+        }
+      }
       sendJson(res, 200, {
         products,
         supplierAccount: supplierAccount ? { connected: true } : null,
@@ -6957,6 +6970,48 @@ async function handleApi(req, res, url) {
       orders: financialService.listDigitalServiceOrders(admin, { limit, status }),
       summary: financialService.getDigitalServiceAdminSummary(),
     });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/integrations/digital-services/products") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const product = financialService.createManualDigitalServiceProduct(admin, await readBody(req), getRequestMeta(req));
+      sendJson(res, 201, {
+        product,
+        products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
+        summary: financialService.getDigitalServiceAdminSummary(),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalManualProductMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/products\/([^/]+)$/);
+  if ((req.method === "PATCH" || req.method === "PUT") && adminDigitalManualProductMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const product = financialService.updateManualDigitalServiceProduct(
+        admin,
+        decodeURIComponent(adminDigitalManualProductMatch[1] || ""),
+        await readBody(req),
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, {
+        product,
+        products: financialService.listDigitalServiceProducts({ includeInactive: true, admin: true }),
+        summary: financialService.getDigitalServiceAdminSummary(),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
     return true;
   }
 
@@ -6989,6 +7044,26 @@ async function handleApi(req, res, url) {
     try {
       const product = await digitalServicesService.refreshProduct(decodeURIComponent(adminDigitalProductRefreshMatch[1] || ""));
       sendJson(res, 200, { product, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalManualFulfillMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/manual-fulfill$/);
+  if (req.method === "POST" && adminDigitalManualFulfillMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    try {
+      const order = financialService.fulfillManualDigitalServiceOrder(
+        admin,
+        decodeURIComponent(adminDigitalManualFulfillMatch[1] || ""),
+        await readBody(req),
+        getRequestMeta(req)
+      );
+      sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message });
     }
@@ -8881,7 +8956,8 @@ async function startServer() {
   vtuService = new VtuService({ financialService, logger: console });
   akundingService = new AkundingService({ logger: console });
   emmaResellerService = new EmmaResellerService({ logger: console });
-  digitalServicesService = new DigitalServicesService({ financialService, akundingService, emmaService: emmaResellerService });
+  efemResellerService = new EfemResellerService({ logger: console });
+  digitalServicesService = new DigitalServicesService({ financialService, akundingService, emmaService: emmaResellerService, efemService: efemResellerService });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

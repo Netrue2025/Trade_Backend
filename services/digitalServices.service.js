@@ -53,6 +53,8 @@ const PROCESSING_STATUSES = new Set(["pending", "processing", "queued", "created
 const PROVIDER_LABELS = {
   akunding: "Alaba Store",
   emma: "Emma Store",
+  efem: "Efem Store",
+  manual: "Manual Store",
 };
 const GENERIC_TIMEOUT_MS = 25000;
 const PRODUCT_FIELD_MAPPING_KEYS = {
@@ -222,7 +224,7 @@ function extractEmmaDeliveryPayload(source = {}) {
 }
 
 function responseHasSupplierSuccess(payload = {}) {
-  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const source = extractSupplierRecord(payload);
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     return false;
   }
@@ -240,6 +242,7 @@ function sanitizeSupplierResponseForStorage(payload, delivery = null) {
     "codes",
     "license",
     "licenses",
+    "value",
     "credentials",
     "delivery",
     "delivery_items",
@@ -297,13 +300,13 @@ function extractSupplierRows(payload) {
   if (!payload || typeof payload !== "object") {
     return [];
   }
-  for (const key of ["data", "products", "items", "results", "records"]) {
+  for (const key of ["data", "products", "orders", "items", "results", "records"]) {
     const value = payload[key];
     if (Array.isArray(value)) {
       return value;
     }
     if (value && typeof value === "object") {
-      for (const nestedKey of ["data", "products", "items", "results", "records"]) {
+      for (const nestedKey of ["data", "products", "orders", "items", "results", "records"]) {
         if (Array.isArray(value[nestedKey])) {
           return value[nestedKey];
         }
@@ -320,7 +323,7 @@ function extractSupplierRecord(payload) {
   if (!payload || Array.isArray(payload) || typeof payload !== "object") {
     return {};
   }
-  for (const key of ["data", "product", "item", "record", "result"]) {
+  for (const key of ["data", "order", "product", "item", "record", "result"]) {
     const value = payload[key];
     if (value && !Array.isArray(value) && typeof value === "object") {
       return value;
@@ -639,7 +642,7 @@ function normalizeMarkupMode(value) {
 }
 
 function mapSupplierStatus(payload = {}) {
-  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const source = extractSupplierRecord(payload);
   const status = normalizeText(firstValue(source, ["status", "order_status", "state"]), "").toLowerCase();
   if (SUCCESS_STATUSES.has(status)) {
     return "delivered";
@@ -660,6 +663,39 @@ function classifySupplierFulfillmentError(error = {}) {
   const statusCode = Number(error.statusCode || 0);
   const timeoutCodes = ["AKUNDING_TIMEOUT", "EMMA_TIMEOUT", "SUPPLIER_TIMEOUT"];
   const message = normalizeText(error.message || "Supplier fulfillment failed.");
+  const errorCode = String(error.code || error.payload?.error || error.payload?.code || "").trim().toLowerCase();
+  if (error.code === "EFEM_TIMEOUT" || error.ambiguousSupplierPurchase) {
+    return {
+      status: "processing",
+      supplierStatus: "fulfillment_unknown",
+      fulfillmentStatus: "manual_review",
+      message: "Efem Store purchase status is unknown after a timeout. Do not retry until the supplier order is reviewed.",
+    };
+  }
+  if (statusCode === 402 || errorCode === "insufficient_funds") {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_balance_required",
+      fulfillmentStatus: "manual_review",
+      message: "Supplier balance is insufficient. Admin action is required before fulfillment can continue.",
+    };
+  }
+  if (statusCode === 409 && errorCode === "out_of_stock") {
+    return {
+      status: "processing",
+      supplierStatus: "out_of_stock",
+      fulfillmentStatus: "manual_review",
+      message: "Supplier product is out of stock. Admin action is required.",
+    };
+  }
+  if (statusCode === 409 && errorCode === "supplier_purchase_pending") {
+    return {
+      status: "processing",
+      supplierStatus: "supplier_purchase_pending",
+      fulfillmentStatus: "manual_review",
+      message: "Supplier purchase is pending. Reconcile the supplier order before retrying.",
+    };
+  }
   if (timeoutCodes.includes(error.code)) {
     return {
       status: "processing",
@@ -725,7 +761,7 @@ function classifySupplierFulfillmentError(error = {}) {
 }
 
 function extractSupplierOrderId(payload = {}) {
-  const source = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const source = extractSupplierRecord(payload);
   return String(firstValue(source, [
     "id",
     "order_id",
@@ -735,6 +771,10 @@ function extractSupplierOrderId(payload = {}) {
     "requestId",
     "external_order_id",
     "externalOrderId",
+    "orderCode",
+    "order_code",
+    "uniqueId",
+    "boughtId",
   ]) || "").trim();
 }
 
@@ -789,10 +829,11 @@ function mergeSupplierPayloads(payloads = []) {
 }
 
 class DigitalServicesService {
-  constructor({ financialService, akundingService, emmaService = null, clock = () => new Date().toISOString() } = {}) {
+  constructor({ financialService, akundingService, emmaService = null, efemService = null, clock = () => new Date().toISOString() } = {}) {
     this.financialService = financialService;
     this.akundingService = akundingService;
     this.emmaService = emmaService;
+    this.efemService = efemService;
     this.clock = clock;
     this.fulfillmentRequests = new Map();
   }
@@ -804,6 +845,12 @@ class DigitalServicesService {
     }
     if (providerKey === "emma") {
       return this.emmaService;
+    }
+    if (providerKey === "efem") {
+      const config = this.financialService.getDigitalServiceSupplierRuntimeConfig?.("efem");
+      return config?.apiKey && typeof this.efemService?.withConfig === "function"
+        ? this.efemService.withConfig(config)
+        : this.efemService;
     }
     const config = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(providerKey);
     return config ? new GenericSupplierService({ config }) : null;
@@ -831,11 +878,22 @@ class DigitalServicesService {
         orderReconciliation: true,
         ...(this.emmaService?.getPublicStatus?.() || { configured: false }),
       },
+      efem: {
+        id: "efem",
+        name: "Efem Store",
+        type: "efem",
+        enabled: true,
+        productSync: true,
+        automaticFulfillment: true,
+        orderReconciliation: true,
+        ...(this.getProviderService("efem")?.getPublicStatus?.() || { configured: false }),
+      },
     };
     for (const supplier of this.financialService.listDigitalServiceSuppliers?.({ includeBuiltIns: false }) || []) {
       statuses[supplier.id] = {
+        ...(statuses[supplier.id] || {}),
         ...supplier,
-        configured: supplier.enabled !== false && !!supplier.baseUrl && !!supplier.productEndpoint,
+        configured: statuses[supplier.id] ? statuses[supplier.id].configured : (supplier.enabled !== false && !!supplier.baseUrl && !!supplier.productEndpoint),
       };
     }
     return statuses;
@@ -857,10 +915,10 @@ class DigitalServicesService {
     const supplierConfig = supplier || this.financialService.getDigitalServiceSupplierRuntimeConfig?.(normalizedProvider) || null;
     const productMapping = mapping || supplierConfig?.fieldMapping || {};
     const supplierProductId = normalizeProductId(raw, productMapping);
-    const supplierCurrency = normalizeCurrency(raw, normalizedProvider === "emma" ? "USD" : "NGN");
+    const supplierCurrency = normalizeCurrency(raw, normalizedProvider === "emma" || normalizedProvider === "efem" ? "USD" : "NGN");
     const storeName = getProviderStoreLabel(normalizedProvider, supplierConfig);
-    const storeKey = supplierConfig?.storeKey || (normalizedProvider === "emma" ? "emma" : normalizedProvider === "akunding" ? "alaba" : normalizedProvider);
-    const automaticFulfillment = normalizedProvider === "akunding" || normalizedProvider === "emma" || supplierConfig?.capabilities?.automaticFulfillment === true;
+    const storeKey = supplierConfig?.storeKey || (normalizedProvider === "emma" ? "emma" : normalizedProvider === "efem" ? "efem" : normalizedProvider === "akunding" ? "alaba" : normalizedProvider);
+    const automaticFulfillment = normalizedProvider === "akunding" || normalizedProvider === "emma" || normalizedProvider === "efem" || supplierConfig?.capabilities?.automaticFulfillment === true;
     return {
       id: createProviderProductId(normalizedProvider, supplierProductId),
       supplierProductId,
@@ -870,11 +928,13 @@ class DigitalServicesService {
       name: normalizeName(raw, productMapping),
       description: normalizeDescription(raw, productMapping),
       category: normalizeCategory(raw, productMapping) || storeName,
-      currency: normalizedProvider === "emma" && supplierCurrency === "NGN" ? "USD" : supplierCurrency,
+      currency: (normalizedProvider === "emma" || normalizedProvider === "efem") && supplierCurrency === "NGN" ? "USD" : supplierCurrency,
       providerCost: normalizeProviderCost(raw, productMapping),
       stock: normalizeStock(raw, productMapping),
       providerStatus: normalizeStatus(raw, productMapping),
       available: automaticFulfillment && supplierConfig?.enabled !== false && isProductAvailable(raw, productMapping),
+      fulfillmentMode: automaticFulfillment ? "automatic" : "manual",
+      storefrontLabel: storeName,
       sourceMissing: false,
       automaticFulfillment,
       imageUrl: normalizeSupplierImageUrl(getImageCandidate(raw, productMapping), service?.baseUrl || supplierConfig?.baseUrl || "https://akunding.shop"),
@@ -917,7 +977,7 @@ class DigitalServicesService {
   }
 
   getSyncProviderKeys() {
-    const keys = ["akunding", "emma"];
+    const keys = ["akunding", "emma", "efem"];
     for (const supplier of this.financialService.listDigitalServiceSuppliers?.({ includeBuiltIns: false }) || []) {
       if (supplier.enabled !== false && supplier.productSync !== false) {
         keys.push(supplier.id);
@@ -945,6 +1005,17 @@ class DigitalServicesService {
   }
 
   async testSupplierConnection(input = {}) {
+    const providerKey = normalizeProviderKey(input.id || input.type || input.provider || "");
+    if (providerKey === "efem" && this.efemService) {
+      const service = typeof this.efemService.withConfig === "function" ? this.efemService.withConfig(input) : this.efemService;
+      const payload = await service.testConnection();
+      return {
+        connected: true,
+        productCount: 0,
+        mapping: {},
+        payload: payload && typeof payload === "object" ? { ok: payload.ok, status: payload.status || "" } : {},
+      };
+    }
     const service = new GenericSupplierService({ config: input });
     const payload = await service.testConnection();
     const rows = extractSupplierRows(payload);
@@ -975,7 +1046,7 @@ class DigitalServicesService {
     };
   }
 
-  async importSupplierProducts(supplierId, { mapping = null } = {}) {
+  async importSupplierProducts(supplierId, { mapping = null, selectedProductIds = [] } = {}) {
     const supplier = this.financialService.getDigitalServiceSupplierRuntimeConfig(supplierId);
     if (!supplier || supplier.enabled === false) {
       throw new Error("Supplier is disabled or unavailable.");
@@ -993,14 +1064,25 @@ class DigitalServicesService {
     if (mapping) {
       this.financialService.updateDigitalServiceSupplierMapping(supplier.id, preview.mapping);
     }
-    const imported = this.financialService.replaceDigitalServiceProducts(preview.products, { provider: supplier.id });
-    this.financialService.updateDigitalServiceSupplierSyncStats?.(supplier.id, preview.products);
+    const selectedIds = new Set((Array.isArray(selectedProductIds) ? selectedProductIds : []).map((value) => String(value)));
+    const selectedProducts = selectedIds.size
+      ? preview.products.filter((product) => selectedIds.has(String(product.supplierProductId || product.id || "")))
+      : preview.products;
+    if (selectedIds.size && !selectedProducts.length) {
+      const error = new Error("Select at least one valid supplier product to import.");
+      error.statusCode = 400;
+      throw error;
+    }
+    const imported = selectedIds.size
+      ? selectedProducts.map((product) => this.financialService.upsertDigitalServiceProduct(product, { provider: supplier.id }))
+      : this.financialService.replaceDigitalServiceProducts(selectedProducts, { provider: supplier.id });
+    this.financialService.updateDigitalServiceSupplierSyncStats?.(supplier.id, selectedProducts);
     return {
       products: imported,
       summary: {
-        importedCount: preview.products.length,
-        availableCount: preview.products.filter((product) => product.available).length,
-        unavailableCount: preview.products.filter((product) => !product.available).length,
+        importedCount: selectedProducts.length,
+        availableCount: selectedProducts.filter((product) => product.available).length,
+        unavailableCount: selectedProducts.filter((product) => !product.available).length,
       },
     };
   }
@@ -1071,8 +1153,9 @@ class DigitalServicesService {
       throw error;
     }
     const provider = normalizeProviderKey(product.provider);
-    const service = this.getProviderService(provider);
-    if (!service?.isConfigured?.()) {
+    const fulfillmentMode = String(product.fulfillmentMode || (provider === "manual" ? "manual" : "automatic")).toLowerCase();
+    const service = fulfillmentMode === "manual" ? null : this.getProviderService(provider);
+    if (fulfillmentMode !== "manual" && !service?.isConfigured?.()) {
       throw new Error("Digital Services supplier is not configured.");
     }
     const quantity = Math.max(1, Math.min(Math.floor(Number(input.quantity || 1)), 1000));
@@ -1092,7 +1175,7 @@ class DigitalServicesService {
       paymentMethod: input.paymentMethod || "wallet",
     }, requestMeta);
     this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order });
-    if (order.paymentMethod === "paystack") {
+    if (order.paymentMethod === "paystack" || order.fulfillmentMode === "manual") {
       return order;
     }
     const fulfilled = await this.fulfillPaidOrder(order.id, user, requestMeta);
@@ -1146,15 +1229,26 @@ class DigitalServicesService {
     if (storedDelivery) {
       return this.applySupplierResult(order.id, order.supplierResponse, actor, requestMeta);
     }
-    if (String(order.provider || "").toLowerCase() !== "emma") {
-      throw new Error("Delivery recovery is only available for Emma Store orders.");
+    const providerKey = normalizeProviderKey(order.provider);
+    if (!["emma", "efem"].includes(providerKey)) {
+      throw new Error("Delivery recovery is only available for supported supplier orders.");
     }
     if (String(order.paymentStatus || "").toLowerCase() !== "paid") {
       throw new Error("Order payment is not confirmed.");
     }
     const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
-    const service = this.getProviderService("emma");
-    if (!service?.isConfigured?.() || typeof service.createOrder !== "function") {
+    const service = this.getProviderService(providerKey);
+    if (!service?.isConfigured?.()) {
+      throw new Error("Delivery recovery is pending supplier configuration.");
+    }
+    if (providerKey === "efem") {
+      if (!order.supplierOrderId || typeof service.getOrder !== "function") {
+        throw new Error("Efem delivery recovery requires a known supplier order code.");
+      }
+      const providerResponse = await service.getOrder(order.supplierOrderId);
+      return this.applySupplierResult(order.id, providerResponse, actor, requestMeta);
+    }
+    if (typeof service.createOrder !== "function") {
       throw new Error("Emma delivery recovery is pending supplier configuration.");
     }
     const providerResponse = await service.createOrder({
@@ -1182,6 +1276,24 @@ class DigitalServicesService {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
     }
     if (["fulfilled", "failed_final"].includes(String(order.fulfillmentStatus || "").toLowerCase())) {
+      return this.financialService.getDigitalServiceOrder(actor, order.id);
+    }
+    const orderProvider = normalizeProviderKey(order.provider);
+    if (String(order.fulfillmentMode || "").toLowerCase() === "manual" || orderProvider === "manual") {
+      return this.financialService.markManualDigitalServiceOrderAwaiting?.(order.id, actor, requestMeta)
+        || this.financialService.applyDigitalServiceOrderResult(order.id, {
+          status: "paid",
+          supplierStatus: "manual_fulfillment_required",
+          fulfillmentStatus: "awaiting_manual_fulfillment",
+          message: "Manual fulfillment is awaiting admin delivery.",
+        }, actor, requestMeta);
+    }
+    if (
+      orderProvider === "efem" &&
+      !order.supplierOrderId &&
+      ["manual_review", "fulfillment_unknown"].includes(String(order.fulfillmentStatus || "").toLowerCase()) &&
+      /unknown|timeout|timed out/i.test(String(order.lastFulfillmentError || ""))
+    ) {
       return this.financialService.getDigitalServiceOrder(actor, order.id);
     }
     order.fulfillmentAttemptCount = Number(order.fulfillmentAttemptCount || 0) + 1;
@@ -1239,6 +1351,13 @@ class DigitalServicesService {
         return this.applySupplierResult(order.id, error.payload, actor, requestMeta);
       }
       const payload = classifySupplierFulfillmentError(error);
+      if (provider === "efem" && ["supplier_balance_required", "fulfillment_unknown", "out_of_stock", "supplier_purchase_pending"].includes(payload.supplierStatus)) {
+        this.financialService.notifyAdminSupplierActionRequired?.(
+          this.financialService.db?.users?.find?.((item) => item.id === order.userId) || {},
+          order,
+          payload
+        );
+      }
       return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
     }
   }
