@@ -32,6 +32,7 @@ function createHarness(options = {}) {
     idGenerator: () => `id-${++id}`,
     clock: () => "2026-08-30T10:00:00.000Z",
     notificationPublisher: options.notificationPublisher || null,
+    emailPublisher: options.emailPublisher || null,
   });
   service.ensureState();
   return {
@@ -4333,6 +4334,71 @@ test("manual product admin APIs reject non-admin and cross-user delivery access 
     () => service.getDigitalServiceOrder(userB, order.id),
     /not found/
   );
+});
+
+test("fulfilled OTP-enabled manual orders create one encrypted admin request", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  const emails = [];
+  try {
+    const { admin, db, service, user } = createHarness({ emailPublisher: (message) => emails.push(message) });
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true } });
+    const product = service.createManualDigitalServiceProduct(admin, {
+      name: "OTP Account", description: "Manual account", sellingPrice: "1000",
+      otpMode: "ADMIN_REQUEST", otpRequestEnabled: true, otpWaitSeconds: 60,
+      whatsappFallbackEnabled: true, whatsappFallbackUrl: "https://wa.me/2348000000000",
+    });
+    const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const stored = db.digitalServiceOrders.find((item) => item.id === order.id);
+    stored.paymentStatus = "paid";
+    stored.status = "delivered";
+    stored.fulfillmentStatus = "fulfilled";
+    service.requestDigitalServiceOtp(user, order.id);
+    service.requestDigitalServiceOtp(user, order.id);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(stored.otpRequest.status, "waiting");
+    assert.equal(stored.otpRequest.requestCount, 1);
+    assert.equal(service.listNotifications(admin).filter((item) => item.title === "OTP Requested").length, 1);
+    assert.equal(emails.length, 1);
+
+    const response = service.respondDigitalServiceOtp(admin, order.id, { code: "482911" });
+    assert.equal(response.otpRequest.code, "482911");
+    assert.notEqual(stored.otpRequest.responseEncrypted, "482911");
+    assert.equal(JSON.stringify(service.listNotifications(user)).includes("482911"), false);
+    assert.throws(() => service.respondDigitalServiceOtp(admin, order.id, { code: "999999" }), /not waiting/);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("OTP requests enforce ownership, payment, fulfillment, product configuration, and admin response", () => {
+  const { admin, db, service, user } = createHarness();
+  const other = { id: "user-2", role: "user", email: "other@example.com" };
+  db.users.push(other);
+  setWallet(service, user.id, "NGN", "5000");
+  service.updateSettings(admin, { digitalServices: { enabled: true } });
+  const product = service.createManualDigitalServiceProduct(admin, {
+    name: "OTP Account", description: "Manual account", sellingPrice: "1000",
+    otpMode: "ADMIN_REQUEST", otpRequestEnabled: true,
+  });
+  const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+  const stored = db.digitalServiceOrders.find((item) => item.id === order.id);
+
+  assert.throws(() => service.requestDigitalServiceOtp(other, order.id), (error) => error.statusCode === 403);
+  stored.paymentStatus = "pending";
+  assert.throws(() => service.requestDigitalServiceOtp(user, order.id), /payment is not confirmed/);
+  stored.paymentStatus = "paid";
+  assert.throws(() => service.requestDigitalServiceOtp(user, order.id), /must be fulfilled/);
+  stored.status = "delivered";
+  stored.fulfillmentStatus = "fulfilled";
+  db.digitalServiceProducts.find((item) => item.id === product.id).otpSupport.enabled = false;
+  assert.throws(() => service.requestDigitalServiceOtp(user, order.id), /not enabled/);
+  db.digitalServiceProducts.find((item) => item.id === product.id).otpSupport.enabled = true;
+  service.requestDigitalServiceOtp(user, order.id);
+  assert.throws(() => service.respondDigitalServiceOtp(user, order.id, { code: "123456" }), (error) => error.statusCode === 403);
 });
 
 test("48-hour cleanup deletes only disposable history older than cutoff", () => {

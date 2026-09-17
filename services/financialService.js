@@ -370,12 +370,13 @@ function toDecimalText(value, fallback = "0") {
 }
 
 class FinancialService {
-  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso, notificationPublisher = null } = {}) {
+  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso, notificationPublisher = null, emailPublisher = null } = {}) {
     this.db = db;
     this.persist = persist;
     this.idGenerator = idGenerator;
     this.clock = clock;
     this.notificationPublisher = notificationPublisher;
+    this.emailPublisher = emailPublisher;
   }
 
   ensureState() {
@@ -5336,6 +5337,7 @@ class FinancialService {
       imageUrl: this.getDigitalServiceImageUrl(product, override),
       deliveryLabel: product.deliveryLabel || "After purchase",
       planLabel: product.planLabel || "",
+      otpSupport: product.otpSupport || { mode: "none", enabled: false },
       providerStatus: product.providerStatus || "",
       syncedAt: product.syncedAt || null,
     };
@@ -5523,6 +5525,7 @@ class FinancialService {
     const storeKey = this.normalizeDigitalServiceSupplierId(input.storeKey || input.storefront || "manual") || "manual";
     const storeName = String(input.storefrontLabel || input.storeName || (storeKey === "efem" ? "Efem Store" : storeKey === "emma" ? "Emma Store" : "Manual Store")).trim().slice(0, 80);
     const imageUrl = normalizeOptionalUrl(input.imageUrl || input.image || "");
+    const otpMode = String(input.otpMode || "none").toLowerCase() === "admin_request" ? "admin_request" : "none";
     const id = `manual:${this.idGenerator(10).toLowerCase().replace(/[^a-z0-9]/g, "")}`;
     const product = {
       id,
@@ -5547,6 +5550,14 @@ class FinancialService {
       deliveryLabel: "Manual delivery",
       planLabel: String(input.planLabel || "").trim(),
       manualCreated: true,
+      otpSupport: {
+        mode: otpMode,
+        enabled: otpMode === "admin_request" && input.otpEnabled !== false,
+        waitSeconds: Math.max(10, Math.min(600, Number(input.otpWaitSeconds || 60))),
+        whatsappFallbackEnabled: input.whatsappFallbackEnabled === true,
+        whatsappUrl: normalizeOptionalUrl(input.whatsappUrl || ""),
+        whatsappLabel: String(input.whatsappLabel || "Get OTP Here").trim().slice(0, 40),
+      },
       createdAt: this.clock(),
       updatedAt: this.clock(),
       syncedAt: this.clock(),
@@ -5612,6 +5623,17 @@ class FinancialService {
     if (input.available !== undefined || input.status !== undefined) {
       next.available = input.available !== false && String(input.status || "available").toLowerCase() !== "unavailable";
       next.providerStatus = next.available ? "active" : "unavailable";
+    }
+    if (input.otpMode !== undefined || input.otpEnabled !== undefined) {
+      const mode = String(input.otpMode || "none").toLowerCase() === "admin_request" ? "admin_request" : "none";
+      next.otpSupport = {
+        mode,
+        enabled: mode === "admin_request" && input.otpEnabled !== false,
+        waitSeconds: Math.max(10, Math.min(600, Number(input.otpWaitSeconds || next.otpSupport?.waitSeconds || 60))),
+        whatsappFallbackEnabled: input.whatsappFallbackEnabled === true,
+        whatsappUrl: normalizeOptionalUrl(input.whatsappUrl || ""),
+        whatsappLabel: String(input.whatsappLabel || next.otpSupport?.whatsappLabel || "Get OTP Here").trim().slice(0, 40),
+      };
     }
     next.updatedAt = this.clock();
     this.db.digitalServiceProducts[index] = next;
@@ -5702,6 +5724,8 @@ class FinancialService {
       refundedAt: order.refundedAt || null,
       user: admin ? this.enrichUserRecord(order).user : undefined,
       delivery: ["delivered", "refunded"].includes(order.status) || admin ? delivery || fallbackDelivery : null,
+      otpRequest: this.sanitizeDigitalServiceOtpRequest(order, { admin }),
+      otpSupport: order.otpSupport || { mode: "none", enabled: false },
     };
     if (admin) {
       response.providerCost = order.providerCost;
@@ -5710,6 +5734,83 @@ class FinancialService {
       response.balanceReserved = !!order.balanceReserved;
     }
     return response;
+  }
+
+  sanitizeDigitalServiceOtpRequest(order = {}, { admin = false } = {}) {
+    const request = order.otpRequest;
+    if (!request) return null;
+    let status = String(request.status || "waiting").toLowerCase();
+    if (status === "responded" && request.expiresAt && Date.parse(request.expiresAt) <= Date.parse(this.clock())) status = "expired";
+    const response = { status, requestedAt: request.requestedAt, respondedAt: request.respondedAt || null, expiresAt: request.expiresAt || null, acknowledgedAt: request.acknowledgedAt || null, requestCount: Number(request.requestCount || 1) };
+    if (status === "responded" && request.responseEncrypted) {
+      try { response.code = decryptSetting(request.responseEncrypted); } catch { response.code = ""; }
+    }
+    if (admin) response.lastRequestedAt = request.lastRequestedAt || request.requestedAt;
+    return response;
+  }
+
+  requestDigitalServiceOtp(user, orderId, requestMeta = {}) {
+    const requestedOrder = this.db.digitalServiceOrders?.find((item) => item.id === orderId || item.requestId === orderId);
+    if (requestedOrder && requestedOrder.userId !== user.id && user.role !== "admin") {
+      throw Object.assign(new Error("You cannot request OTP for this order."), { statusCode: 403 });
+    }
+    const order = this.getDigitalServiceOrderRecord(user, orderId);
+    const product = this.getDigitalServiceProduct(order.productId, { admin: true });
+    const otp = product.otpSupport || order.otpSupport || {};
+    if (String(order.paymentStatus || "").toLowerCase() !== "paid") throw Object.assign(new Error("Order payment is not confirmed."), { statusCode: 400 });
+    if (order.status !== "delivered" || String(order.fulfillmentStatus || "").toLowerCase() !== "fulfilled") throw Object.assign(new Error("Order must be fulfilled before requesting OTP."), { statusCode: 400 });
+    if (String(otp.mode || "none").toLowerCase() !== "admin_request" || otp.enabled === false) throw Object.assign(new Error("OTP support is not enabled for this product."), { statusCode: 400 });
+    if (String(order.otpRequest?.status || "").toLowerCase() === "waiting") return this.sanitizeDigitalServiceOrder(order, { admin: false });
+    const requestedAt = this.clock();
+    order.otpSupport = otp;
+    order.otpRequest = { status: "waiting", requestedAt, respondedAt: null, expiresAt: null, responseEncrypted: "", acknowledgedAt: null, requestCount: Number(order.otpRequest?.requestCount || 0) + 1, lastRequestedAt: requestedAt };
+    const customer = this.db.users.find((item) => item.id === order.userId) || user;
+    this.notifyAdmins({ type: "DIGITAL_SERVICE", category: "adminEvents", title: "OTP Requested", message: `A customer needs an OTP for ${order.productName}.`, entityType: "DIGITAL_SERVICE", entityId: order.id, route: `/?tab=store&order=${encodeURIComponent(order.id)}`, dedupeKey: `admin:otp-request:${order.id}:${requestedAt}`, metadata: { orderId: order.id, requestId: order.requestId, otpRequest: true } });
+    if (this.emailPublisher) Promise.resolve().then(() => this.emailPublisher({ productName: order.productName, orderReference: order.requestId, customer: customer.email || customer.id, requestedAt })).catch((error) => console.warn("OTP admin email delivery failed:", error.message || error));
+    this.audit(user, "DIGITAL_SERVICE_OTP_REQUESTED", "DigitalServiceOrder", order.id, { requestId: order.requestId }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: false });
+  }
+
+  respondDigitalServiceOtp(admin, orderId, input = {}, requestMeta = {}) {
+    if (admin?.role !== "admin") throw Object.assign(new Error("Admin access is required."), { statusCode: 403 });
+    const order = this.getDigitalServiceOrderRecord(admin, orderId);
+    const request = order.otpRequest;
+    if (!request || String(request.status).toLowerCase() !== "waiting") throw Object.assign(new Error("OTP request is not waiting."), { statusCode: 409 });
+    const code = String(input.code || "").trim();
+    if (!/^[A-Za-z0-9 -]{4,32}$/.test(code)) throw Object.assign(new Error("Enter a valid OTP code."), { statusCode: 400 });
+    const minutes = Math.max(1, Math.min(60, Number(input.expiresInMinutes || 5)));
+    request.status = "responded";
+    request.respondedAt = this.clock();
+    request.expiresAt = new Date(Date.parse(request.respondedAt) + minutes * 60000).toISOString();
+    request.responseEncrypted = encryptSetting(code);
+    this.createNotification({ userId: order.userId, type: "DIGITAL_SERVICE", title: "Your OTP is ready", message: "Open NetrueFi to view your verification code.", entityType: "DIGITAL_SERVICE", entityId: order.id, route: "/?tab=store", dedupeKey: `otp-ready:${order.id}:${request.respondedAt}` });
+    this.audit(admin, "DIGITAL_SERVICE_OTP_RESPONDED", "DigitalServiceOrder", order.id, { requestId: order.requestId }, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: true });
+  }
+
+  cancelDigitalServiceOtp(admin, orderId, requestMeta = {}) {
+    if (admin?.role !== "admin") throw Object.assign(new Error("Admin access is required."), { statusCode: 403 });
+    const order = this.getDigitalServiceOrderRecord(admin, orderId);
+    const request = order.otpRequest;
+    if (!request || request.status !== "waiting") throw Object.assign(new Error("There is no waiting OTP request for this order."), { statusCode: 409 });
+    request.status = "cancelled";
+    request.cancelledAt = this.clock();
+    this.audit(admin, "DIGITAL_SERVICE_OTP_CANCELLED", "DigitalServiceOrder", order.id, {}, requestMeta);
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: true });
+  }
+
+  acknowledgeDigitalServiceOtp(user, orderId) {
+    const requestedOrder = this.db.digitalServiceOrders?.find((item) => item.id === orderId || item.requestId === orderId);
+    if (requestedOrder && requestedOrder.userId !== user.id && user.role !== "admin") {
+      throw Object.assign(new Error("You cannot access OTP for this order."), { statusCode: 403 });
+    }
+    const order = this.getDigitalServiceOrderRecord(user, orderId);
+    if (order.otpRequest) order.otpRequest.acknowledgedAt = order.otpRequest.acknowledgedAt || this.clock();
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" });
   }
 
   listDigitalServiceOrders(user, { limit = 100, offset = 0, status = "" } = {}) {
@@ -5803,6 +5904,7 @@ class FinancialService {
       storeName: product.storeName || product.storefrontLabel || (product.provider === "emma" ? "Emma Store" : product.provider === "efem" ? "Efem Store" : product.provider === "manual" ? "Manual Store" : "Alaba Store"),
       storefrontLabel: product.storefrontLabel || product.storeName || "",
       fulfillmentMode,
+      otpSupport: product.otpSupport || { mode: "none", enabled: false },
       productId: product.id,
       supplierProductId: product.supplierProductId || product.id,
       productName: product.name,

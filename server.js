@@ -59,6 +59,7 @@ const { PushNotificationService } = require("./services/pushNotificationService"
 const { AkundingService, DEFAULT_AKUNDING_BASE_URL } = require("./services/akunding.service");
 const { EmmaResellerService, DEFAULT_EMMA_RESELLER_BASE_URL } = require("./services/emmaReseller.service");
 const { EfemResellerService, DEFAULT_EFEM_RESELLER_BASE_URL } = require("./services/efemReseller.service");
+const { EmailNotificationService } = require("./services/emailNotification.service");
 const { DigitalServicesService, validateSupplierUrl } = require("./services/digitalServices.service");
 const {
   VtuService,
@@ -139,6 +140,7 @@ let vtuService = null;
 let akundingService = null;
 let emmaResellerService = null;
 let efemResellerService = null;
+let emailNotificationService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
@@ -7070,6 +7072,49 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const digitalOtpRequestMatch = url.pathname.match(/^\/api\/digital-services\/orders\/([^/]+)\/otp-request$/);
+  if (req.method === "POST" && digitalOtpRequestMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      const order = financialService.requestDigitalServiceOtp(user, decodeURIComponent(digitalOtpRequestMatch[1] || ""), getRequestMeta(req));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const digitalOtpAcknowledgeMatch = url.pathname.match(/^\/api\/digital-services\/orders\/([^/]+)\/otp-acknowledge$/);
+  if (req.method === "POST" && digitalOtpAcknowledgeMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      const order = financialService.acknowledgeDigitalServiceOtp(user, decodeURIComponent(digitalOtpAcknowledgeMatch[1] || ""));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const adminDigitalOtpResponseMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/otp-response$/);
+  if (req.method === "POST" && adminDigitalOtpResponseMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const input = await readBody(req);
+      const orderId = decodeURIComponent(adminDigitalOtpResponseMatch[1] || "");
+      const order = String(input.action || "").toLowerCase() === "cancel"
+        ? financialService.cancelDigitalServiceOtp(admin, orderId, getRequestMeta(req))
+        : financialService.respondDigitalServiceOtp(admin, orderId, input, getRequestMeta(req));
+      sendJson(res, 200, { order, summary: financialService.getDigitalServiceAdminSummary() });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   const adminDigitalOrderRequeryMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/requery$/);
   if (req.method === "POST" && adminDigitalOrderRequeryMatch) {
     const admin = requireAuth(req, res, "admin");
@@ -8945,10 +8990,12 @@ async function startServer() {
   db = await loadDb();
   ensureAdminUser(db);
   pushNotificationService = new PushNotificationService({ db, persist, logger: console });
+  emailNotificationService = new EmailNotificationService({ logger: console });
   financialService = new FinancialService({
     db,
     persist,
     notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
+    emailPublisher: (message) => emailNotificationService.sendAdminOtpRequest(message),
   });
   financialService.ensureState();
   pushNotificationService.ensureState();
