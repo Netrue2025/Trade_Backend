@@ -7098,6 +7098,19 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  const digitalReadyAcknowledgeMatch = url.pathname.match(/^\/api\/digital-services\/orders\/([^/]+)\/ready-acknowledge$/);
+  if (req.method === "POST" && digitalReadyAcknowledgeMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      const order = financialService.acknowledgeDigitalServiceOrderReady(user, decodeURIComponent(digitalReadyAcknowledgeMatch[1] || ""));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
   const adminDigitalOtpResponseMatch = url.pathname.match(/^\/api\/admin\/integrations\/digital-services\/orders\/([^/]+)\/otp-response$/);
   if (req.method === "POST" && adminDigitalOtpResponseMatch) {
     const admin = requireAuth(req, res, "admin");

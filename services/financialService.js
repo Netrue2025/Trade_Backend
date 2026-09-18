@@ -5338,6 +5338,7 @@ class FinancialService {
       deliveryLabel: product.deliveryLabel || "After purchase",
       planLabel: product.planLabel || "",
       otpSupport: product.otpSupport || { mode: "none", enabled: false },
+      postPaymentExperience: product.postPaymentExperience || [],
       providerStatus: product.providerStatus || "",
       syncedAt: product.syncedAt || null,
     };
@@ -5526,6 +5527,7 @@ class FinancialService {
     const storeName = String(input.storefrontLabel || input.storeName || (storeKey === "efem" ? "Efem Store" : storeKey === "emma" ? "Emma Store" : "Manual Store")).trim().slice(0, 80);
     const imageUrl = normalizeOptionalUrl(input.imageUrl || input.image || "");
     const otpMode = String(input.otpMode || "none").toLowerCase() === "admin_request" ? "admin_request" : "none";
+    const postPaymentExperience = this.normalizePostPaymentExperience(input.postPaymentExperience);
     const id = `manual:${this.idGenerator(10).toLowerCase().replace(/[^a-z0-9]/g, "")}`;
     const product = {
       id,
@@ -5558,6 +5560,7 @@ class FinancialService {
         whatsappUrl: normalizeOptionalUrl(input.whatsappUrl || ""),
         whatsappLabel: String(input.whatsappLabel || "Get OTP Here").trim().slice(0, 40),
       },
+      postPaymentExperience,
       createdAt: this.clock(),
       updatedAt: this.clock(),
       syncedAt: this.clock(),
@@ -5634,6 +5637,9 @@ class FinancialService {
         whatsappUrl: normalizeOptionalUrl(input.whatsappUrl || ""),
         whatsappLabel: String(input.whatsappLabel || next.otpSupport?.whatsappLabel || "Get OTP Here").trim().slice(0, 40),
       };
+    }
+    if (input.postPaymentExperience !== undefined) {
+      next.postPaymentExperience = this.normalizePostPaymentExperience(input.postPaymentExperience);
     }
     next.updatedAt = this.clock();
     this.db.digitalServiceProducts[index] = next;
@@ -5726,6 +5732,9 @@ class FinancialService {
       delivery: ["delivered", "refunded"].includes(order.status) || admin ? delivery || fallbackDelivery : null,
       otpRequest: this.sanitizeDigitalServiceOtpRequest(order, { admin }),
       otpSupport: order.otpSupport || { mode: "none", enabled: false },
+      postPaymentExperience: order.postPaymentExperience || [],
+      readyAcknowledgedAt: order.readyAcknowledgedAt || null,
+      readyNotificationPending: order.readyNotificationPending === true,
     };
     if (admin) {
       response.providerCost = order.providerCost;
@@ -5811,6 +5820,34 @@ class FinancialService {
     if (order.otpRequest) order.otpRequest.acknowledgedAt = order.otpRequest.acknowledgedAt || this.clock();
     this.persist();
     return this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" });
+  }
+
+  acknowledgeDigitalServiceOrderReady(user, orderId) {
+    const order = this.getDigitalServiceOrderRecord(user, orderId);
+    if (order.status !== "delivered" || String(order.fulfillmentStatus || "").toLowerCase() !== "fulfilled") {
+      throw Object.assign(new Error("Order is not ready."), { statusCode: 409 });
+    }
+    order.readyAcknowledgedAt = order.readyAcknowledgedAt || this.clock();
+    order.readyNotificationPending = false;
+    this.persist();
+    return this.sanitizeDigitalServiceOrder(order, { admin: user.role === "admin" });
+  }
+
+  normalizePostPaymentExperience(value) {
+    const source = Array.isArray(value) ? value : Array.isArray(value?.blocks) ? value.blocks : [];
+    return source.slice(0, 20).map((block) => {
+      const type = String(block?.type || "").trim().toLowerCase();
+      if (!['heading', 'text', 'instructions', 'code', 'link', 'divider'].includes(type)) return null;
+      if (type === 'divider') return { type };
+      if (type === 'link') {
+        const url = normalizeOptionalUrl(block.url || block.value || "");
+        if (!/^https?:\/\//i.test(url)) return null;
+        return { type, label: String(block.label || "Open link").trim().slice(0, 60), url };
+      }
+      const text = String(block.text || block.value || "").trim().slice(0, 2000);
+      if (!text) return null;
+      return { type, text };
+    }).filter(Boolean);
   }
 
   listDigitalServiceOrders(user, { limit = 100, offset = 0, status = "" } = {}) {
@@ -5905,6 +5942,7 @@ class FinancialService {
       storefrontLabel: product.storefrontLabel || product.storeName || "",
       fulfillmentMode,
       otpSupport: product.otpSupport || { mode: "none", enabled: false },
+      postPaymentExperience: product.postPaymentExperience || [],
       productId: product.id,
       supplierProductId: product.supplierProductId || product.id,
       productName: product.name,
@@ -6102,6 +6140,7 @@ class FinancialService {
       order.status = "delivered";
       order.completedAt = order.completedAt || this.clock();
       order.deliveredAt = order.deliveredAt || order.completedAt || this.clock();
+      order.readyNotificationPending = true;
       this.updateDigitalServiceLedgerStatus(order.requestId, "SUCCESSFUL", wallet.availableBalance);
       this.createNotification({
         userId: order.userId,

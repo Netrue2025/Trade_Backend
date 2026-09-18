@@ -4401,6 +4401,61 @@ test("OTP requests enforce ownership, payment, fulfillment, product configuratio
   assert.throws(() => service.respondDigitalServiceOtp(user, order.id, { code: "123456" }), (error) => error.statusCode === 403);
 });
 
+test("manual post-payment blocks are sanitized, snapshotted, and never mark payment as fulfillment", () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "5000");
+  service.updateSettings(admin, { digitalServices: { enabled: true } });
+  const product = service.createManualDigitalServiceProduct(admin, {
+    name: "Prepared Account", description: "Manual delivery", sellingPrice: "1000",
+    postPaymentExperience: [
+      { type: "heading", text: "Payment received" },
+      { type: "text", text: "Your account is being prepared." },
+      { type: "instructions", text: "Keep this page open.\nCheck My Orders." },
+      { type: "code", text: "{{orderReference}}" },
+      { type: "link", label: "Support", url: "https://example.com/support" },
+      { type: "link", label: "Unsafe", url: "javascript:alert(1)" },
+      { type: "unknown", text: "discard" },
+    ],
+  });
+  const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+  const stored = db.digitalServiceOrders.find((item) => item.id === order.id);
+
+  assert.equal(product.postPaymentExperience.length, 5);
+  assert.equal(order.postPaymentExperience.length, 5);
+  assert.equal(order.status, "payment_reserved");
+  assert.notEqual(order.fulfillmentStatus, "fulfilled");
+  assert.equal(stored.deliveryEncrypted, "");
+});
+
+test("fulfilled delivery remains authorized and order-ready acknowledgement is per order", () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    const other = { id: "user-2", role: "user", email: "other@example.com" };
+    db.users.push(other);
+    setWallet(service, user.id, "NGN", "5000");
+    service.updateSettings(admin, { digitalServices: { enabled: true } });
+    const product = service.createManualDigitalServiceProduct(admin, { name: "Manual", description: "Manual delivery", sellingPrice: "1000" });
+    const order = service.createDigitalServiceOrder(user, { product, quantity: 1 });
+    const stored = db.digitalServiceOrders.find((item) => item.id === order.id);
+    stored.paymentStatus = "paid";
+    const fulfilled = service.fulfillManualDigitalServiceOrder(admin, order.id, { deliveryItems: [{ type: "Password", value: "SecretValue" }] });
+
+    assert.equal(fulfilled.readyNotificationPending, true);
+    assert.equal(fulfilled.delivery.deliveryItems[0].value, "SecretValue");
+    assert.equal(JSON.stringify(stored).includes("SecretValue"), false);
+    assert.throws(() => service.getDigitalServiceOrder(other, order.id), /not found/);
+    const acknowledged = service.acknowledgeDigitalServiceOrderReady(user, order.id);
+    assert.equal(acknowledged.readyNotificationPending, false);
+    assert.ok(acknowledged.readyAcknowledgedAt);
+    assert.equal(service.getDigitalServiceOrder(admin, order.id).delivery.deliveryItems[0].value, "SecretValue");
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
 test("48-hour cleanup deletes only disposable history older than cutoff", () => {
   let persistCount = 0;
   const db = {
