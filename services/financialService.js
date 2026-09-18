@@ -5769,7 +5769,14 @@ class FinancialService {
     if (String(order.paymentStatus || "").toLowerCase() !== "paid") throw Object.assign(new Error("Order payment is not confirmed."), { statusCode: 400 });
     if (order.status !== "delivered" || String(order.fulfillmentStatus || "").toLowerCase() !== "fulfilled") throw Object.assign(new Error("Order must be fulfilled before requesting OTP."), { statusCode: 400 });
     if (String(otp.mode || "none").toLowerCase() !== "admin_request" || otp.enabled === false) throw Object.assign(new Error("OTP support is not enabled for this product."), { statusCode: 400 });
-    if (String(order.otpRequest?.status || "").toLowerCase() === "waiting") return this.sanitizeDigitalServiceOrder(order, { admin: false });
+    if (String(order.otpRequest?.status || "").toLowerCase() === "waiting") {
+      const waitMs = Math.max(1, Number(otp.waitSeconds || 60)) * 1000;
+      const lastRequestedAt = Date.parse(order.otpRequest.lastRequestedAt || order.otpRequest.requestedAt || "");
+      const now = Date.parse(this.clock());
+      if (Number.isFinite(lastRequestedAt) && Number.isFinite(now) && now - lastRequestedAt < waitMs) {
+        return this.sanitizeDigitalServiceOrder(order, { admin: false });
+      }
+    }
     const requestedAt = this.clock();
     order.otpSupport = otp;
     order.otpRequest = { status: "waiting", requestedAt, respondedAt: null, expiresAt: null, responseEncrypted: "", acknowledgedAt: null, requestCount: Number(order.otpRequest?.requestCount || 0) + 1, lastRequestedAt: requestedAt };

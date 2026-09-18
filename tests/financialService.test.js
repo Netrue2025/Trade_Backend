@@ -4363,6 +4363,14 @@ test("fulfilled OTP-enabled manual orders create one encrypted admin request", a
     assert.equal(service.listNotifications(admin).filter((item) => item.title === "OTP Requested").length, 1);
     assert.equal(emails.length, 1);
 
+    stored.otpRequest.lastRequestedAt = "2026-08-30T09:58:59.000Z";
+    service.clock = () => "2026-08-30T10:02:00.000Z";
+    service.requestDigitalServiceOtp(user, order.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stored.otpRequest.requestCount, 2);
+    assert.equal(service.listNotifications(admin).filter((item) => item.title === "OTP Requested").length, 2);
+    assert.equal(emails.length, 2);
+
     const response = service.respondDigitalServiceOtp(admin, order.id, { code: "482911" });
     assert.equal(response.otpRequest.code, "482911");
     assert.notEqual(stored.otpRequest.responseEncrypted, "482911");
