@@ -4382,6 +4382,74 @@ test("fulfilled OTP-enabled manual orders create one encrypted admin request", a
   }
 });
 
+test("legacy users default to Basic and successful joins consume the Lagos trading day limit", () => {
+  const { db, service, user } = createHarness();
+  const initial = service.getMembershipSummary(user);
+  assert.equal(initial.plan, "BASIC");
+  assert.equal(initial.dailyTradeLimit, 1);
+  assert.equal(initial.tradesUsedToday, 0);
+  assert.doesNotThrow(() => service.assertMembershipTradeJoinAllowed(user));
+  db.tradeInvestments.push({ id: "membership-trade-1", userId: user.id, tradeId: "trade-1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" });
+  assert.throws(() => service.assertMembershipTradeJoinAllowed(user), (error) => error.code === "PLAN_TRADE_LIMIT_REACHED" && error.membership.usedToday === 1);
+  db.tradeInvestments[0].joinedAt = "2026-08-29T22:59:59.000Z";
+  assert.doesNotThrow(() => service.assertMembershipTradeJoinAllowed(user));
+});
+
+test("active Pro bypasses only membership join limits and expired Pro resolves to Basic", () => {
+  const { db, service, user } = createHarness();
+  db.tradeInvestments.push({ id: "membership-trade-1", userId: user.id, tradeId: "trade-1", status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" });
+  user.membership = { plan: "PRO", status: "ACTIVE", startedAt: "2026-08-01T00:00:00.000Z", expiresAt: "2026-09-30T00:00:00.000Z" };
+  assert.equal(service.getMembershipSummary(user).plan, "PRO");
+  assert.doesNotThrow(() => service.assertMembershipTradeJoinAllowed(user));
+  user.membership.expiresAt = "2026-08-29T00:00:00.000Z";
+  assert.equal(service.getMembershipSummary(user).plan, "BASIC");
+  assert.throws(() => service.assertMembershipTradeJoinAllowed(user), (error) => error.code === "PLAN_TRADE_LIMIT_REACHED");
+});
+
+test("wallet Pro upgrade is authoritative idempotent and extends active membership", () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "50000");
+  service.updateSettings(admin, { membership: { pro: { price: "10000", durationDays: 30, enabled: true } } });
+  const first = service.purchaseProWithWallet(user, "upgrade-1");
+  const duplicate = service.purchaseProWithWallet(user, "upgrade-1");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "40000");
+  assert.equal(first.transaction.id, duplicate.transaction.id);
+  assert.equal(db.transactions.filter((item) => item.type === "MEMBERSHIP_UPGRADE").length, 1);
+  const firstExpiry = first.membership.expiresAt;
+  const second = service.purchaseProWithWallet(user, "upgrade-2");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "30000");
+  assert.ok(Date.parse(second.membership.expiresAt) > Date.parse(firstExpiry));
+  assert.equal(db.transactions.filter((item) => item.type === "MEMBERSHIP_UPGRADE").length, 2);
+});
+
+test("concurrent different Pro wallet purchases cannot overdraw the wallet", async () => {
+  const { admin, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "5000");
+  service.updateSettings(admin, { membership: { pro: { price: "4000", durationDays: 30, enabled: true } } });
+  const attempts = await Promise.allSettled([
+    Promise.resolve().then(() => service.purchaseProWithWallet(user, "concurrent-upgrade-a")),
+    Promise.resolve().then(() => service.purchaseProWithWallet(user, "concurrent-upgrade-b")),
+  ]);
+  assert.equal(attempts.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(attempts.filter((item) => item.status === "rejected").length, 1);
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "1000");
+  assert.equal(service.db.transactions.filter((item) => item.type === "MEMBERSHIP_UPGRADE").length, 1);
+});
+
+test("Paystack Pro verification checks amount and currency and activates only once", () => {
+  const { admin, db, service, user } = createHarness();
+  service.updateSettings(admin, { membership: { pro: { price: "4000", durationDays: 30, enabled: true } } });
+  const pending = service.createProPaystackPurchase(user, "paystack-upgrade-1");
+  const reference = pending.transaction.reference;
+  assert.throws(() => service.confirmProPaystackPurchase(reference, { status: "success", reference, currency: "NGN", amount: 399900 }), /amount does not match/);
+  assert.throws(() => service.confirmProPaystackPurchase(reference, { status: "success", reference, currency: "USD", amount: 400000 }), /currency does not match/);
+  const paid = service.confirmProPaystackPurchase(reference, { status: "success", reference, currency: "NGN", amount: 400000 });
+  const expiry = paid.membership.expiresAt;
+  const replay = service.confirmProPaystackPurchase(reference, { status: "success", reference, currency: "NGN", amount: 400000 });
+  assert.equal(replay.membership.expiresAt, expiry);
+  assert.equal(db.transactions.filter((item) => item.reference === reference).length, 1);
+});
+
 test("OTP requests enforce ownership, payment, fulfillment, product configuration, and admin response", () => {
   const { admin, db, service, user } = createHarness();
   const other = { id: "user-2", role: "user", email: "other@example.com" };

@@ -145,6 +145,8 @@ let digitalServicesService = null;
 let pushNotificationService = null;
 const loginAttemptBuckets = new Map();
 const digitalServiceOrderRequests = new Map();
+const membershipPurchaseRequests = new Map();
+const tradeJoinRequests = new Set();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
 const subscriberModel = new SubscriberModel();
@@ -3318,6 +3320,7 @@ function serializeTradeInvestment(investment) {
     stoppedAt: investment.stoppedAt || null,
     hiddenAt: investment.hiddenAt || null,
     settledPnlUsdt: investment.settledPnlUsdt || "0",
+    membershipAtJoin: investment.membershipAtJoin || "BASIC",
     fundingSources: getInvestmentFundingSources(investment),
   };
 }
@@ -4963,6 +4966,7 @@ async function handleApi(req, res, url) {
 
       let withdrawal = null;
       let digitalOrder = null;
+      let membershipUpgrade = null;
       const statusSettled = eventType.startsWith("transfer.")
         ? applyPaystackTransferStatus(reference, data, getRequestMeta(req))
         : null;
@@ -4987,20 +4991,15 @@ async function handleApi(req, res, url) {
         withdrawal = financialService.applyPaystackTransferReversed(reference, data, getRequestMeta(req));
         await editWithdrawalTelegramMessage(withdrawal, "WITHDRAWAL REVERSED", ["Funds returned to wallet."]);
       } else if (eventType === "charge.success") {
-        const paidOrder = financialService.confirmDigitalServicePaystackPayment(
-          reference,
-          data,
-          { id: "paystack", role: "system" },
-          getRequestMeta(req)
-        );
-        digitalOrder = await digitalServicesService.fulfillPaidOrder(
-          paidOrder.id,
-          { id: "paystack", role: "system" },
-          getRequestMeta(req)
-        );
+        if (String(data.metadata?.type || "") === "membership_upgrade" || String(reference).startsWith("PRO-")) {
+          membershipUpgrade = financialService.confirmProPaystackPurchase(reference, data, { id: "paystack", role: "system" }, getRequestMeta(req));
+        } else {
+          const paidOrder = financialService.confirmDigitalServicePaystackPayment(reference, data, { id: "paystack", role: "system" }, getRequestMeta(req));
+          digitalOrder = await digitalServicesService.fulfillPaidOrder(paidOrder.id, { id: "paystack", role: "system" }, getRequestMeta(req));
+        }
       }
       financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
-      sendJson(res, 200, { received: true, processed: !!(withdrawal || digitalOrder) });
+      sendJson(res, 200, { received: true, processed: !!(withdrawal || digitalOrder || membershipUpgrade) });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -5061,7 +5060,60 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
-    sendJson(res, 200, { user: user ? sanitizeUser(user) : null, exchanges: listExchanges() });
+    sendJson(res, 200, { user: user ? { ...sanitizeUser(user), membership: financialService.getMembershipSummary(user) } : null, exchanges: listExchanges() });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/membership/plans") {
+    const user = getCurrentUser(req);
+    sendJson(res, 200, { plans: financialService.getMembershipSettings(), membership: user?.role === "user" ? financialService.getMembershipSummary(user) : null });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/membership/pro/wallet") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    const lockKey = `${user.id}:wallet:${idempotencyKey}`;
+    if (membershipPurchaseRequests.has(lockKey)) { sendJson(res, 200, await membershipPurchaseRequests.get(lockKey)); return true; }
+    try {
+      const purchase = Promise.resolve().then(() => financialService.purchaseProWithWallet(user, idempotencyKey, getRequestMeta(req)));
+      membershipPurchaseRequests.set(lockKey, purchase);
+      const result = await purchase.finally(() => membershipPurchaseRequests.delete(lockKey));
+      sendJson(res, 200, { ...result, user: { ...sanitizeUser(user), membership: result.membership } });
+    } catch (error) { sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" }); }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/membership/pro/paystack/initialize") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+    const lockKey = `${user.id}:paystack:${idempotencyKey}`;
+    if (membershipPurchaseRequests.has(lockKey)) { sendJson(res, 200, await membershipPurchaseRequests.get(lockKey)); return true; }
+    try {
+      const purchase = (async () => {
+        const pending = financialService.createProPaystackPurchase(user, idempotencyKey, getRequestMeta(req));
+        const payment = await paystackService.initializeTransaction({ email: user.email, amountKobo: toKobo(pending.plan.price), reference: pending.transaction.reference, callbackUrl: `${getFrontendUrl()}/?tab=plans&membership_reference=${encodeURIComponent(pending.transaction.reference)}`, metadata: { type: "membership_upgrade", userId: user.id, plan: "PRO", transactionId: pending.transaction.id } });
+        return { transaction: pending.transaction, payment: { reference: pending.transaction.reference, authorizationUrl: payment.authorization_url || "", accessCode: payment.access_code || "" } };
+      })();
+      membershipPurchaseRequests.set(lockKey, purchase);
+      sendJson(res, 200, await purchase.finally(() => membershipPurchaseRequests.delete(lockKey)));
+    } catch (error) { sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" }); }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/membership/pro/paystack/verify") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      const reference = String((await readBody(req)).reference || "").trim();
+      const transaction = db.transactions.find((item) => item.type === "MEMBERSHIP_UPGRADE" && item.reference === reference);
+      if (!transaction || transaction.userId !== user.id) { sendJson(res, 403, { error: "This payment reference does not belong to your account." }); return true; }
+      const verification = await paystackService.verifyTransaction(reference);
+      const result = financialService.confirmProPaystackPurchase(reference, verification.data || verification, user, getRequestMeta(req));
+      sendJson(res, 200, { ...result, user: { ...sanitizeUser(user), membership: result.membership } });
+    } catch (error) { sendJson(res, error.statusCode || 400, { error: error.message }); }
     return true;
   }
 
@@ -8123,6 +8175,7 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    let joinedUserLockId = "";
     try {
       const userId = decodeURIComponent(adminUserJoinTradeMatch[1] || "").trim();
       const tradeId = decodeURIComponent(adminUserJoinTradeMatch[2] || "").trim();
@@ -8131,6 +8184,12 @@ async function handleApi(req, res, url) {
         sendJson(res, 404, { error: "User not found." });
         return true;
       }
+      if (tradeJoinRequests.has(targetUser.id)) {
+        sendJson(res, 409, { error: "A trade join is already being processed for this user.", code: "TRADE_JOIN_IN_PROGRESS" });
+        return true;
+      }
+      tradeJoinRequests.add(targetUser.id);
+      joinedUserLockId = targetUser.id;
       const trade = db.tradeIntents.find((item) => item.id === tradeId);
       if (!trade) {
         sendJson(res, 404, { error: "Trade not found." });
@@ -8152,6 +8211,7 @@ async function handleApi(req, res, url) {
       } catch (error) {
         throw new Error(error.message.replace("your free balance", "this user's free balance"));
       }
+      const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(targetUser);
 
       const investmentId = randomId(12);
       const fundingSources = reserveTradeInvestmentFunds(targetUser, amountUsdt, investmentId, admin.id);
@@ -8171,6 +8231,7 @@ async function handleApi(req, res, url) {
         stoppedAt: null,
         settledPnlUsdt: "0",
         joinedBy: admin.id,
+        membershipAtJoin: membershipAtJoin.plan,
       };
       ensureTradeInvestmentsState().unshift(investment);
       financialService.createNotification({
@@ -8192,7 +8253,9 @@ async function handleApi(req, res, url) {
         user: await buildManagedUserSummary(targetUser, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
       });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "", ...(error.membership || {}) });
+    } finally {
+      if (joinedUserLockId) tradeJoinRequests.delete(joinedUserLockId);
     }
     return true;
   }
@@ -8474,6 +8537,11 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
+    if (tradeJoinRequests.has(user.id)) {
+      sendJson(res, 409, { error: "A trade join is already being processed.", code: "TRADE_JOIN_IN_PROGRESS" });
+      return true;
+    }
+    tradeJoinRequests.add(user.id);
     try {
       const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(joinTradeMatch[1] || ""));
       if (!trade) {
@@ -8493,6 +8561,7 @@ async function handleApi(req, res, url) {
 
       const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
       validateTradeJoinAmount(amountUsdt, freeUsdt);
+      const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(user);
 
       const investmentId = randomId(12);
       const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
@@ -8511,6 +8580,7 @@ async function handleApi(req, res, url) {
         joinedAt: nowIso(),
         stoppedAt: null,
         settledPnlUsdt: "0",
+        membershipAtJoin: membershipAtJoin.plan,
       };
       ensureTradeInvestmentsState().unshift(investment);
       financialService.createNotification({
@@ -8526,9 +8596,11 @@ async function handleApi(req, res, url) {
       financialService.notifyAdminTradeJoined(user, investment, trade);
       financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
       persist();
-      sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
+      sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id), membership: financialService.getMembershipSummary(user) });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "", ...(error.membership || {}) });
+    } finally {
+      tradeJoinRequests.delete(user.id);
     }
     return true;
   }

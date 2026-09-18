@@ -39,6 +39,8 @@ const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND
 const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "0";
 const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
 const DISPOSABLE_HISTORY_RETENTION_MS = 48 * 60 * 60 * 1000;
+const MEMBERSHIP_TIME_ZONE = "Africa/Lagos";
+const DEFAULT_BASIC_TRADE_LIMIT = 1;
 
 function nowIso() {
   return new Date().toISOString();
@@ -354,6 +356,20 @@ function defaultSettings() {
       updatedAt: nowIso(),
       updatedBy: "system",
     },
+    membership: {
+      basic: { name: "Basic", dailyTradeLimit: DEFAULT_BASIC_TRADE_LIMIT, targetLabel: "Trade target up to 1.5%" },
+      pro: {
+        name: "Pro",
+        price: getEnvValue("PRO_MEMBERSHIP_PRICE_NGN") || "10000",
+        currency: "NGN",
+        durationDays: 30,
+        enabled: true,
+        benefits: ["Unlimited eligible trade joins", "Participate in multiple available trades", "Premium PRO badge", "All Basic features"],
+      },
+      timeZone: MEMBERSHIP_TIME_ZONE,
+      updatedAt: nowIso(),
+      updatedBy: "system",
+    },
   };
 }
 
@@ -437,6 +453,10 @@ class FinancialService {
         ...defaultSettings().referral,
         ...(this.db.systemSettings?.referral || {}),
       },
+      membership: {
+        ...defaultSettings().membership,
+        ...(this.db.systemSettings?.membership || {}),
+      },
     };
     if (compare(this.db.systemSettings.withdrawal.minUsdt || "0", MIN_WITHDRAWAL_AMOUNTS.USDT) < 0) {
       this.db.systemSettings.withdrawal.minUsdt = MIN_WITHDRAWAL_AMOUNTS.USDT;
@@ -446,6 +466,7 @@ class FinancialService {
     }
     this.db.systemSettings.referral = this.normalizeReferralSettings(this.db.systemSettings.referral);
     this.db.systemSettings.digitalServices = this.normalizeDigitalServiceSettings(this.db.systemSettings.digitalServices);
+    this.db.systemSettings.membership = this.normalizeMembershipSettings(this.db.systemSettings.membership);
 
     for (const user of this.db.users || []) {
       if (user.role === "user") {
@@ -490,6 +511,178 @@ class FinancialService {
     settings.vtu = this.sanitizeVtuSettings(settings.vtu);
     settings.digitalServices = this.sanitizeDigitalServiceSettings(settings.digitalServices, { admin: true });
     return settings;
+  }
+
+  normalizeMembershipSettings(settings = {}) {
+    const defaults = defaultSettings().membership;
+    const basic = { ...defaults.basic, ...(settings.basic || {}) };
+    const pro = { ...defaults.pro, ...(settings.pro || {}) };
+    return {
+      basic: {
+        name: String(basic.name || "Basic").trim().slice(0, 40) || "Basic",
+        dailyTradeLimit: Math.max(1, normalizeWholeNumber(basic.dailyTradeLimit, DEFAULT_BASIC_TRADE_LIMIT, "Basic daily trade limit")),
+        targetLabel: String(basic.targetLabel || defaults.basic.targetLabel).trim().slice(0, 100),
+      },
+      pro: {
+        name: String(pro.name || "Pro").trim().slice(0, 40) || "Pro",
+        price: normalizeAmount(pro.price || defaults.pro.price, "Pro price"),
+        currency: "NGN",
+        durationDays: Math.max(1, normalizeWholeNumber(pro.durationDays, defaults.pro.durationDays, "Pro duration")),
+        enabled: pro.enabled !== false && pro.enabled !== "false",
+        benefits: (Array.isArray(pro.benefits) ? pro.benefits : defaults.pro.benefits)
+          .map((item) => String(item || "").trim().slice(0, 120)).filter(Boolean).slice(0, 12),
+      },
+      timeZone: MEMBERSHIP_TIME_ZONE,
+      updatedAt: settings.updatedAt || this.clock(),
+      updatedBy: String(settings.updatedBy || "system"),
+    };
+  }
+
+  getMembershipSettings({ admin = false } = {}) {
+    this.ensureState();
+    const settings = clone(this.db.systemSettings.membership);
+    if (!admin) {
+      delete settings.updatedBy;
+      delete settings.updatedAt;
+    }
+    return settings;
+  }
+
+  getMembershipTradingDay(isoValue = this.clock()) {
+    const date = new Date(isoValue);
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: MEMBERSHIP_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(date).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  }
+
+  getMembershipSummary(user, at = this.clock()) {
+    this.ensureState();
+    const raw = user?.membership || {};
+    const expiresAtMs = Date.parse(raw.expiresAt || "");
+    const activePro = String(raw.plan || "").toUpperCase() === "PRO"
+      && String(raw.status || "ACTIVE").toUpperCase() === "ACTIVE"
+      && Number.isFinite(expiresAtMs) && expiresAtMs > Date.parse(at);
+    const day = this.getMembershipTradingDay(at);
+    const usedToday = (this.db.tradeInvestments || []).filter((item) => item.userId === user?.id
+      && item.joinedAt && this.getMembershipTradingDay(item.joinedAt) === day).length;
+    const settings = this.db.systemSettings.membership;
+    return {
+      plan: activePro ? "PRO" : "BASIC",
+      status: activePro ? "ACTIVE" : (raw.plan === "PRO" && raw.expiresAt ? "EXPIRED" : "ACTIVE"),
+      active: activePro,
+      startedAt: raw.startedAt || null,
+      expiresAt: raw.expiresAt || null,
+      purchaseReference: raw.purchaseReference || "",
+      dailyTradeLimit: activePro ? null : settings.basic.dailyTradeLimit,
+      tradesUsedToday: usedToday,
+      tradingDay: day,
+      timeZone: MEMBERSHIP_TIME_ZONE,
+    };
+  }
+
+  assertMembershipTradeJoinAllowed(user) {
+    const membership = this.getMembershipSummary(user);
+    if (membership.plan === "PRO") return membership;
+    if (membership.tradesUsedToday >= membership.dailyTradeLimit) {
+      const error = new Error("Your Basic plan daily trade join limit has been reached.");
+      error.statusCode = 403;
+      error.code = "PLAN_TRADE_LIMIT_REACHED";
+      error.membership = { plan: "BASIC", dailyLimit: membership.dailyTradeLimit, usedToday: membership.tradesUsedToday };
+      throw error;
+    }
+    return membership;
+  }
+
+  activateProMembership(user, transaction, purchasedAt = this.clock()) {
+    if (transaction.metadata?.membershipActivatedAt) return this.getMembershipSummary(user);
+    const settings = this.db.systemSettings.membership.pro;
+    const currentExpiry = Date.parse(user.membership?.expiresAt || "");
+    const purchasedAtMs = Date.parse(purchasedAt);
+    const extendActive = String(user.membership?.status || "").toUpperCase() === "ACTIVE"
+      && Number.isFinite(currentExpiry) && currentExpiry > purchasedAtMs;
+    const startsFrom = extendActive ? currentExpiry : purchasedAtMs;
+    const expiresAt = new Date(startsFrom + settings.durationDays * 86400000).toISOString();
+    user.membership = {
+      plan: "PRO", status: "ACTIVE", startedAt: extendActive ? (user.membership?.startedAt || purchasedAt) : purchasedAt,
+      expiresAt, purchaseReference: transaction.reference,
+    };
+    transaction.metadata = { ...(transaction.metadata || {}), membershipActivatedAt: purchasedAt, expiresAt };
+    return this.getMembershipSummary(user, purchasedAt);
+  }
+
+  purchaseProWithWallet(user, idempotencyKey, requestMeta = {}) {
+    this.ensureState();
+    const cached = this.findIdempotent("membership:wallet", user.id, idempotencyKey);
+    if (cached) return cached;
+    if (!idempotencyKey) throw Object.assign(new Error("Idempotency key is required."), { statusCode: 400 });
+    const plan = this.db.systemSettings.membership.pro;
+    if (!plan.enabled) throw Object.assign(new Error("Pro membership is currently unavailable."), { statusCode: 400 });
+    const wallet = this.ensureWallet(user.id, "NGN");
+    if (compare(wallet.availableBalance, plan.price) < 0) throw Object.assign(new Error("Insufficient wallet balance."), { statusCode: 400, code: "INSUFFICIENT_BALANCE" });
+    const balanceBefore = wallet.availableBalance;
+    wallet.availableBalance = subtract(wallet.availableBalance, plan.price);
+    wallet.updatedAt = this.clock();
+    const transaction = {
+      id: this.idGenerator(12), userId: user.id, type: "MEMBERSHIP_UPGRADE", currency: "NGN",
+      amount: `-${plan.price}`, balanceBefore, balanceAfter: wallet.availableBalance,
+      reference: `PRO-${this.idGenerator(10)}`, status: "SUCCESSFUL", description: "Pro Plan Upgrade",
+      createdBy: user.id, createdAt: this.clock(), metadata: { paymentMethod: "wallet", plan: "PRO", durationDays: plan.durationDays },
+    };
+    this.db.transactions.unshift(transaction);
+    const membership = this.activateProMembership(user, transaction, transaction.createdAt);
+    this.notifyMembershipUpgrade(user, transaction);
+    this.audit(user, "PRO_MEMBERSHIP_PURCHASED", "User", user.id, { reference: transaction.reference, paymentMethod: "wallet" }, requestMeta);
+    const response = { membership, transaction: clone(transaction) };
+    this.saveIdempotent("membership:wallet", user.id, idempotencyKey, response);
+    this.persist();
+    return response;
+  }
+
+  createProPaystackPurchase(user, idempotencyKey, requestMeta = {}) {
+    this.ensureState();
+    const cached = this.findIdempotent("membership:paystack:init", user.id, idempotencyKey);
+    if (cached) return cached;
+    if (!idempotencyKey) throw Object.assign(new Error("Idempotency key is required."), { statusCode: 400 });
+    const plan = this.db.systemSettings.membership.pro;
+    if (!plan.enabled) throw Object.assign(new Error("Pro membership is currently unavailable."), { statusCode: 400 });
+    const transaction = {
+      id: this.idGenerator(12), userId: user.id, type: "MEMBERSHIP_UPGRADE", currency: "NGN",
+      amount: `-${plan.price}`, reference: `PRO-${this.idGenerator(10)}`, status: "PENDING",
+      description: "Pro Plan Upgrade", createdBy: user.id, createdAt: this.clock(),
+      metadata: { paymentMethod: "paystack", plan: "PRO", durationDays: plan.durationDays, expectedAmount: plan.price },
+    };
+    this.db.transactions.unshift(transaction);
+    const response = { transaction: clone(transaction), plan: this.getMembershipSettings().pro };
+    this.saveIdempotent("membership:paystack:init", user.id, idempotencyKey, response);
+    this.audit(user, "PRO_MEMBERSHIP_PAYMENT_CREATED", "Transaction", transaction.id, { reference: transaction.reference }, requestMeta);
+    this.persist();
+    return response;
+  }
+
+  confirmProPaystackPurchase(reference, payment = {}, actor = { id: "paystack", role: "system" }, requestMeta = {}) {
+    this.ensureState();
+    const transaction = this.db.transactions.find((item) => item.type === "MEMBERSHIP_UPGRADE" && item.reference === reference);
+    if (!transaction || transaction.metadata?.paymentMethod !== "paystack") throw Object.assign(new Error("Membership payment not found."), { statusCode: 404 });
+    const user = this.db.users.find((item) => item.id === transaction.userId);
+    if (!user) throw Object.assign(new Error("Membership user not found."), { statusCode: 404 });
+    if (transaction.status === "SUCCESSFUL") return { membership: this.getMembershipSummary(user), transaction: clone(transaction), userId: user.id };
+    if (String(payment.status || "").toLowerCase() !== "success") throw new Error("Paystack payment was not successful.");
+    if (String(payment.reference || reference) !== reference) throw new Error("Paystack payment reference does not match.");
+    if (String(payment.currency || "NGN").toUpperCase() !== "NGN") throw new Error("Paystack payment currency does not match.");
+    if (Number(payment.amount) !== toKobo(transaction.metadata.expectedAmount)) throw new Error("Paystack payment amount does not match.");
+    transaction.status = "SUCCESSFUL";
+    transaction.updatedAt = this.clock();
+    const membership = this.activateProMembership(user, transaction, transaction.updatedAt);
+    this.notifyMembershipUpgrade(user, transaction);
+    this.audit(actor, "PRO_MEMBERSHIP_PAYMENT_CONFIRMED", "Transaction", transaction.id, { reference }, requestMeta);
+    this.persist();
+    return { membership, transaction: clone(transaction), userId: user.id };
+  }
+
+  notifyMembershipUpgrade(user, transaction) {
+    this.createNotification({ userId: user.id, type: "MEMBERSHIP", title: "Welcome to NetrueFi Pro", message: "Your Pro plan is active.", entityType: "User", entityId: user.id, route: "/?tab=plans", dedupeKey: `membership:pro:${transaction.reference}` });
+    this.notifyAdmins({ type: "MEMBERSHIP", category: "adminEvents", title: "New Pro Upgrade", message: `${user.name || user.email} upgraded to Pro.`, entityType: "User", entityId: user.id, route: "/?tab=users", dedupeKey: `admin:membership:pro:${transaction.reference}`, metadata: { amount: transaction.metadata?.expectedAmount || String(transaction.amount || "").replace("-", ""), paymentMethod: transaction.metadata?.paymentMethod } });
   }
 
   normalizeDigitalServiceSettings(settings = {}) {
@@ -1370,6 +1563,12 @@ class FinancialService {
         ...before.digitalServices,
         ...(patch.digitalServices || {}),
       },
+      membership: {
+        ...before.membership,
+        ...(patch.membership || {}),
+        basic: { ...before.membership.basic, ...(patch.membership?.basic || {}) },
+        pro: { ...before.membership.pro, ...(patch.membership?.pro || {}) },
+      },
     };
 
     if (patch.exchangeRate?.usdtToNgn !== undefined) {
@@ -1402,6 +1601,11 @@ class FinancialService {
       ...next.digitalServices,
       updatedBy: patch.digitalServices ? admin.id : next.digitalServices.updatedBy,
       updatedAt: patch.digitalServices ? this.clock() : next.digitalServices.updatedAt,
+    });
+    next.membership = this.normalizeMembershipSettings({
+      ...next.membership,
+      updatedBy: patch.membership ? admin.id : next.membership.updatedBy,
+      updatedAt: patch.membership ? this.clock() : next.membership.updatedAt,
     });
     next.withdrawal.maxDailyCount = 0;
     next.withdrawal.maxDailyNgn = normalizeAmount(next.withdrawal.maxDailyNgn || "10000000", "Daily withdrawal limit");
@@ -1875,6 +2079,7 @@ class FinancialService {
         id: user.id,
         name: user.name,
         email: user.email,
+        membership: this.getMembershipSummary(user),
       },
       wallets: this.getWallets(user.id),
       recentTransactions: this.getTransactions(user.id, { limit: 12 }),
@@ -4685,6 +4890,7 @@ class FinancialService {
         referral: clone(this.db.systemSettings.referral),
         vtu: this.sanitizeVtuSettings(this.db.systemSettings.vtu),
         digitalServices: this.sanitizeDigitalServiceSettings(this.db.systemSettings.digitalServices, { admin: true }),
+        membership: this.getMembershipSettings({ admin: true }),
       },
       referral: this.getAdminReferralSummary({ limit: 5 }),
       vtu: this.getVtuAdminSummary(),
