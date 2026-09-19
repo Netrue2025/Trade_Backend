@@ -3401,6 +3401,55 @@ test("Paystack digital service payment verifies amount and fulfills once", async
   }
 });
 
+test("verified Paystack order is persisted as paid before supplier fulfillment", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, service, user } = createHarness();
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "paystack-persist-first",
+      supplierProductId: "paystack-persist-first",
+      provider: "akunding",
+      name: "Persist First",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 1,
+      available: true,
+    }]);
+    const sequence = [];
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      persistPaidOrder: async () => {
+        const current = service.getDigitalServiceOrderByPaymentReference(pending.paymentReference);
+        assert.equal(current.paymentStatus, "paid");
+        sequence.push("persisted-paid");
+      },
+      akundingService: {
+        isConfigured: () => true,
+        listOrders: async () => [],
+        createOrder: async () => {
+          sequence.push("supplier");
+          return { data: { id: "AK-persist-first", status: "delivered", activation_link: "https://example.com/ready" } };
+        },
+      },
+    });
+    const pending = await digitalServices.purchase(user, { productId: "paystack-persist-first", paymentMethod: "paystack" });
+    const delivered = await digitalServices.completeVerifiedPaystackOrder(pending.paymentReference, {
+      status: "success",
+      reference: pending.paymentReference,
+      currency: "NGN",
+      amount: toKobo("4000"),
+    }, user);
+    assert.equal(delivered.fulfillmentStatus, "fulfilled");
+    assert.deepEqual(sequence, ["persisted-paid", "supplier"]);
+  } finally {
+    if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
+    else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+  }
+});
+
 test("Paystack paid order can retry retryable supplier failure without another payment", async () => {
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");

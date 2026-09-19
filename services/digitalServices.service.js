@@ -829,11 +829,12 @@ function mergeSupplierPayloads(payloads = []) {
 }
 
 class DigitalServicesService {
-  constructor({ financialService, akundingService, emmaService = null, efemService = null, clock = () => new Date().toISOString() } = {}) {
+  constructor({ financialService, akundingService, emmaService = null, efemService = null, persistPaidOrder = null, clock = () => new Date().toISOString() } = {}) {
     this.financialService = financialService;
     this.akundingService = akundingService;
     this.emmaService = emmaService;
     this.efemService = efemService;
+    this.persistPaidOrder = persistPaidOrder;
     this.clock = clock;
     this.fulfillmentRequests = new Map();
   }
@@ -1216,6 +1217,14 @@ class DigitalServicesService {
     const fulfilled = await this.fulfillPaidOrder(order.id, user, requestMeta);
     this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order: fulfilled });
     return fulfilled;
+  }
+
+  async completeVerifiedPaystackOrder(reference, payment, actor, requestMeta = {}) {
+    const paidOrder = this.financialService.confirmDigitalServicePaystackPayment(reference, payment, actor, requestMeta);
+    if (typeof this.persistPaidOrder === "function") {
+      await this.persistPaidOrder();
+    }
+    return this.fulfillPaidOrder(paidOrder.id, actor, requestMeta);
   }
 
   async fulfillPaidOrder(orderId, actor, requestMeta = {}) {

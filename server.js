@@ -4994,8 +4994,12 @@ async function handleApi(req, res, url) {
         if (String(data.metadata?.type || "") === "membership_upgrade" || String(reference).startsWith("PRO-")) {
           membershipUpgrade = financialService.confirmProPaystackPurchase(reference, data, { id: "paystack", role: "system" }, getRequestMeta(req));
         } else {
-          const paidOrder = financialService.confirmDigitalServicePaystackPayment(reference, data, { id: "paystack", role: "system" }, getRequestMeta(req));
-          digitalOrder = await digitalServicesService.fulfillPaidOrder(paidOrder.id, { id: "paystack", role: "system" }, getRequestMeta(req));
+          digitalOrder = await digitalServicesService.completeVerifiedPaystackOrder(
+            reference,
+            data,
+            { id: "paystack", role: "system" },
+            getRequestMeta(req)
+          );
         }
       }
       financialService.markPaystackWebhookEventProcessed(webhookEvent.event.id);
@@ -5904,8 +5908,7 @@ async function handleApi(req, res, url) {
       }
       const verification = await paystackService.verifyTransaction(reference);
       const payment = verification.data || verification;
-      const paidOrder = financialService.confirmDigitalServicePaystackPayment(reference, payment, user, getRequestMeta(req));
-      const order = await digitalServicesService.fulfillPaidOrder(paidOrder.id, user, getRequestMeta(req));
+      const order = await digitalServicesService.completeVerifiedPaystackOrder(reference, payment, user, getRequestMeta(req));
       sendJson(res, 200, { order });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message });
@@ -9089,7 +9092,13 @@ async function startServer() {
   akundingService = new AkundingService({ logger: console });
   emmaResellerService = new EmmaResellerService({ logger: console });
   efemResellerService = new EfemResellerService({ logger: console });
-  digitalServicesService = new DigitalServicesService({ financialService, akundingService, emmaService: emmaResellerService, efemService: efemResellerService });
+  digitalServicesService = new DigitalServicesService({
+    financialService,
+    akundingService,
+    emmaService: emmaResellerService,
+    efemService: efemResellerService,
+    persistPaidOrder: () => saveDb(db),
+  });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

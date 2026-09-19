@@ -129,6 +129,8 @@ test("quest reward reveal and wallet redemption credit once", () => {
   assert.equal(redeemed.reward.status, "USED");
   assert.equal(financialService.ensureWallet(user.id, "NGN").availableBalance, "1200");
   assert.equal(questService.redeemReward(user, started.session.id).transaction.id, redeemed.transaction.id);
+  assert.equal(db.quests[0].stats.redeemed, 1);
+  assert.equal(db.transactions.filter((item) => item.reference === redeemed.reward.id).length, 1);
 });
 
 test("admin can create, disable, duplicate, and delete quests", () => {

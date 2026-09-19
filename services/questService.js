@@ -530,6 +530,8 @@ class QuestService {
     this.ensureState();
     const session = this.requireUserSession(user, sessionId);
     const reward = this.requireSessionReward(user, session);
+    const alreadyRedeemed = String(session.status || "").toUpperCase() === "REDEEMED"
+      || String(reward.status || "").toUpperCase() === "USED";
     if (String(reward.status || "").toUpperCase() === "ASSIGNED") {
       reward.status = "REVEALED";
       reward.revealedAt = this.clock();
@@ -543,6 +545,13 @@ class QuestService {
         idempotencyKey: requestMeta.idempotencyKey || `quest-reward:${session.id}:${reward.id}`,
       }
     );
+    if (alreadyRedeemed) {
+      return {
+        ...result,
+        session: this.sanitizeSession(session),
+        reward: this.sanitizeReward(reward, { revealSecret: true }),
+      };
+    }
     session.status = "REDEEMED";
     session.rewardRedeemedAt = this.clock();
     const quest = this.db.quests.find((item) => item.id === session.questId) || session.questSnapshot || {};
