@@ -74,10 +74,10 @@ test("user answers quest stages and receives an assigned reward", () => {
 
   const wrong = questService.answerStage(user, started.session.id, { answer: "Password and login" });
   assert.equal(wrong.correct, false);
-  assert.equal(wrong.session.currentStageIndex, 0);
+  assert.equal(wrong.session.currentStageIndex, 1);
 
   let sessionId = started.session.id;
-  for (const stage of started.quest.stages) {
+  for (const stage of started.quest.stages.slice(1)) {
     const sourceStage = db.quests[0].stages.find((item) => item.id === stage.id);
     const answer = questService.answerStage(user, sessionId, { answer: sourceStage.correctAnswer });
     assert.equal(answer.correct, true);
@@ -85,6 +85,7 @@ test("user answers quest stages and receives an assigned reward", () => {
 
   const completed = questService.completeQuest(user, sessionId);
   assert.equal(completed.session.status, "REWARD_ASSIGNED");
+  assert.equal(completed.scorePercent, 67);
   assert.equal(completed.reward.status, "ASSIGNED");
   assert.equal(db.giftCards[0].assignedTo, user.id);
 });
@@ -131,6 +132,58 @@ test("quest reward reveal and wallet redemption credit once", () => {
   assert.equal(questService.redeemReward(user, started.session.id).transaction.id, redeemed.transaction.id);
   assert.equal(db.quests[0].stats.redeemed, 1);
   assert.equal(db.transactions.filter((item) => item.reference === redeemed.reward.id).length, 1);
+});
+
+test("quest scores every question once and failed users wait 12 hours without a reward", () => {
+  const harness = createHarness();
+  const { questService, user, db } = harness;
+  createQuestReward(harness, "2500");
+
+  const started = questService.startQuest(user, questService.getUserStatus(user).activeQuest.id);
+  for (const stage of db.quests[0].stages) {
+    questService.answerStage(user, started.session.id, { answer: `wrong-${stage.id}` });
+  }
+  const completed = questService.completeQuest(user, started.session.id);
+
+  assert.equal(completed.passed, false);
+  assert.equal(completed.scorePercent, 0);
+  assert.equal(completed.session.status, "FAILED");
+  assert.equal(completed.reward, null);
+  assert.equal(db.giftCards[0].status, "UNUSED");
+  assert.equal(questService.getUserStatus(user).cooldownRemainingMs, QUEST_COOLDOWN_MS);
+});
+
+test("quest timeout records zero and advances automatically", () => {
+  const harness = createHarness();
+  const { questService, user } = harness;
+  createQuestReward(harness);
+  const started = questService.startQuest(user, questService.getUserStatus(user).activeQuest.id);
+
+  harness.tick(30000);
+  const answer = questService.answerStage(user, started.session.id, { timedOut: true });
+
+  assert.equal(answer.correct, false);
+  assert.equal(answer.timedOut, true);
+  assert.equal(answer.session.currentStageIndex, 1);
+  assert.equal(answer.session.correctAnswers, 0);
+});
+
+test("admin question timers are normalized and exposed without answers", () => {
+  const { admin, questService } = createHarness();
+  const quest = questService.createQuest(admin, {
+    title: "Timed Quest",
+    category: "AI",
+    stages: [{
+      type: "multiple-choice",
+      prompt: "Pick one",
+      options: ["One", "Two"],
+      correctAnswer: "One",
+      timeLimitSeconds: 45,
+    }],
+  });
+
+  assert.equal(quest.stages[0].timeLimitSeconds, 45);
+  assert.equal(questService.sanitizeQuest(quest).stages[0].correctAnswer, undefined);
 });
 
 test("admin can create, disable, duplicate, and delete quests", () => {

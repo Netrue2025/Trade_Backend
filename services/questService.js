@@ -3,6 +3,10 @@ const crypto = require("node:crypto");
 const { randomId } = require("../lib/security");
 
 const QUEST_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_STAGE_TIME_LIMIT_SECONDS = 30;
+const MIN_STAGE_TIME_LIMIT_SECONDS = 5;
+const MAX_STAGE_TIME_LIMIT_SECONDS = 600;
+const QUEST_PASS_PERCENT = 50;
 const QUEST_CATEGORIES = ["technology", "AI", "IoT", "agriculture", "animals", "plants", "crypto"];
 const ACTIVE_SESSION_STATUSES = ["STARTED", "IN_PROGRESS", "COMPLETED", "REWARD_ASSIGNED", "REVEALED"];
 const AVAILABLE_REWARD_STATUSES = ["UNUSED"];
@@ -58,6 +62,12 @@ function parseDateMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+function normalizeStageTimeLimit(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return DEFAULT_STAGE_TIME_LIMIT_SECONDS;
+  return Math.min(MAX_STAGE_TIME_LIMIT_SECONDS, Math.max(MIN_STAGE_TIME_LIMIT_SECONDS, Math.round(seconds)));
+}
+
 function createDefaultQuest(clock, idGenerator) {
   const now = clock();
   return {
@@ -89,6 +99,7 @@ function createDefaultQuest(clock, idGenerator) {
         options: ["Profit and loss", "Password and login", "Payment limit", "Pending ledger"],
         correctAnswer: "Profit and loss",
         explanation: "P&L tracks how a position is moving after entry.",
+        timeLimitSeconds: DEFAULT_STAGE_TIME_LIMIT_SECONDS,
       },
       {
         id: idGenerator(12),
@@ -97,6 +108,7 @@ function createDefaultQuest(clock, idGenerator) {
         options: ["True", "False"],
         correctAnswer: "True",
         explanation: "Markets move both ways, so risk control matters.",
+        timeLimitSeconds: DEFAULT_STAGE_TIME_LIMIT_SECONDS,
       },
       {
         id: idGenerator(12),
@@ -105,6 +117,7 @@ function createDefaultQuest(clock, idGenerator) {
         options: ["Available balance", "Pending withdrawal", "Hidden balance", "Used gift card"],
         correctAnswer: "Available balance",
         explanation: "Only available balance can be locked into a new trade.",
+        timeLimitSeconds: DEFAULT_STAGE_TIME_LIMIT_SECONDS,
       },
     ],
   };
@@ -140,6 +153,7 @@ class QuestService {
         pairs: stage.pairs || [],
         orderItems: stage.orderItems || [],
         hint: stage.hint || "",
+        timeLimitSeconds: normalizeStageTimeLimit(stage.timeLimitSeconds),
         index,
       };
       if (includeAnswers) {
@@ -206,6 +220,7 @@ class QuestService {
           correctAnswer,
           explanation: normalizeText(stage.explanation),
           hint: normalizeText(stage.hint),
+          timeLimitSeconds: normalizeStageTimeLimit(stage.timeLimitSeconds),
         };
       }),
     };
@@ -328,13 +343,28 @@ class QuestService {
   sanitizeSession(session, quest = null) {
     const sourceQuest = quest || this.db.quests.find((item) => item.id === session.questId) || session.questSnapshot || null;
     const currentStage = sourceQuest?.stages?.[session.currentStageIndex || 0] || null;
+    const totalStages = sourceQuest?.stages?.length || 0;
+    const answeredCount = Array.isArray(session.answers) ? session.answers.length : 0;
+    const correctAnswers = Number.isFinite(Number(session.correctAnswers))
+      ? Number(session.correctAnswers)
+      : (session.answers || []).filter((answer) => answer.correct !== false).length;
+    const stageStartedAt = session.stageStartedAt || session.startedAt;
+    const stageDeadlineAt = currentStage && stageStartedAt
+      ? new Date(Date.parse(stageStartedAt) + normalizeStageTimeLimit(currentStage.timeLimitSeconds) * 1000).toISOString()
+      : null;
     return {
       id: session.id,
       questId: session.questId,
       status: session.status,
       currentStageIndex: session.currentStageIndex || 0,
-      totalStages: sourceQuest?.stages?.length || 0,
+      totalStages,
+      answeredCount,
+      correctAnswers,
+      scorePercent: totalStages ? Math.round((correctAnswers / totalStages) * 100) : 0,
+      passed: session.passed ?? null,
       startedAt: session.startedAt,
+      stageStartedAt,
+      stageDeadlineAt,
       completedAt: session.completedAt || null,
       rewardId: session.rewardId || "",
       currentStage: currentStage ? this.sanitizeQuest({ stages: [currentStage] }).stages[0] : null,
@@ -386,8 +416,12 @@ class QuestService {
       status: "IN_PROGRESS",
       currentStageIndex: 0,
       answers: [],
+      correctAnswers: 0,
+      scorePercent: 0,
+      passed: null,
       rewardId: "",
       startedAt: this.clock(),
+      stageStartedAt: this.clock(),
       completedAt: null,
       rewardAssignedAt: null,
       rewardRedeemedAt: null,
@@ -415,29 +449,39 @@ class QuestService {
     if (!stage) {
       throw new Error("Quest stage not found.");
     }
-    const answer = input.answer;
-    if (!answersMatch(stage.correctAnswer, answer)) {
-      this.financialService?.audit?.(user, "QUEST_STAGE_FAILED", "QuestSession", session.id, { stageId: stage.id }, requestMeta);
-      return {
-        correct: false,
-        message: "Try again.",
-        session: this.sanitizeSession(session, quest),
-      };
-    }
+    const now = this.clock();
+    const deadlineMs = Date.parse(session.stageStartedAt || session.startedAt) + normalizeStageTimeLimit(stage.timeLimitSeconds) * 1000;
+    const timedOut = input.timedOut === true || Date.parse(now) >= deadlineMs;
+    const answer = timedOut ? null : input.answer;
+    const correct = !timedOut && answersMatch(stage.correctAnswer, answer);
     session.answers.push({
       stageId: stage.id,
       answer,
-      answeredAt: this.clock(),
+      correct,
+      timedOut,
+      answeredAt: now,
     });
+    if (correct) {
+      session.correctAnswers = Number(session.correctAnswers || 0) + 1;
+    } else {
+      this.financialService?.audit?.(user, "QUEST_STAGE_FAILED", "QuestSession", session.id, { stageId: stage.id, timedOut }, requestMeta);
+    }
     session.currentStageIndex = index + 1;
     const completed = session.currentStageIndex >= (quest.stages || []).length;
     if (completed) {
       session.status = "COMPLETED";
+      session.completedAt = now;
+      session.scorePercent = Math.round((Number(session.correctAnswers || 0) / quest.stages.length) * 100);
+      session.passed = session.scorePercent >= QUEST_PASS_PERCENT;
+    } else {
+      session.stageStartedAt = now;
     }
     this.persist();
     return {
-      correct: true,
+      correct,
+      timedOut,
       completed,
+      message: timedOut ? "Time is up. Moving to the next question." : correct ? "Correct" : "Incorrect",
       explanation: stage.explanation || "",
       session: this.sanitizeSession(session, quest),
     };
@@ -453,23 +497,49 @@ class QuestService {
         reward: reward ? this.sanitizeReward(reward) : null,
       };
     }
+    if (String(session.status || "").toUpperCase() === "FAILED") {
+      const progress = this.getProgress(user.id);
+      return {
+        session: this.sanitizeSession(session),
+        reward: null,
+        passed: false,
+        scorePercent: Number(session.scorePercent || 0),
+        nextQuestAvailableAt: progress.nextQuestAvailableAt,
+      };
+    }
     const quest = session.questSnapshot || this.db.quests.find((item) => item.id === session.questId);
     if ((session.currentStageIndex || 0) < (quest?.stages?.length || 0)) {
       throw new Error("Complete every quest stage first.");
     }
-    const reward = this.assignReward(user, session, quest, requestMeta);
     const progress = this.getProgress(user.id);
     progress.lastQuestCompletedAt = this.clock();
     progress.nextQuestAvailableAt = new Date(Date.parse(this.clock()) + QUEST_COOLDOWN_MS).toISOString();
     progress.totalCompleted = Number(progress.totalCompleted || 0) + 1;
-    progress.totalRewards = Number(progress.totalRewards || 0) + 1;
     progress.currentSessionId = "";
     progress.updatedAt = this.clock();
     quest.stats = quest.stats || {};
     quest.stats.completed = Number(quest.stats.completed || 0) + 1;
+    session.scorePercent = Number.isFinite(Number(session.scorePercent))
+      ? Number(session.scorePercent)
+      : Math.round((Number(session.correctAnswers || 0) / quest.stages.length) * 100);
+    session.passed = session.scorePercent >= QUEST_PASS_PERCENT;
+    session.completedAt = session.completedAt || this.clock();
+    if (!session.passed) {
+      session.status = "FAILED";
+      this.financialService?.audit?.(user, "QUEST_FAILED", "Quest", quest.id, { sessionId: session.id, scorePercent: session.scorePercent }, requestMeta);
+      this.persist();
+      return {
+        session: this.sanitizeSession(session, quest),
+        reward: null,
+        passed: false,
+        scorePercent: session.scorePercent,
+        nextQuestAvailableAt: progress.nextQuestAvailableAt,
+      };
+    }
+    const reward = this.assignReward(user, session, quest, requestMeta);
+    progress.totalRewards = Number(progress.totalRewards || 0) + 1;
     quest.stats.rewarded = Number(quest.stats.rewarded || 0) + 1;
     session.status = "REWARD_ASSIGNED";
-    session.completedAt = session.completedAt || this.clock();
     session.rewardAssignedAt = this.clock();
     this.financialService?.createNotification?.({
       userId: user.id,
@@ -484,6 +554,8 @@ class QuestService {
     return {
       session: this.sanitizeSession(session, quest),
       reward: this.sanitizeReward(reward),
+      passed: true,
+      scorePercent: session.scorePercent,
       nextQuestAvailableAt: progress.nextQuestAvailableAt,
     };
   }
@@ -758,4 +830,5 @@ module.exports = {
   QuestService,
   QUEST_CATEGORIES,
   QUEST_COOLDOWN_MS,
+  QUEST_PASS_PERCENT,
 };
