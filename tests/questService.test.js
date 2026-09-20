@@ -134,6 +134,54 @@ test("quest reward reveal and wallet redemption credit once", () => {
   assert.equal(db.transactions.filter((item) => item.reference === redeemed.reward.id).length, 1);
 });
 
+test("used reward repairs a stale revealed session and returns the user to cooldown", () => {
+  const harness = createHarness();
+  const { questService, financialService, user, db } = harness;
+  createQuestReward(harness, "1200");
+  const started = questService.startQuest(user, questService.getUserStatus(user).activeQuest.id);
+  for (const stage of db.quests[0].stages) {
+    questService.answerStage(user, started.session.id, { answer: stage.correctAnswer });
+  }
+  questService.completeQuest(user, started.session.id);
+  questService.revealReward(user, started.session.id);
+  questService.redeemReward(user, started.session.id);
+
+  const session = db.questSessions.find((item) => item.id === started.session.id);
+  session.status = "REVEALED";
+  session.rewardRedeemedAt = null;
+  const balanceBeforeRepair = financialService.ensureWallet(user.id, "NGN").availableBalance;
+  const transactionCountBeforeRepair = db.transactions.length;
+  const status = questService.getUserStatus(user);
+
+  assert.equal(status.activeSession, null);
+  assert.equal(status.cooldownRemainingMs, QUEST_COOLDOWN_MS);
+  assert.equal(session.status, "REDEEMED");
+  assert.equal(financialService.ensureWallet(user.id, "NGN").availableBalance, balanceBeforeRepair);
+  assert.equal(db.transactions.length, transactionCountBeforeRepair);
+});
+
+test("idempotent redemption repairs stale session status without a second credit", () => {
+  const harness = createHarness();
+  const { questService, financialService, user, db } = harness;
+  createQuestReward(harness, "900");
+  const started = questService.startQuest(user, questService.getUserStatus(user).activeQuest.id);
+  for (const stage of db.quests[0].stages) {
+    questService.answerStage(user, started.session.id, { answer: stage.correctAnswer });
+  }
+  questService.completeQuest(user, started.session.id);
+  questService.revealReward(user, started.session.id);
+  questService.redeemReward(user, started.session.id);
+  const session = db.questSessions.find((item) => item.id === started.session.id);
+  session.status = "REVEALED";
+  const balance = financialService.ensureWallet(user.id, "NGN").availableBalance;
+
+  const repaired = questService.redeemReward(user, started.session.id);
+
+  assert.equal(repaired.session.status, "REDEEMED");
+  assert.equal(financialService.ensureWallet(user.id, "NGN").availableBalance, balance);
+  assert.equal(db.transactions.filter((item) => item.reference === repaired.reward.id).length, 1);
+});
+
 test("quest scores every question once and failed users wait 12 hours without a reward", () => {
   const harness = createHarness();
   const { questService, user, db } = harness;

@@ -299,13 +299,42 @@ class QuestService {
 
   getActiveSession(userId) {
     return this.db.questSessions.find((session) => {
-      return session.userId === userId && ACTIVE_SESSION_STATUSES.includes(String(session.status || "").toUpperCase());
+      if (session.userId !== userId || !ACTIVE_SESSION_STATUSES.includes(String(session.status || "").toUpperCase())) {
+        return false;
+      }
+      const reward = session.rewardId ? this.db.giftCards.find((card) => card.id === session.rewardId) : null;
+      return !["USED", "REDEEMED"].includes(String(reward?.status || "").toUpperCase());
     }) || null;
+  }
+
+  reconcileRedeemedSessions(userId, progress) {
+    let changed = false;
+    for (const session of this.db.questSessions) {
+      if (session.userId !== userId || !ACTIVE_SESSION_STATUSES.includes(String(session.status || "").toUpperCase()) || !session.rewardId) {
+        continue;
+      }
+      const reward = this.db.giftCards.find((card) => card.id === session.rewardId);
+      if (!["USED", "REDEEMED"].includes(String(reward?.status || "").toUpperCase())) {
+        continue;
+      }
+      session.status = "REDEEMED";
+      session.rewardRedeemedAt = session.rewardRedeemedAt || reward.redeemedAt || this.clock();
+      if (progress.currentSessionId === session.id) progress.currentSessionId = "";
+      if (!progress.nextQuestAvailableAt) {
+        const completedMs = parseDateMs(session.completedAt) || parseDateMs(reward.redeemedAt) || Date.parse(this.clock());
+        progress.nextQuestAvailableAt = new Date(completedMs + QUEST_COOLDOWN_MS).toISOString();
+      }
+      progress.updatedAt = this.clock();
+      changed = true;
+    }
+    if (changed) this.persist();
+    return changed;
   }
 
   getUserStatus(user) {
     this.syncQuestAvailability();
     const progress = this.getProgress(user.id);
+    this.reconcileRedeemedSessions(user.id, progress);
     const nowMs = Date.parse(this.clock());
     const nextAvailableMs = parseDateMs(progress.nextQuestAvailableAt);
     const cooldownRemainingMs = nextAvailableMs && nextAvailableMs > nowMs ? nextAvailableMs - nowMs : 0;
@@ -618,6 +647,12 @@ class QuestService {
       }
     );
     if (alreadyRedeemed) {
+      session.status = "REDEEMED";
+      session.rewardRedeemedAt = session.rewardRedeemedAt || reward.redeemedAt || this.clock();
+      const progress = this.getProgress(user.id);
+      if (progress.currentSessionId === session.id) progress.currentSessionId = "";
+      progress.updatedAt = this.clock();
+      this.persist();
       return {
         ...result,
         session: this.sanitizeSession(session),
