@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
 const crypto = require("node:crypto");
+const zlib = require("node:zlib");
 const { WebSocketServer } = require("ws");
 const { getEnvValue, parseEnvFileValue } = require("./lib/env");
 
@@ -106,7 +107,7 @@ const port = getConfiguredPort();
 const BYBIT_USDT_NGN_URL = getEnvValue("BYBIT_USDT_NGN_URL") || "https://www.bybit.com/en/convert/usdt-to-ngn/";
 const FIAT_RATE_CACHE_TTL_MS = 1000 * 60 * 15;
 const MARKET_WATCHLIST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "PEPEUSDT"];
-const WATCHLIST_CACHE_TTL_MS = 1000 * 10;
+const WATCHLIST_CACHE_TTL_MS = 1000 * 60;
 const SESSION_TTL_MS = 1000 * 60 * 60 * 48;
 const SESSION_TTL_SECONDS = Math.round(SESSION_TTL_MS / 1000);
 const SIGNAL_STREAM_KEEPALIVE_MS = 20_000;
@@ -114,8 +115,9 @@ const SIGNAL_EXPIRY_SWEEP_MS = 60_000;
 const ACCOUNT_SNAPSHOT_CACHE_TTL_MS = 1000 * 60;
 const TRADE_RECONCILE_BACKGROUND_INTERVAL_MS = 15_000;
 const SERVICE_RETRY_INTERVAL_MS = 60_000;
-const SETTINGS_USERS_WS_REFRESH_MS = 20_000;
 const SETTINGS_USERS_WS_PATH = "/ws/settings-users";
+const LIVE_STATE_WS_PATH = "/ws/live-state";
+const COMPRESSION_MIN_BYTES = 1024;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5;
 const PAYMENT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -143,6 +145,17 @@ let efemResellerService = null;
 let emailNotificationService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
+let liveStateVersion = 1;
+let liveStateBroadcastScheduled = false;
+const liveStateClients = new Set();
+const egressMetrics = {
+  requestsByRoute: Object.create(null),
+  responseBytesByRoute: Object.create(null),
+  liveStateResponseBytes: 0,
+  saveDbCount: 0,
+  appStateSerializedBytes: 0,
+  externalApiCallCount: 0,
+};
 const loginAttemptBuckets = new Map();
 const digitalServiceOrderRequests = new Map();
 const membershipPurchaseRequests = new Map();
@@ -221,6 +234,8 @@ const fiatRateCache = {
 };
 
 const watchlistCache = new Map();
+const watchlistRequests = new Map();
+const accountSnapshotRequests = new WeakMap();
 let signalEngineStartPromise = null;
 let tradeListenerStartPromise = null;
 
@@ -266,7 +281,9 @@ function persist() {
     return;
   }
 
-  saveDb(db).catch((error) => {
+  egressMetrics.saveDbCount += 1;
+  egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
+  saveDb(db).then(() => scheduleLiveStateBroadcast()).catch((error) => {
     console.error("Failed to persist application state:", error.message);
   });
 }
@@ -720,13 +737,23 @@ function readRawBody(req) {
 }
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  const body = Buffer.from(JSON.stringify(payload));
+  const route = res._routePath || "unknown";
+  egressMetrics.responseBytesByRoute[route] = (egressMetrics.responseBytesByRoute[route] || 0) + body.length;
+  if (route === "/api/live-state") egressMetrics.liveStateResponseBytes = body.length;
+  const acceptsGzip = /\bgzip\b/i.test(String(res._acceptEncoding || ""));
+  const shouldCompress = acceptsGzip && body.length >= COMPRESSION_MIN_BYTES;
+  const responseBody = shouldCompress ? zlib.gzipSync(body) : body;
   res.writeHead(statusCode, {
     ...buildSecurityHeaders(),
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
+    Vary: "Accept-Encoding",
+    ...(shouldCompress ? { "Content-Encoding": "gzip" } : {}),
+    "Content-Length": responseBody.length,
     ...extraHeaders,
   });
-  res.end(JSON.stringify(payload));
+  res.end(responseBody);
 }
 
 function sendText(res, statusCode, payload, contentType = "text/plain; charset=utf-8") {
@@ -786,6 +813,23 @@ function isAllowedCorsOrigin(origin) {
   }
 
   return getAllowedCorsOrigins().includes(origin);
+}
+
+function scheduleLiveStateBroadcast() {
+  liveStateVersion += 1;
+  if (liveStateBroadcastScheduled) return;
+  liveStateBroadcastScheduled = true;
+  setImmediate(() => {
+    liveStateBroadcastScheduled = false;
+    for (const socket of liveStateClients) {
+      const user = getSettingsSocketUser(socket);
+      if (!user) {
+        socket.close();
+        continue;
+      }
+      sendWebSocketJson(socket, { type: "live_state_changed", version: liveStateVersion });
+    }
+  });
 }
 
 function buildCorsHeaders(req) {
@@ -1991,7 +2035,8 @@ async function buildBybitAiInsight(item, mode) {
   }
 }
 
-async function getAccountSnapshot(account, exchange) {
+async function fetchAccountSnapshot(account, exchange) {
+  egressMetrics.externalApiCallCount += 1;
   const previousSnapshot = getCachedAccountSnapshot(account, exchange);
   const [accountInfo, openOrders, tickers, stats24h, usdtNgnRate, exchangeInfo] = await Promise.all([
     getAccountInfo(account, exchange),
@@ -2060,6 +2105,16 @@ async function getAccountSnapshot(account, exchange) {
   };
   cacheAccountSnapshot(account, snapshot, exchange);
   return snapshot;
+}
+
+async function getAccountSnapshot(account, exchange) {
+  const active = accountSnapshotRequests.get(account);
+  if (active?.exchange === exchange) return active.promise;
+  const promise = fetchAccountSnapshot(account, exchange).finally(() => {
+    if (accountSnapshotRequests.get(account)?.promise === promise) accountSnapshotRequests.delete(account);
+  });
+  accountSnapshotRequests.set(account, { exchange, promise });
+  return promise;
 }
 
 async function getConnectedWalletDetails(user, usdtNgnRate) {
@@ -2238,6 +2293,7 @@ async function getUsdtToNgnRate() {
     return fiatRateCache.usdtNgnRate;
   }
 
+  egressMetrics.externalApiCallCount += 1;
   const response = await fetch(BYBIT_USDT_NGN_URL, {
     signal: AbortSignal.timeout(10000),
     headers: {
@@ -2316,13 +2372,14 @@ async function getUsdtToNgnRateFromBybitPage() {
   throw new Error("Unable to parse the Bybit USDT/NGN fiat rate.");
 }
 
-async function getMarketWatchlist(testnet = false, exchange = "bybit") {
+async function fetchMarketWatchlist(testnet = false, exchange = "bybit") {
   const cacheKey = getWatchlistCacheKey(testnet, exchange);
   const cached = watchlistCache.get(cacheKey);
   if (cached && Date.now() - cached.updatedAt < WATCHLIST_CACHE_TTL_MS) {
     return cached.items;
   }
 
+  egressMetrics.externalApiCallCount += 1;
   let items = [];
   try {
     const allTickers = await getTicker24hr(testnet, false, exchange);
@@ -2390,6 +2447,14 @@ async function getMarketWatchlist(testnet = false, exchange = "bybit") {
   });
 
   return items;
+}
+
+async function getMarketWatchlist(testnet = false, exchange = "bybit") {
+  const cacheKey = getWatchlistCacheKey(testnet, exchange);
+  if (watchlistRequests.has(cacheKey)) return watchlistRequests.get(cacheKey);
+  const promise = fetchMarketWatchlist(testnet, exchange).finally(() => watchlistRequests.delete(cacheKey));
+  watchlistRequests.set(cacheKey, promise);
+  return promise;
 }
 
 async function getSpotMarketSymbols(testnet = false, exchange = "bybit") {
@@ -3296,6 +3361,70 @@ function ensureTradeInvestmentsState() {
 function getUserTradeInvestment(tradeId, userId) {
   return ensureTradeInvestmentsState()
     .find((item) => item.tradeId === tradeId && item.userId === userId && item.status === "ACTIVE") || null;
+}
+
+function projectLiveTrade(trade, user) {
+  const source = user.role === "admin" ? serializeTradeForAdmin(trade) : serializeTradeForUser(trade, user.id);
+  return {
+    id: source.id,
+    createdAt: source.createdAt,
+    symbol: source.symbol,
+    side: source.side,
+    type: source.type,
+    quantity: source.quantity,
+    quoteOrderQty: source.quoteOrderQty,
+    price: source.price,
+    exchange: source.exchange,
+    takeProfitTargetPrice: source.takeProfitTargetPrice,
+    stopLossTargetPrice: source.stopLossTargetPrice,
+    lifecycleStatus: source.lifecycleStatus,
+    actualLifecycleStatus: source.actualLifecycleStatus,
+    adminExecution: source.adminExecution ? {
+      status: source.adminExecution.status,
+      orderId: source.adminExecution.orderId,
+      executedQty: source.adminExecution.executedQty,
+      cummulativeQuoteQty: source.adminExecution.cummulativeQuoteQty,
+      price: source.adminExecution.price,
+    } : null,
+    userInvestment: source.userInvestment || null,
+    joinedUsersCount: source.joinedUsersCount,
+  };
+}
+
+function buildLiveState(user) {
+  const wallets = financialService.getWallets(user.id);
+  const ngnWallet = wallets.find((wallet) => wallet.currency === "NGN") || {};
+  const usdtWallet = wallets.find((wallet) => wallet.currency === "USDT") || {};
+  const rate = String(db.systemSettings?.exchangeRate?.usdtToNgn || "0");
+  const ngn = String(ngnWallet.availableBalance || "0");
+  const usdt = String(usdtWallet.availableBalance || "0");
+  const ngnLocked = String(ngnWallet.lockedBalance || "0");
+  const usdtLocked = String(usdtWallet.lockedBalance || "0");
+  const visibleTrades = (db.tradeIntents || []).filter((trade) => {
+    const lifecycle = deriveTradeLifecycle(trade);
+    if (!['OPEN', 'PENDING'].includes(lifecycle)) return false;
+    if (user.role === "admin") return true;
+    const investment = getUserTradeInvestmentRecord(trade.id, user.id);
+    return investment?.status !== "STOPPED" && (lifecycle === "OPEN" || trade.side === "BUY");
+  });
+  const projected = visibleTrades.map((trade) => projectLiveTrade(trade, user));
+  return {
+    version: liveStateVersion,
+    updatedAt: new Date().toISOString(),
+    balance: {
+      ngn,
+      ngnLocked,
+      usdt,
+      usdtLocked,
+      usdtToNgnRate: rate,
+      totalUsdtEquivalent: financialService.getAvailableUsdtEquivalent(user.id, rate),
+      totalNgnEquivalent: add(ngn, multiplyRatio(usdt, rate, "1")),
+      lockedUsdtEquivalent: add(usdtLocked, compare(rate, "0") > 0 ? multiplyRatio(ngnLocked, "1", rate) : "0"),
+      lockedNgnEquivalent: add(ngnLocked, multiplyRatio(usdtLocked, rate, "1")),
+    },
+    openTrades: projected.filter((trade) => trade.lifecycleStatus === "OPEN"),
+    queueTrades: projected.filter((trade) => trade.lifecycleStatus === "PENDING"),
+  };
 }
 
 function getUserTradeInvestmentRecord(tradeId, userId) {
@@ -5068,6 +5197,20 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/live-state") {
+    const user = requireAuth(req, res);
+    if (!user) return true;
+    sendJson(res, 200, buildLiveState(user));
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/egress-metrics") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    sendJson(res, 200, { metrics: egressMetrics });
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/membership/plans") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { plans: financialService.getMembershipSettings(), membership: user?.role === "user" ? financialService.getMembershipSummary(user) : null });
@@ -5394,12 +5537,6 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    await settleInactiveTradeInvestmentsForUsers({
-      userId: user.id,
-      reason: "TRADE_CLOSED",
-      description: "Closed trade investment settled.",
-      createdBy: "system",
-    });
     const dashboard = financialService.getDashboard(user);
     const financeSummary = await buildUserTradeInvestmentSummary(user);
     sendJson(res, 200, {
@@ -5872,9 +6009,44 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
-    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 300);
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 50), 1), 100);
     financialService.recoverMissingDigitalServiceOrdersFromHistory(user, getRequestMeta(req));
     sendJson(res, 200, { orders: financialService.listDigitalServiceOrders(user, { limit }) });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/digital-services/pending-status") {
+    const user = requireAuth(req, res);
+    if (!user) return true;
+    const orders = financialService.listDigitalServiceOrders(user, { limit: 300 })
+      .filter((order) => {
+        const status = String(order.status || "").toLowerCase();
+        return !["failed", "refunded", "cancelled", "canceled"].includes(status)
+          && (status !== "delivered" || order.readyNotificationPending || order.otpRequest?.status === "responded");
+      })
+      .map((order) => ({
+        id: order.id,
+        status: order.status,
+        fulfillmentStatus: order.fulfillmentStatus,
+        paymentStatus: order.paymentStatus,
+        ready: order.readyNotificationPending === true,
+        otpStatus: order.otpRequest?.status || "",
+        updatedAt: order.updatedAt || order.completedAt || order.createdAt,
+      }));
+    sendJson(res, 200, { orders });
+    return true;
+  }
+
+  const digitalOrderStatusMatch = url.pathname.match(/^\/api\/digital-services\/orders\/([^/]+)\/status$/);
+  if (req.method === "GET" && digitalOrderStatusMatch) {
+    const user = requireAuth(req, res);
+    if (!user) return true;
+    try {
+      const order = financialService.getDigitalServiceOrder(user, decodeURIComponent(digitalOrderStatusMatch[1] || ""));
+      sendJson(res, 200, { order });
+    } catch (error) {
+      sendJson(res, error.statusCode || 404, { error: error.message });
+    }
     return true;
   }
 
@@ -6259,7 +6431,6 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
-    await syncProcessingPaystackWithdrawals(getRequestMeta(req));
     const dashboard = financialService.getAdminDashboard();
     const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(admin));
     const account = getExchangeAccount(admin, exchange);
@@ -6269,11 +6440,7 @@ async function handleApi(req, res, url) {
       dashboard.accountSnapshot = cachedSnapshot || null;
       if (forceRefresh || !cachedSnapshot || !isCachedAccountSnapshotFresh(cachedSnapshot, 15_000)) {
         dashboard.accountSnapshot = await getAccountSnapshot(account, exchange)
-          .then((snapshot) => {
-            account.lastValidatedAt = nowIso();
-            persist();
-            return snapshot;
-          })
+          .then((snapshot) => snapshot)
           .catch(() => cachedSnapshot ? { ...cachedSnapshot, stale: true } : null);
       }
     }
@@ -7762,8 +7929,6 @@ async function handleApi(req, res, url) {
 
     try {
       const snapshot = await getAccountSnapshot(account, exchange);
-      account.lastValidatedAt = nowIso();
-      persist();
       sendJson(res, 200, snapshot);
     } catch (error) {
       if (cachedSnapshot) {
@@ -8503,13 +8668,6 @@ async function handleApi(req, res, url) {
       return true;
     }
     const exchange = normalizeExchange(url.searchParams.get("exchange"), getPreferredExchange(user));
-    await waitForTradeReconciliation(4000, { force: true });
-    await settleInactiveTradeInvestmentsForUsers({
-      userId: user.role === "user" ? user.id : "",
-      reason: "TRADE_CLOSED",
-      description: "Closed trade investment settled.",
-      createdBy: "system",
-    });
     const trades =
       user.role === "admin"
         ? db.tradeIntents.filter((trade) => getTradeExchange(trade) === exchange).map(serializeTradeForAdmin)
@@ -8939,6 +9097,9 @@ function serveStatic(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  res._routePath = url.pathname;
+  res._acceptEncoding = req.headers["accept-encoding"];
+  egressMetrics.requestsByRoute[url.pathname] = (egressMetrics.requestsByRoute[url.pathname] || 0) + 1;
   applyCorsHeaders(req, res);
 
   if (handleCorsPreflight(req, res)) {
@@ -9017,18 +9178,13 @@ async function pushSettingsUsersSnapshot(socket, reason = "refresh") {
 
 function scheduleSettingsUsersBroadcast(reason = "update") {
   for (const socket of settingsUsersClients) {
-    void pushSettingsUsersSnapshot(socket, reason);
+    sendWebSocketJson(socket, { type: "settings_changed", reason });
   }
 }
 
 settingsUsersWss.on("connection", (socket, request, auth = {}) => {
   socket.sessionId = auth.sessionId || null;
   settingsUsersClients.add(socket);
-  socket.refreshTimer = setInterval(() => {
-    void pushSettingsUsersSnapshot(socket, "interval");
-  }, SETTINGS_USERS_WS_REFRESH_MS);
-
-  void pushSettingsUsersSnapshot(socket, "initial");
 
   socket.on("message", (raw) => {
     try {
@@ -9042,19 +9198,26 @@ settingsUsersWss.on("connection", (socket, request, auth = {}) => {
   });
 
   socket.on("close", () => {
-    clearInterval(socket.refreshTimer);
     settingsUsersClients.delete(socket);
   });
 
   socket.on("error", () => {
-    clearInterval(socket.refreshTimer);
     settingsUsersClients.delete(socket);
   });
 });
 
+const liveStateWss = new WebSocketServer({ noServer: true });
+liveStateWss.on("connection", (socket, request, auth = {}) => {
+  socket.sessionId = auth.sessionId || null;
+  liveStateClients.add(socket);
+  sendWebSocketJson(socket, { type: "live_state_changed", version: liveStateVersion });
+  socket.on("close", () => liveStateClients.delete(socket));
+  socket.on("error", () => liveStateClients.delete(socket));
+});
+
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname !== SETTINGS_USERS_WS_PATH) {
+  if (![SETTINGS_USERS_WS_PATH, LIVE_STATE_WS_PATH].includes(url.pathname)) {
     return;
   }
 
@@ -9066,8 +9229,9 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  settingsUsersWss.handleUpgrade(req, socket, head, (ws) => {
-    settingsUsersWss.emit("connection", ws, req, {
+  const target = url.pathname === LIVE_STATE_WS_PATH ? liveStateWss : settingsUsersWss;
+  target.handleUpgrade(req, socket, head, (ws) => {
+    target.emit("connection", ws, req, {
       sessionId: session.id,
     });
   });
@@ -9097,7 +9261,12 @@ async function startServer() {
     akundingService,
     emmaService: emmaResellerService,
     efemService: efemResellerService,
-    persistPaidOrder: () => saveDb(db),
+    persistPaidOrder: async () => {
+      egressMetrics.saveDbCount += 1;
+      egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
+      await saveDb(db);
+      scheduleLiveStateBroadcast();
+    },
   });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();

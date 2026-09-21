@@ -2886,8 +2886,6 @@ class FinancialService {
     const todayMirroredPercentage = todayTransactions
       .find((transaction) => transaction.metadata?.profitLossPercentage)
       ?.metadata?.profitLossPercentage || "0";
-    this.syncLowBalanceNotification(user, totalNgnEquivalent);
-
     return {
       user: {
         id: user.id,
