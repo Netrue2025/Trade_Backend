@@ -1,8 +1,7 @@
-const cron = require("node-cron");
-
 const { createBroadcaster } = require("../utils/broadcast");
 
 const DAILY_PROFIT_TARGET_PERCENT = 1;
+const REPORTING_TIME_ZONE = "Africa/Lagos";
 
 function normalizeExchange(exchange) {
   const value = String(exchange || "").trim().toLowerCase();
@@ -83,6 +82,66 @@ function calculateProfitPercent(trade, exitOrder) {
   }
 
   return ((exitPrice - entryPrice) / entryPrice) * 100;
+}
+
+function getNigeriaDateKey(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: REPORTING_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getFilledTradeExitSummary(trade) {
+  const entryQuantity = getExecutionQuantity(trade?.adminExecution);
+  const exits = (trade?.exitOrders || [])
+    .map((exitOrder) => ({ exitOrder, execution: exitOrder?.adminExecution }))
+    .filter(({ execution }) => ["FILLED", "PARTIALLY_FILLED"].includes(getExecutionStatus(execution)))
+    .map((item) => ({ ...item, quantity: getExecutionQuantity(item.execution), price: getExecutionPrice(item.execution) }))
+    .filter((item) => item.quantity > 0 && item.price > 0);
+  const exitedQuantity = exits.reduce((sum, item) => sum + item.quantity, 0);
+  if (!(entryQuantity > 0) || exitedQuantity + 1e-8 < entryQuantity || !exits.length) return null;
+  const entryPrice = getExecutionPrice(trade?.adminExecution) || toNumber(trade?.price);
+  if (!(entryPrice > 0)) return null;
+  const exitPrice = exits.reduce((sum, item) => sum + (item.quantity * item.price), 0) / exitedQuantity;
+  const timestamps = exits.map(({ execution, exitOrder }) => {
+    const numeric = Number(execution?.transactTime || execution?.updateTime || execution?.time || 0);
+    return numeric > 0 ? numeric : Date.parse(exitOrder?.closedAt || exitOrder?.updatedAt || exitOrder?.createdAt || "");
+  }).filter(Number.isFinite);
+  if (!timestamps.length) return null;
+  const side = String(trade?.side || "BUY").trim().toUpperCase();
+  const profitPercent = side === "SELL"
+    ? ((entryPrice - exitPrice) / entryPrice) * 100
+    : ((exitPrice - entryPrice) / entryPrice) * 100;
+  return { closedAt: new Date(Math.max(...timestamps)).toISOString(), profitPercent };
+}
+
+function aggregateDailyTradeProfit(trades = [], { exchange = "bybit", at = new Date() } = {}) {
+  const normalizedExchange = normalizeExchange(exchange);
+  const date = getNigeriaDateKey(at);
+  const records = [];
+  const includedTradeIds = new Set();
+  for (const trade of trades) {
+    if (normalizeExchange(trade?.exchange) !== normalizedExchange) continue;
+    const tradeId = String(trade?.id || "").trim();
+    if (!tradeId || includedTradeIds.has(tradeId)) continue;
+    const summary = getFilledTradeExitSummary(trade);
+    if (!summary || getNigeriaDateKey(summary.closedAt) !== date) continue;
+    includedTradeIds.add(tradeId);
+    records.push({ tradeId, closedAt: summary.closedAt, profitPercent: summary.profitPercent });
+  }
+  return {
+    date,
+    exchange: normalizedExchange,
+    tradesClosed: records.length,
+    totalPercent: records.reduce((sum, record) => sum + record.profitPercent, 0),
+    records,
+  };
 }
 
 function buildExchangeHeader(exchange, suffix = "Trade") {
@@ -266,48 +325,48 @@ function buildTargetMessage(exchange) {
   ].join("\n");
 }
 
-function buildDailyTargetMessage(exchange, totalPercent = DAILY_PROFIT_TARGET_PERCENT) {
+function buildDailyTargetMessage(exchange, totalPercent = DAILY_PROFIT_TARGET_PERCENT, report = {}) {
   return [
     "🎉 Daily Target Hit",
     `${getExchangeLabel(exchange)} Profit Update`,
     "",
     `✅ Daily ${DAILY_PROFIT_TARGET_PERCENT}% target accomplished today`,
+    report.date ? `Date: ${report.date} (Africa/Lagos)` : null,
+    Number.isFinite(Number(report.tradesClosed)) ? `Trades closed today: ${report.tradesClosed}` : null,
     "",
     "Total profit today",
     formatSignedPercent(totalPercent),
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
-function buildDailyAdditionalProfitMessage(exchange, additionalPercent, totalPercent) {
+function buildDailyAdditionalProfitMessage(exchange, additionalPercent, totalPercent, report = {}) {
   return [
     "🎉 Profit Update",
     `${getExchangeLabel(exchange)} Daily Progress`,
     "",
     `Congratulations! You have ${formatSignedPercent(additionalPercent)} profit in addition to the daily ${DAILY_PROFIT_TARGET_PERCENT}% accomplished today.`,
+    report.date ? `Date: ${report.date} (Africa/Lagos)` : null,
+    Number.isFinite(Number(report.tradesClosed)) ? `Trades closed today: ${report.tradesClosed}` : null,
     "",
     "Total profit today",
     formatSignedPercent(totalPercent),
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 class TradeListener {
-  constructor({ telegramService, subscriberModel, logger = console, channelSender = null, tradeUrlBuilder = null } = {}) {
+  constructor({ telegramService, subscriberModel, logger = console, channelSender = null, tradeUrlBuilder = null, dailyProfitProvider = null } = {}) {
     this.telegramService = telegramService;
     this.subscriberModel = subscriberModel;
     this.logger = logger;
     this.channelSender = typeof channelSender === "function" ? channelSender : null;
     this.tradeUrlBuilder = typeof tradeUrlBuilder === "function" ? tradeUrlBuilder : null;
+    this.dailyProfitProvider = typeof dailyProfitProvider === "function" ? dailyProfitProvider : null;
     this.broadcaster = createBroadcaster({
       telegramService,
       subscriberModel,
       logger,
     });
-    this.binanceDailyProfit = 0;
-    this.bybitDailyProfit = 0;
-    this.binanceTargetHit = false;
-    this.bybitTargetHit = false;
     this.processedOrderExecutionKeys = new Map();
-    this.resetTask = null;
     this.started = false;
   }
 
@@ -323,46 +382,12 @@ class TradeListener {
       return this;
     }
 
-    if (!this.resetTask) {
-      this.resetTask = cron.schedule("0 0 * * *", () => {
-        this.resetDailyState();
-      });
-    }
-
     this.started = true;
     return this;
   }
 
   stop() {
-    if (this.resetTask) {
-      this.resetTask.stop();
-      this.resetTask = null;
-    }
     this.started = false;
-  }
-
-  resetDailyState() {
-    this.binanceDailyProfit = 0;
-    this.bybitDailyProfit = 0;
-    this.binanceTargetHit = false;
-    this.bybitTargetHit = false;
-    this.logger.log("Trade listener daily profit counters reset.");
-  }
-
-  getDailyProfit(exchange) {
-    return normalizeExchange(exchange) === "binance" ? this.binanceDailyProfit : this.bybitDailyProfit;
-  }
-
-  hasTargetHit(exchange) {
-    return normalizeExchange(exchange) === "binance" ? this.binanceTargetHit : this.bybitTargetHit;
-  }
-
-  markTargetHit(exchange) {
-    if (normalizeExchange(exchange) === "binance") {
-      this.binanceTargetHit = true;
-      return;
-    }
-    this.bybitTargetHit = true;
   }
 
   async broadcast(message, type, options = {}) {
@@ -493,7 +518,7 @@ class TradeListener {
           });
         }
       }
-      await this.updateDailyProfit(exchange, profitPercent);
+      await this.updateDailyProfit(exchange, profitPercent, { trade, exitOrder });
       return;
     }
 
@@ -525,7 +550,7 @@ class TradeListener {
       }
     }
 
-    await this.updateDailyProfit(exchange, profitPercent);
+    await this.updateDailyProfit(exchange, profitPercent, { trade, exitOrder });
   }
 
   async handleOrderExecuted(orderEvent = {}) {
@@ -580,23 +605,21 @@ class TradeListener {
     return { ok: true, managed: false };
   }
 
-  async updateDailyProfit(exchange, profitPercent) {
+  async updateDailyProfit(exchange, profitPercent, context = {}) {
     const normalizedExchange = normalizeExchange(exchange);
     const numericProfit = toNumber(profitPercent);
     if (!Number.isFinite(numericProfit) || numericProfit === 0) {
       return;
     }
 
-    if (normalizedExchange === "binance") {
-      this.binanceDailyProfit += numericProfit;
-    } else {
-      this.bybitDailyProfit += numericProfit;
-    }
-
-    const dailyProfit = this.getDailyProfit(normalizedExchange);
-    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && !this.hasTargetHit(normalizedExchange)) {
-      this.markTargetHit(normalizedExchange);
-      const message = buildDailyTargetMessage(normalizedExchange, dailyProfit);
+    if (!this.dailyProfitProvider) return;
+    const report = await this.dailyProfitProvider({ exchange: normalizedExchange, ...context });
+    const dailyProfit = toNumber(report?.totalPercent);
+    const currentRecord = (report?.records || []).find((record) => record.tradeId === String(context.trade?.id || ""));
+    if (!currentRecord) return;
+    const previousProfit = dailyProfit - toNumber(currentRecord?.profitPercent ?? numericProfit);
+    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && previousProfit < DAILY_PROFIT_TARGET_PERCENT) {
+      const message = buildDailyTargetMessage(normalizedExchange, dailyProfit, report);
       await this.broadcast(message, "dailyProfit", {
         exchange: normalizedExchange,
       });
@@ -607,8 +630,8 @@ class TradeListener {
       return;
     }
 
-    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && this.hasTargetHit(normalizedExchange) && numericProfit > 0) {
-      const message = buildDailyAdditionalProfitMessage(normalizedExchange, numericProfit, dailyProfit);
+    if (dailyProfit >= DAILY_PROFIT_TARGET_PERCENT && previousProfit >= DAILY_PROFIT_TARGET_PERCENT && numericProfit > 0) {
+      const message = buildDailyAdditionalProfitMessage(normalizedExchange, numericProfit, dailyProfit, report);
       await this.broadcast(message, "dailyProfit", {
         exchange: normalizedExchange,
       });
@@ -622,5 +645,7 @@ class TradeListener {
 
 module.exports = {
   TradeListener,
+  aggregateDailyTradeProfit,
   calculateProfitPercent,
+  getNigeriaDateKey,
 };

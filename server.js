@@ -73,7 +73,7 @@ const {
   normalizePhone,
 } = require("./services/vtuService");
 const { TradeLearningService } = require("./services/tradeLearning");
-const { TradeListener } = require("./services/tradeListener");
+const { TradeListener, aggregateDailyTradeProfit } = require("./services/tradeListener");
 const { createSignalConfig } = require("./src/config/signalConfig");
 const { SIGNAL_EVENTS, signalBus } = require("./src/events/signalBus");
 const { createLogger } = require("./src/utils/logger");
@@ -176,6 +176,7 @@ const tradeListener = new TradeListener({
   subscriberModel,
   channelSender: sendTelegramChannelAlert,
   tradeUrlBuilder: buildTradeDeepLink,
+  dailyProfitProvider: ({ exchange }) => aggregateDailyTradeProfit(db?.tradeIntents || [], { exchange, at: new Date() }),
 });
 const signalConfig = createSignalConfig();
 const signalLogger = createLogger("signals");
@@ -3164,9 +3165,6 @@ async function reconcileTradeStatuses() {
       }
 
       if (JSON.stringify(previousTrade || null) !== JSON.stringify(trade)) {
-        await tradeListener.handleTradeUpdated(previousTrade, trade).catch((error) => {
-          console.error(`Trade listener update failed for trade ${trade.id}:`, error.message);
-        });
         if (deriveTradeLifecycle(previousTrade) !== "CLOSED" && deriveTradeLifecycle(trade) === "CLOSED") {
           await recordTradeForLearning(trade);
           const settledInvestments = await settleClosedTradeInvestments(trade, {
@@ -3177,7 +3175,11 @@ async function reconcileTradeStatuses() {
           if (settledInvestments.length) {
             changed = true;
           }
+          await persist({ required: true });
         }
+        await tradeListener.handleTradeUpdated(previousTrade, trade).catch((error) => {
+          console.error(`Trade listener update failed for trade ${trade.id}:`, error.message);
+        });
       }
     } catch (error) {
       console.error(`Failed to reconcile trade ${trade.id}:`, error.message);
@@ -4989,7 +4991,15 @@ async function executeTradeExit(trade, admin, options = {}) {
   }
 
   trade.exitOrders.push(exitOrder);
-  persist();
+  if (deriveTradeLifecycle(trade) === "CLOSED") {
+    await recordTradeForLearning(trade);
+    await settleClosedTradeInvestments(trade, {
+      reason: kind === "MANUAL_SELL" ? "MANUAL_CLOSE" : "TAKE_PROFIT_OR_CLOSE",
+      description: `${trade.symbol} investment settled after trade close.`,
+      createdBy: admin.id,
+    });
+  }
+  await persist({ required: true });
   await tradeListener.handleExitOrderCreated(trade, exitOrder).catch((error) => {
     console.error(`Trade listener exit event failed for trade ${trade.id}:`, error.message);
   });
