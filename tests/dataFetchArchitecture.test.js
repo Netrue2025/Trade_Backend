@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+const socketService = fs.readFileSync(path.join(__dirname, "..", "src", "services", "socketSignalService.js"), "utf8");
 
 test("live state is authenticated, projected, and does not reconcile or persist", () => {
   const route = server.match(/if \(req\.method === "GET" && url\.pathname === "\/api\/live-state"\)[\s\S]*?return true;\s*}/)?.[0] || "";
@@ -28,9 +29,26 @@ test("trade reads use reconciled state without forcing exchange reconciliation",
 
 test("settings websocket has no interval snapshot and private status routes require auth", () => {
   assert.doesNotMatch(server, /socket\.refreshTimer\s*=\s*setInterval/);
-  assert.match(server, /LIVE_STATE_WS_PATH = "\/ws\/live-state"/);
+  assert.doesNotMatch(server, /LIVE_STATE_WS_PATH|liveStateWss|\/ws\/live-state/);
   assert.match(server, /digital-services\/pending-status[\s\S]*?requireAuth\(req, res\)/);
   assert.match(server, /digital-services\\\/orders\\\/\(\[\^\/\]\+\)\\\/status\$\/\)[\s\S]*?requireAuth\(req, res\)/);
+});
+
+test("one authenticated Socket.IO namespace scopes private realtime events by user", () => {
+  assert.match(socketService, /this\.namespace = this\.io\.of\("\/signals"\)/);
+  assert.match(socketService, /this\.namespace\.use\(\(socket, next\)/);
+  assert.match(socketService, /socket\.join\(`user:\$\{user\.id\}`\)/);
+  assert.match(socketService, /this\.namespace\.to\(`user:\$\{userId\}`\)\.emit/);
+  assert.match(server, /emitToUser\(userId, "live_state_changed", \{ version: liveStateVersion \}\)/);
+  assert.doesNotMatch(socketService, /signals:snapshot", payload/);
+});
+
+test("private realtime event payloads contain identifiers and status metadata only", () => {
+  assert.match(server, /"order_ready", \{ orderId: current\.orderReady\.id, status: current\.orderReady\.status \}/);
+  assert.match(server, /"otp_ready", \{ orderId: current\.otpReady\.id \}/);
+  const otpEvent = server.match(/emitToUser\(userId, "otp_ready", \{[^}]+\}\)/)?.[0] || "";
+  assert.equal(otpEvent, 'emitToUser(userId, "otp_ready", { orderId: current.otpReady.id })');
+  assert.doesNotMatch(server, /emitToUser\([^\n]*(password|apiKey|delivery|secret)/i);
 });
 
 test("JSON responses preserve private no-store caching and support gzip", () => {

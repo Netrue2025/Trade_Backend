@@ -7,6 +7,7 @@ class SocketSignalService {
     this.eventBus = eventBus;
     this.logger = logger;
     this.io = null;
+    this.namespace = null;
     this.snapshotProvider = null;
   }
 
@@ -20,8 +21,9 @@ class SocketSignalService {
       },
     });
 
+    this.namespace = this.io.of("/signals");
     if (typeof authorize === "function") {
-      this.io.use((socket, next) => {
+      this.namespace.use((socket, next) => {
         try {
           const result = authorize(socket.request);
           if (!result) {
@@ -36,18 +38,15 @@ class SocketSignalService {
       });
     }
 
-    this.io.of("/signals").on("connection", async (socket) => {
+    this.namespace.on("connection", async (socket) => {
+      const user = socket.data.user;
+      socket.join(`user:${user.id}`);
+      if (user.role === "admin") socket.join("role:admin");
       this.logger.info(`Signal socket connected: ${socket.id}`);
-      if (this.snapshotProvider) {
-        socket.emit("signals:snapshot", await this.snapshotProvider());
-      }
     });
 
     this.eventBus.on(SIGNAL_EVENTS.SIGNAL_GENERATED, (payload) => {
       this.broadcast("signals:new", payload);
-    });
-    this.eventBus.on(SIGNAL_EVENTS.SNAPSHOT_UPDATED, (payload) => {
-      this.broadcast("signals:snapshot", payload);
     });
     this.eventBus.on(SIGNAL_EVENTS.STATUS_UPDATED, (payload) => {
       this.broadcast("signals:status", payload);
@@ -55,10 +54,20 @@ class SocketSignalService {
   }
 
   broadcast(eventName, payload) {
-    if (!this.io) {
+    if (!this.namespace) {
       return;
     }
-    this.io.of("/signals").emit(eventName, payload);
+    this.namespace.emit(eventName, payload);
+  }
+
+  emitToUser(userId, eventName, payload) {
+    if (!this.namespace || !userId) return;
+    this.namespace.to(`user:${userId}`).emit(eventName, payload);
+  }
+
+  emitToAdmins(eventName, payload) {
+    if (!this.namespace) return;
+    this.namespace.to("role:admin").emit(eventName, payload);
   }
 }
 

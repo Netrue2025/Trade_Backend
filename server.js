@@ -116,7 +116,6 @@ const ACCOUNT_SNAPSHOT_CACHE_TTL_MS = 1000 * 60;
 const TRADE_RECONCILE_BACKGROUND_INTERVAL_MS = 15_000;
 const SERVICE_RETRY_INTERVAL_MS = 60_000;
 const SETTINGS_USERS_WS_PATH = "/ws/settings-users";
-const LIVE_STATE_WS_PATH = "/ws/live-state";
 const COMPRESSION_MIN_BYTES = 1024;
 const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5;
@@ -147,7 +146,8 @@ let digitalServicesService = null;
 let pushNotificationService = null;
 let liveStateVersion = 1;
 let liveStateBroadcastScheduled = false;
-const liveStateClients = new Set();
+const liveStateSignatures = new Map();
+const realtimeResourceSignatures = new Map();
 const egressMetrics = {
   requestsByRoute: Object.create(null),
   responseBytesByRoute: Object.create(null),
@@ -816,20 +816,74 @@ function isAllowedCorsOrigin(origin) {
 }
 
 function scheduleLiveStateBroadcast() {
-  liveStateVersion += 1;
   if (liveStateBroadcastScheduled) return;
   liveStateBroadcastScheduled = true;
   setImmediate(() => {
     liveStateBroadcastScheduled = false;
-    for (const socket of liveStateClients) {
-      const user = getSettingsSocketUser(socket);
-      if (!user) {
-        socket.close();
-        continue;
-      }
-      sendWebSocketJson(socket, { type: "live_state_changed", version: liveStateVersion });
+    const changes = [];
+    for (const user of db?.users || []) {
+      const state = buildLiveState(user);
+      const signature = JSON.stringify({ balance: state.balance, openTrades: state.openTrades, queueTrades: state.queueTrades });
+      const previous = liveStateSignatures.get(user.id);
+      liveStateSignatures.set(user.id, signature);
+      if (previous && previous !== signature) changes.push(user.id);
+      const resources = buildRealtimeResourceState(user.id);
+      const previousResources = realtimeResourceSignatures.get(user.id);
+      realtimeResourceSignatures.set(user.id, resources);
+      if (previousResources) emitRealtimeResourceChanges(user.id, previousResources, resources);
+    }
+    if (!changes.length) return;
+    liveStateVersion += 1;
+    for (const userId of changes) {
+      socketSignalService.emitToUser(userId, "live_state_changed", { version: liveStateVersion });
     }
   });
+}
+
+function buildRealtimeResourceState(userId) {
+  const orders = (db?.digitalServiceOrders || []).filter((item) => item.userId === userId);
+  const latest = (items, dateField = "updatedAt") => [...items].sort((a, b) => Date.parse(b[dateField] || b.createdAt || 0) - Date.parse(a[dateField] || a.createdAt || 0))[0] || null;
+  return {
+    orderReady: latest(orders.filter((item) => item.readyNotificationPending === true)),
+    otpReady: latest(orders.filter((item) => item.otpRequest?.status === "responded" && !item.otpRequest?.acknowledgedAt)),
+    deposit: latest((db?.deposits || []).filter((item) => item.userId === userId)),
+    withdrawal: latest((db?.withdrawals || []).filter((item) => item.userId === userId)),
+    notification: latest((db?.notifications || []).filter((item) => item.userId === userId), "createdAt"),
+  };
+}
+
+function realtimeResourceKey(item, statusField = "status") {
+  const status = statusField === "otpRequest.status" ? item?.otpRequest?.status : item?.[statusField];
+  const updatedAt = statusField === "otpRequest.status" ? item?.otpRequest?.respondedAt : item?.updatedAt;
+  return item ? `${item.id}:${status || ""}:${updatedAt || item.completedAt || item.createdAt || ""}` : "";
+}
+
+function emitRealtimeResourceChanges(userId, previous, current) {
+  if (realtimeResourceKey(previous.orderReady) !== realtimeResourceKey(current.orderReady) && current.orderReady) {
+    socketSignalService.emitToUser(userId, "order_ready", { orderId: current.orderReady.id, status: current.orderReady.status });
+  }
+  if (realtimeResourceKey(previous.otpReady, "otpRequest.status") !== realtimeResourceKey(current.otpReady, "otpRequest.status") && current.otpReady) {
+    socketSignalService.emitToUser(userId, "otp_ready", { orderId: current.otpReady.id });
+  }
+  if (realtimeResourceKey(previous.deposit) !== realtimeResourceKey(current.deposit) && current.deposit) {
+    socketSignalService.emitToUser(userId, "deposit_updated", { depositId: current.deposit.id, status: current.deposit.status });
+  }
+  if (realtimeResourceKey(previous.withdrawal) !== realtimeResourceKey(current.withdrawal) && current.withdrawal) {
+    socketSignalService.emitToUser(userId, "withdrawal_updated", { withdrawalId: current.withdrawal.id, status: current.withdrawal.status });
+  }
+  if (realtimeResourceKey(previous.notification) !== realtimeResourceKey(current.notification) && current.notification) {
+    socketSignalService.emitToUser(userId, "notification_created", { notificationId: current.notification.id, type: current.notification.type || "" });
+  }
+}
+
+function primeLiveStateSignatures() {
+  liveStateSignatures.clear();
+  realtimeResourceSignatures.clear();
+  for (const user of db?.users || []) {
+    const state = buildLiveState(user);
+    liveStateSignatures.set(user.id, JSON.stringify({ balance: state.balance, openTrades: state.openTrades, queueTrades: state.queueTrades }));
+    realtimeResourceSignatures.set(user.id, buildRealtimeResourceState(user.id));
+  }
 }
 
 function buildCorsHeaders(req) {
@@ -9206,18 +9260,9 @@ settingsUsersWss.on("connection", (socket, request, auth = {}) => {
   });
 });
 
-const liveStateWss = new WebSocketServer({ noServer: true });
-liveStateWss.on("connection", (socket, request, auth = {}) => {
-  socket.sessionId = auth.sessionId || null;
-  liveStateClients.add(socket);
-  sendWebSocketJson(socket, { type: "live_state_changed", version: liveStateVersion });
-  socket.on("close", () => liveStateClients.delete(socket));
-  socket.on("error", () => liveStateClients.delete(socket));
-});
-
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  if (![SETTINGS_USERS_WS_PATH, LIVE_STATE_WS_PATH].includes(url.pathname)) {
+  if (url.pathname !== SETTINGS_USERS_WS_PATH) {
     return;
   }
 
@@ -9229,9 +9274,8 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  const target = url.pathname === LIVE_STATE_WS_PATH ? liveStateWss : settingsUsersWss;
-  target.handleUpgrade(req, socket, head, (ws) => {
-    target.emit("connection", ws, req, {
+  settingsUsersWss.handleUpgrade(req, socket, head, (ws) => {
+    settingsUsersWss.emit("connection", ws, req, {
       sessionId: session.id,
     });
   });
@@ -9270,6 +9314,7 @@ async function startServer() {
   });
   questService = new QuestService({ db, financialService, persist });
   questService.ensureState();
+  primeLiveStateSignatures();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));
 
   const listeningPort = await listenOnAvailablePort(server, port);
