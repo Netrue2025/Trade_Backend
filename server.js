@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 const { WebSocketServer } = require("ws");
@@ -45,7 +46,7 @@ function loadEnvFile() {
 loadEnvFile();
 
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
-const { createUserFinancialLock } = require("./lib/financialIntegrity");
+const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -162,7 +163,7 @@ const digitalServiceOrderRequests = new Map();
 const membershipPurchaseRequests = new Map();
 const tradeJoinRequests = new Set();
 const runWithUserFinancialLock = createUserFinancialLock();
-let financialPersistenceFailure = null;
+const financialRequestState = new AsyncLocalStorage();
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
 const subscriberModel = new SubscriberModel();
@@ -286,25 +287,31 @@ function persist({ required = false } = {}) {
 
   egressMetrics.saveDbCount += 1;
   egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
+  const requestState = financialRequestState.getStore();
+  const durabilityRequired = required || !!requestState?.durableMutation;
   const operation = saveDb().then(() => scheduleLiveStateBroadcast()).catch((error) => {
     console.error("Failed to persist application state:", error.message);
-    if (required) {
-      financialPersistenceFailure = error;
-      console.error("FINANCIAL_PERSISTENCE_FROZEN", { reason: error.message || String(error) });
+    if (durabilityRequired) {
+      financialIntegrity.freeze(error.message || String(error));
       throw error;
     }
   });
+  if (durabilityRequired && requestState) requestState.pending.add(operation);
   return operation;
 }
 
-function withUserFinancialLock(userId, operation) {
-  if (financialPersistenceFailure) {
-    throw Object.assign(new Error("Financial operations are temporarily unavailable because durable storage failed."), { code: "FINANCIAL_PERSISTENCE_UNAVAILABLE" });
+function markRequestDurableMutation(operation) {
+  const requestState = financialRequestState.getStore();
+  if (requestState) {
+    requestState.durableMutation = true;
+    requestState.operations.add(String(operation || "unknown"));
   }
+}
+
+function withUserFinancialLock(userId, operation) {
+  financialIntegrity.assertWritable();
   return runWithUserFinancialLock(userId, async () => {
-    if (financialPersistenceFailure) {
-      throw Object.assign(new Error("Financial operations are temporarily unavailable because durable storage failed."), { code: "FINANCIAL_PERSISTENCE_UNAVAILABLE" });
-    }
+    financialIntegrity.assertWritable();
     return operation();
   });
 }
@@ -772,7 +779,7 @@ function readRawBody(req) {
   });
 }
 
-function sendJson(res, statusCode, payload, extraHeaders = {}) {
+function writeJson(res, statusCode, payload, extraHeaders = {}) {
   const body = Buffer.from(JSON.stringify(payload));
   const route = res._routePath || "unknown";
   egressMetrics.responseBytesByRoute[route] = (egressMetrics.responseBytesByRoute[route] || 0) + body.length;
@@ -790,6 +797,22 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(responseBody);
+}
+
+function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  const requestState = financialRequestState.getStore();
+  if (statusCode < 400 && requestState?.durableMutation && requestState.pending.size) {
+    const pending = [...requestState.pending];
+    requestState.pending.clear();
+    Promise.all(pending).then(() => writeJson(res, statusCode, payload, extraHeaders)).catch(() => {
+      writeJson(res, 503, {
+        error: "Financial operations are temporarily unavailable. Please try again shortly.",
+        code: "FINANCIAL_SERVICE_TEMPORARILY_UNAVAILABLE",
+      });
+    });
+    return;
+  }
+  writeJson(res, statusCode, payload, extraHeaders);
 }
 
 function sendText(res, statusCode, payload, contentType = "text/plain; charset=utf-8") {
@@ -5241,6 +5264,7 @@ async function handleApi(req, res, url) {
     sendJson(res, 200, {
       ok: true,
       storage: shouldUseMongo() ? "mongodb" : "local-json",
+      financialIntegrity: financialIntegrity.getStatus(),
     });
     return true;
   }
@@ -5885,6 +5909,7 @@ async function handleApi(req, res, url) {
         amountCharged: price.sellingPrice,
         markupAmount: price.markupAmount,
       }, getRequestMeta(req));
+      await persist({ required: true });
       try {
         const providerResponse = await vtuService.purchaseAirtime({
           requestId: transaction.requestId,
@@ -5962,6 +5987,7 @@ async function handleApi(req, res, url) {
         amountCharged: plan.sellingPrice,
         markupAmount: subtract(plan.sellingPrice, plan.providerCost),
       }, getRequestMeta(req));
+      await persist({ required: true });
       try {
         const providerResponse = await vtuService.purchaseData({
           requestId: transaction.requestId,
@@ -6391,6 +6417,7 @@ async function handleApi(req, res, url) {
         }
       }
       const withdrawal = financialService.createWithdrawal(user, body, getRequestMeta(req));
+      await persist({ required: true });
       if (withdrawal.currency === "NGN") {
         const sent = await sendWithdrawalTelegramMessage(withdrawal, "NEW WITHDRAWAL REQUEST", [
           "Status: Pending Admin Approval",
@@ -9114,7 +9141,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    const handled = await handleApi(req, res, url);
+    const handled = await financialRequestState.run(
+      { durableMutation: false, pending: new Set(), operations: new Set() },
+      () => handleApi(req, res, url),
+    );
     if (handled) {
       return;
     }
@@ -9238,12 +9268,15 @@ async function startServer() {
   paystackService.validateProductionEnvironment();
   db = await loadDb();
   setAuthoritativeDbProvider(() => db);
+  financialIntegrity.registerAuthoritativeState();
   ensureAdminUser(db);
   pushNotificationService = new PushNotificationService({ db, persist, logger: console });
   emailNotificationService = new EmailNotificationService({ logger: console });
   financialService = new FinancialService({
     db,
     persist,
+    financialIntegrity,
+    onDurableMutation: markRequestDurableMutation,
     notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
     emailPublisher: (message) => emailNotificationService.sendAdminOtpRequest(message),
   });
@@ -9260,13 +9293,10 @@ async function startServer() {
     emmaService: emmaResellerService,
     efemService: efemResellerService,
     persistPaidOrder: async () => {
-      egressMetrics.saveDbCount += 1;
-      egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
-      await saveDb(db);
-      scheduleLiveStateBroadcast();
+      await persist({ required: true });
     },
   });
-  questService = new QuestService({ db, financialService, persist });
+  questService = new QuestService({ db, financialService, persist, financialIntegrity });
   questService.ensureState();
   primeLiveStateSignatures();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));

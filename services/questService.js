@@ -124,12 +124,13 @@ function createDefaultQuest(clock, idGenerator) {
 }
 
 class QuestService {
-  constructor({ db, financialService, persist = () => undefined, idGenerator = randomId, clock = () => new Date().toISOString() } = {}) {
+  constructor({ db, financialService, persist = () => undefined, idGenerator = randomId, clock = () => new Date().toISOString(), financialIntegrity = null } = {}) {
     this.db = db;
     this.financialService = financialService;
     this.persist = persist;
     this.idGenerator = idGenerator;
     this.clock = clock;
+    this.financialIntegrity = financialIntegrity;
   }
 
   ensureState() {
@@ -628,6 +629,7 @@ class QuestService {
   }
 
   redeemReward(user, sessionId, requestMeta = {}) {
+    this.financialIntegrity?.assertWritable();
     this.ensureState();
     const session = this.requireUserSession(user, sessionId);
     const reward = this.requireSessionReward(user, session);

@@ -1214,6 +1214,9 @@ class DigitalServicesService {
     if (order.paymentMethod === "paystack" || order.fulfillmentMode === "manual") {
       return order;
     }
+    if (typeof this.persistPaidOrder === "function") {
+      await this.persistPaidOrder();
+    }
     const fulfilled = await this.fulfillPaidOrder(order.id, user, requestMeta);
     this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order: fulfilled });
     return fulfilled;

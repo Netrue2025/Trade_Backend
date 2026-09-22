@@ -386,13 +386,30 @@ function toDecimalText(value, fallback = "0") {
 }
 
 class FinancialService {
-  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso, notificationPublisher = null, emailPublisher = null } = {}) {
+  constructor({ db, persist = () => undefined, idGenerator = randomId, clock = nowIso, notificationPublisher = null, emailPublisher = null, financialIntegrity = null, onDurableMutation = null } = {}) {
     this.db = db;
     this.persist = persist;
     this.idGenerator = idGenerator;
     this.clock = clock;
     this.notificationPublisher = notificationPublisher;
     this.emailPublisher = emailPublisher;
+    this.financialIntegrity = financialIntegrity;
+    this.onDurableMutation = onDurableMutation;
+    if (financialIntegrity) {
+      return new Proxy(this, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver);
+          if (typeof value !== "function" || property === "constructor") return value;
+          const isDurableMutation = /\bthis\.persist\(\)/.test(value.toString());
+          if (!isDurableMutation) return value.bind(receiver);
+          return (...args) => {
+            financialIntegrity.assertWritable();
+            onDurableMutation?.(String(property));
+            return value.apply(receiver, args);
+          };
+        },
+      });
+    }
   }
 
   ensureState() {

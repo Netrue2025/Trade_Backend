@@ -1,7 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createUserFinancialLock, auditFinancialIntegrity } = require("../lib/financialIntegrity");
+const { FinancialIntegrityState, createUserFinancialLock, auditFinancialIntegrity } = require("../lib/financialIntegrity");
 const { saveDb, setAuthoritativeDbProvider } = require("../lib/db");
+const { FinancialService } = require("../services/financialService");
+const { QuestService } = require("../services/questService");
 
 test("same-user financial deltas serialize and read the latest balance inside the lock", async () => {
   const withUserLock = createUserFinancialLock();
@@ -57,4 +59,71 @@ test("read-only integrity audit finds duplicate and missing settlement reference
   assert.deepEqual(result.duplicateSettlementReferences, ["trade-settlement:investment-1"]);
   assert.equal(result.missingSettlementReferences[0].investmentId, "investment-2");
   assert.deepEqual(result.candidateUserIds, ["user-1"]);
+});
+
+test("financial integrity freeze is sticky until a new process authority is created", () => {
+  const integrity = new FinancialIntegrityState();
+  integrity.registerAuthoritativeState();
+  assert.doesNotThrow(() => integrity.assertWritable());
+  integrity.freeze("forced persistence failure");
+  integrity.registerAuthoritativeState();
+  assert.throws(() => integrity.assertWritable(), (error) => error.statusCode === 503 && error.code === "FINANCIAL_SERVICE_TEMPORARILY_UNAVAILABLE");
+  assert.throws(() => integrity.assertPersistenceAllowed(), (error) => error.code === "APP_STATE_PERSISTENCE_FROZEN");
+
+  const restarted = new FinancialIntegrityState();
+  restarted.registerAuthoritativeState();
+  assert.doesNotThrow(() => restarted.assertWritable());
+});
+
+test("a global freeze blocks financial and unrelated durable mutations before state changes", () => {
+  const integrity = new FinancialIntegrityState();
+  integrity.registerAuthoritativeState();
+  let saves = 0;
+  const db = { users: [{ id: "admin-1", role: "admin" }, { id: "user-1", role: "user", name: "Ada", email: "ada@example.com" }] };
+  const service = new FinancialService({
+    db,
+    persist: () => { saves += 1; },
+    financialIntegrity: integrity,
+    idGenerator: (() => { let id = 0; return () => `id-${++id}`; })(),
+    clock: () => "2026-09-22T10:00:00.000Z",
+  });
+  service.ensureState();
+  const user = db.users[1];
+  const admin = db.users[0];
+  const wallet = service.ensureWallet(user.id, "NGN");
+  wallet.availableBalance = "10000";
+  const deposit = service.createDeposit(user, { amount: "1000", currency: "NGN", transactionHash: "freeze-test" });
+  const baseline = JSON.stringify(db);
+  const baselineSaves = saves;
+
+  integrity.freeze("forced trade persistence failure");
+  assert.throws(() => service.approveDeposit(admin, deposit.id), /temporarily unavailable/i);
+  assert.throws(() => service.createVtuTransaction(user, { type: "airtime", amount: "100", sellingPrice: "100", requestId: "vtu-freeze" }), /temporarily unavailable/i);
+  assert.throws(() => service.updateSettings(admin, { withdrawalFeeNgn: "200" }), /temporarily unavailable/i);
+  assert.equal(JSON.stringify(db), baseline);
+  assert.equal(saves, baselineSaves);
+});
+
+test("quest monetary redemption checks the shared gate before touching quest state", () => {
+  const integrity = new FinancialIntegrityState();
+  integrity.registerAuthoritativeState();
+  integrity.freeze("forced trade persistence failure");
+  const db = { quests: [], questSessions: [], questProgress: [], users: [] };
+  const before = JSON.stringify(db);
+  const service = new QuestService({ db, financialService: {}, financialIntegrity: integrity });
+  assert.throws(() => service.redeemReward({ id: "user-1" }, "session-1"), /temporarily unavailable/i);
+  assert.equal(JSON.stringify(db), before);
+});
+
+test("every FinancialService persist site is protected by the shared frozen gate", () => {
+  const integrity = new FinancialIntegrityState();
+  integrity.registerAuthoritativeState();
+  const service = new FinancialService({ db: {}, financialIntegrity: integrity });
+  const durableMethods = Object.getOwnPropertyNames(FinancialService.prototype)
+    .filter((name) => name !== "constructor" && /\bthis\.persist\(\)/.test(FinancialService.prototype[name]?.toString?.() || ""));
+  assert.equal(durableMethods.length, 74);
+  integrity.freeze("forced trade persistence failure");
+  for (const method of durableMethods) {
+    assert.throws(() => service[method](), (error) => error.code === "FINANCIAL_SERVICE_TEMPORARILY_UNAVAILABLE", method);
+  }
 });
