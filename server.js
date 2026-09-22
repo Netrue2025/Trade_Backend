@@ -8335,15 +8335,40 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
-    financialService.scanDuplicateUserReviews();
+    const page = Math.max(1, Number.parseInt(url.searchParams.get("page") || "1", 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "50", 10) || 50));
+    const query = String(url.searchParams.get("search") || "").trim().toLowerCase();
     const usdtNgnRate = await getUsdtToNgnRateFromBybitPage().catch(() => null);
+    const matchingUsers = db.users
+      .filter((user) => user.role === "user")
+      .filter((user) => !query || [user.id, user.name, user.firstName, user.lastName, user.email, user.username]
+        .some((value) => String(value || "").toLowerCase().includes(query)))
+      .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+    const total = matchingUsers.length;
+    const offset = (page - 1) * limit;
     const users = await Promise.all(
-      db.users
-        .filter((user) => user.role === "user")
-        .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
+      matchingUsers
+        .slice(offset, offset + limit)
         .map((user) => buildManagedUserSummary(user, usdtNgnRate))
     );
-    sendJson(res, 200, { users });
+    sendJson(res, 200, { users, page, limit, total, hasMore: offset + users.length < total });
+    return true;
+  }
+
+  const adminTradeParticipantsMatch = url.pathname.match(/^\/api\/admin\/trades\/([^/]+)\/participants$/);
+  if (req.method === "GET" && adminTradeParticipantsMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) {
+      return true;
+    }
+    const tradeId = decodeURIComponent(adminTradeParticipantsMatch[1] || "").trim();
+    const trade = db.tradeIntents.find((item) => String(item.id) === tradeId);
+    if (!trade) {
+      sendJson(res, 404, { error: "Trade not found." });
+      return true;
+    }
+    const summary = getTradeJoinedUsersSummary(trade);
+    sendJson(res, 200, { tradeId, participants: summary.users, total: summary.count });
     return true;
   }
 

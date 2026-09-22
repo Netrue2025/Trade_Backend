@@ -71,3 +71,19 @@ test("representative live-state projection remains a small KB-scale payload", ()
   };
   assert.ok(Buffer.byteLength(JSON.stringify(fixture)) < 4096);
 });
+
+test("admin user and trade participant reads are paginated, authorized, and persistence-free", () => {
+  const usersRoute = server.match(/if \(req\.method === "GET" && url\.pathname === "\/api\/admin\/users"\)[\s\S]*?const adminTradeParticipantsMatch/)?.[0] || "";
+  assert.match(usersRoute, /requireAuth\(req, res, "admin"\)/);
+  assert.match(usersRoute, /url\.searchParams\.get\("page"\)/);
+  assert.match(usersRoute, /url\.searchParams\.get\("limit"\)/);
+  assert.match(usersRoute, /url\.searchParams\.get\("search"\)/);
+  assert.match(usersRoute, /hasMore:/);
+  assert.doesNotMatch(usersRoute, /persist\(|saveDb|scanDuplicateUserReviews/);
+
+  const participantsRoute = server.match(/const adminTradeParticipantsMatch[\s\S]*?const adminUserFinanceMatch/)?.[0] || "";
+  assert.match(participantsRoute, /requireAuth\(req, res, "admin"\)/);
+  assert.match(participantsRoute, /getTradeJoinedUsersSummary\(trade\)/);
+  assert.match(participantsRoute, /participants: summary\.users/);
+  assert.doesNotMatch(participantsRoute, /persist\(|saveDb/);
+});
