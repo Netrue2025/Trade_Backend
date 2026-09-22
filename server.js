@@ -44,7 +44,8 @@ function loadEnvFile() {
 
 loadEnvFile();
 
-const { loadDb, saveDb, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
+const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
+const { createUserFinancialLock } = require("./lib/financialIntegrity");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -160,6 +161,8 @@ const loginAttemptBuckets = new Map();
 const digitalServiceOrderRequests = new Map();
 const membershipPurchaseRequests = new Map();
 const tradeJoinRequests = new Set();
+const runWithUserFinancialLock = createUserFinancialLock();
+let financialPersistenceFailure = null;
 const paymentAttemptBuckets = new Map();
 const tradeLearningService = new TradeLearningService();
 const subscriberModel = new SubscriberModel();
@@ -276,15 +279,48 @@ function isAuthorizedSignalIngestRequest(req) {
   return false;
 }
 
-function persist() {
+function persist({ required = false } = {}) {
   if (!db) {
-    return;
+    return required ? Promise.reject(new Error("Application state is unavailable.")) : Promise.resolve();
   }
 
   egressMetrics.saveDbCount += 1;
   egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
-  saveDb(db).then(() => scheduleLiveStateBroadcast()).catch((error) => {
+  const operation = saveDb().then(() => scheduleLiveStateBroadcast()).catch((error) => {
     console.error("Failed to persist application state:", error.message);
+    if (required) {
+      financialPersistenceFailure = error;
+      console.error("FINANCIAL_PERSISTENCE_FROZEN", { reason: error.message || String(error) });
+      throw error;
+    }
+  });
+  return operation;
+}
+
+function withUserFinancialLock(userId, operation) {
+  if (financialPersistenceFailure) {
+    throw Object.assign(new Error("Financial operations are temporarily unavailable because durable storage failed."), { code: "FINANCIAL_PERSISTENCE_UNAVAILABLE" });
+  }
+  return runWithUserFinancialLock(userId, async () => {
+    if (financialPersistenceFailure) {
+      throw Object.assign(new Error("Financial operations are temporarily unavailable because durable storage failed."), { code: "FINANCIAL_PERSISTENCE_UNAVAILABLE" });
+    }
+    return operation();
+  });
+}
+
+function markFinancialMutation(wallets, reason, reference) {
+  const touched = Array.isArray(wallets) ? wallets : [wallets];
+  for (const wallet of touched.filter(Boolean)) {
+    wallet.revision = Math.max(0, Number(wallet.revision || 0)) + 1;
+    wallet.updatedAt = nowIso();
+  }
+  db.meta = db.meta || {};
+  db.meta.stateRevision = Math.max(0, Number(db.meta.stateRevision || 0)) + 1;
+  console.info("FINANCIAL_MUTATION", {
+    reason: String(reason || "UNKNOWN"),
+    reference: String(reference || ""),
+    stateRevision: db.meta.stateRevision,
   });
 }
 
@@ -3851,63 +3887,40 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     : Number(investment.baselinePnlPercent || 0);
   const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
   const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
-  const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
-  let settlement;
-  let releaseError = "";
+  return withUserFinancialLock(user.id, async () => {
+    const currentInvestment = ensureTradeInvestmentsState().find((item) => item.id === investment.id);
+    if (!currentInvestment || currentInvestment.status !== "ACTIVE") return currentInvestment || investment;
+    const settlementReference = `trade-settlement:${currentInvestment.id}`;
+    const existingTransaction = db.transactions.find((item) => item.reference === settlementReference);
+    if (existingTransaction) return currentInvestment;
 
-  try {
-    settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
-  } catch (error) {
-    releaseError = error.message || String(error);
-    settlement = {
-      releasedPrincipalUsdt: "0",
-      netSettlementUsdt: "0",
-      releasedSources: [],
-    };
-  }
+    const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
+    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, settledPnlUsdt);
+    const touchedWallets = settlement.releasedSources.map((source) => financialService.ensureWallet(user.id, source.currency));
+    if (!touchedWallets.length) touchedWallets.push(financialService.ensureWallet(user.id, "USDT"));
+    markFinancialMutation(touchedWallets, "TRADE_SETTLEMENT", settlementReference);
+    const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
+    currentInvestment.status = "STOPPED";
+    currentInvestment.stoppedAt = nowIso();
+    currentInvestment.updatedAt = currentInvestment.stoppedAt;
+    currentInvestment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
+    currentInvestment.settledPnlUsdt = settledPnlUsdt;
+    currentInvestment.netSettlementUsdt = settlement.netSettlementUsdt;
+    currentInvestment.stopReason = options.reason || (trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND");
 
-  const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
-  investment.status = "STOPPED";
-  investment.stoppedAt = nowIso();
-  investment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
-  investment.settledPnlUsdt = settledPnlUsdt;
-  investment.netSettlementUsdt = settlement.netSettlementUsdt;
-  investment.stopReason = options.reason || (trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND");
-
-  db.transactions.unshift({
-    id: randomId(12),
-    userId: user.id,
-    type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
-    currency: "USDT",
-    amount: settledPnlUsdt,
-    balanceBefore,
-    balanceAfter,
-    reference: investment.id,
-    status: "APPROVED",
-    description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
-    createdBy: options.createdBy || "system",
-    createdAt: nowIso(),
-    metadata: {
-      tradeId: investment.tradeId,
-      pnlPercent: toMoneyDecimal(pnlDeltaPercent),
-      lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING",
-      releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
-      netSettlementUsdt: settlement.netSettlementUsdt,
-      releasedSources: settlement.releasedSources,
-      releaseError,
-    },
+    db.transactions.unshift({
+      id: randomId(12), userId: user.id,
+      type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
+      currency: "USDT", amount: settledPnlUsdt, balanceBefore, balanceAfter,
+      reference: settlementReference, status: "APPROVED",
+      description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
+      createdBy: options.createdBy || "system", createdAt: nowIso(),
+      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, pnlPercent: toMoneyDecimal(pnlDeltaPercent), lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
+    });
+    financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade settled", message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`, entityType: "Trade", entityId: currentInvestment.tradeId });
+    await persist({ required: true });
+    return currentInvestment;
   });
-
-  financialService.createNotification({
-    userId: user.id,
-    type: "TRADE",
-    title: "Trade settled",
-    message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`,
-    entityType: "Trade",
-    entityId: investment.tradeId,
-  });
-
-  return investment;
 }
 
 async function settleInactiveTradeInvestmentsForUsers(options = {}) {
@@ -3933,10 +3946,6 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
     }));
   }
 
-  if (settled.length) {
-    persist();
-  }
-
   return settled;
 }
 
@@ -3960,10 +3969,6 @@ async function settleClosedTradeInvestments(trade, options = {}) {
       description: options.description || `${trade.symbol} investment settled.`,
       createdBy: options.createdBy || "system",
     }));
-  }
-
-  if (settled.length) {
-    persist();
   }
 
   return settled;
@@ -8447,52 +8452,24 @@ async function handleApi(req, res, url) {
         return true;
       }
       await assertTradeCanAcceptInvestment(trade);
-      if (getUserTradeInvestmentRecord(trade.id, targetUser.id)) {
-        sendJson(res, 400, { error: "User already joined this trade and cannot join it again." });
-        return true;
-      }
-
-      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id);
-      try {
-        validateTradeJoinAmount(amountUsdt, freeUsdt);
-      } catch (error) {
-        throw new Error(error.message.replace("your free balance", "this user's free balance"));
-      }
-      const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(targetUser);
-
-      const investmentId = randomId(12);
-      const fundingSources = reserveTradeInvestmentFunds(targetUser, amountUsdt, investmentId, admin.id);
       const marketCache = new Map();
       const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
       const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
-      const investment = {
-        id: investmentId,
-        userId: targetUser.id,
-        tradeId: trade.id,
-        amountUsdt,
-        fundingSources,
-        baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
-        baselinePrice: String(Number(baselinePrice || 0).toFixed(8)),
-        status: "ACTIVE",
-        joinedAt: nowIso(),
-        stoppedAt: null,
-        settledPnlUsdt: "0",
-        joinedBy: admin.id,
-        membershipAtJoin: membershipAtJoin.plan,
-      };
-      ensureTradeInvestmentsState().unshift(investment);
-      financialService.createNotification({
-        userId: targetUser.id,
-        type: "TRADE",
-        title: "Trade joined",
-        message: `Admin added you to ${trade.symbol}.`,
-        entityType: "Trade",
-        entityId: trade.id,
-        category: "tradingSignals",
-        route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
+      const investment = await withUserFinancialLock(targetUser.id, async () => {
+        if (getUserTradeInvestmentRecord(trade.id, targetUser.id)) throw new Error("User already joined this trade and cannot join it again.");
+        const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id);
+        try { validateTradeJoinAmount(amountUsdt, freeUsdt); } catch (error) { throw new Error(error.message.replace("your free balance", "this user's free balance")); }
+        const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(targetUser);
+        const investmentId = randomId(12);
+        const fundingSources = reserveTradeInvestmentFunds(targetUser, amountUsdt, investmentId, admin.id);
+        markFinancialMutation(fundingSources.map((source) => financialService.ensureWallet(targetUser.id, source.currency)), "ADMIN_TRADE_JOIN", investmentId);
+        const nextInvestment = { id: investmentId, userId: targetUser.id, tradeId: trade.id, amountUsdt, fundingSources, baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))), baselinePrice: String(Number(baselinePrice || 0).toFixed(8)), status: "ACTIVE", joinedAt: nowIso(), updatedAt: nowIso(), stoppedAt: null, settledPnlUsdt: "0", joinedBy: admin.id, membershipAtJoin: membershipAtJoin.plan };
+        ensureTradeInvestmentsState().unshift(nextInvestment);
+        financialService.createNotification({ userId: targetUser.id, type: "TRADE", title: "Trade joined", message: `Admin added you to ${trade.symbol}.`, entityType: "Trade", entityId: trade.id, category: "tradingSignals", route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}` });
+        financialService.notifyAdminTradeJoined(targetUser, nextInvestment, trade);
+        await persist({ required: true });
+        return nextInvestment;
       });
-      financialService.notifyAdminTradeJoined(targetUser, investment, trade);
-      persist();
       scheduleSettingsUsersBroadcast("admin_user_trade_joined");
       sendJson(res, 201, {
         investment: serializeTradeInvestment(investment),
@@ -8794,48 +8771,33 @@ async function handleApi(req, res, url) {
         return true;
       }
       await assertTradeCanAcceptInvestment(trade);
-      if (getUserTradeInvestmentRecord(trade.id, user.id)) {
-        sendJson(res, 400, { error: "You already joined this trade and cannot join it again." });
-        return true;
-      }
-
-      const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
-      validateTradeJoinAmount(amountUsdt, freeUsdt);
-      const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(user);
-
-      const investmentId = randomId(12);
-      const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
       const marketCache = new Map();
       const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
       const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
-      const investment = {
-        id: investmentId,
-        userId: user.id,
-        tradeId: trade.id,
-        amountUsdt,
-        fundingSources,
-        baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
-        baselinePrice: String(Number(baselinePrice || 0).toFixed(8)),
-        status: "ACTIVE",
-        joinedAt: nowIso(),
-        stoppedAt: null,
-        settledPnlUsdt: "0",
-        membershipAtJoin: membershipAtJoin.plan,
-      };
-      ensureTradeInvestmentsState().unshift(investment);
-      financialService.createNotification({
-        userId: user.id,
-        type: "TRADE",
-        title: "Trade joined",
-        message: `You joined ${trade.symbol}.`,
-        entityType: "Trade",
-        entityId: trade.id,
-        category: "tradingSignals",
-        route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}`,
+      const investment = await withUserFinancialLock(user.id, async () => {
+        if (getUserTradeInvestmentRecord(trade.id, user.id)) {
+          throw new Error("You already joined this trade and cannot join it again.");
+        }
+        const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
+        validateTradeJoinAmount(amountUsdt, freeUsdt);
+        const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(user);
+        const investmentId = randomId(12);
+        const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
+        markFinancialMutation(fundingSources.map((source) => financialService.ensureWallet(user.id, source.currency)), "TRADE_JOIN", investmentId);
+        const nextInvestment = {
+          id: investmentId, userId: user.id, tradeId: trade.id, amountUsdt, fundingSources,
+          baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
+          baselinePrice: String(Number(baselinePrice || 0).toFixed(8)), status: "ACTIVE",
+          joinedAt: nowIso(), updatedAt: nowIso(), stoppedAt: null, settledPnlUsdt: "0",
+          membershipAtJoin: membershipAtJoin.plan,
+        };
+        ensureTradeInvestmentsState().unshift(nextInvestment);
+        financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade joined", message: `You joined ${trade.symbol}.`, entityType: "Trade", entityId: trade.id, category: "tradingSignals", route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}` });
+        financialService.notifyAdminTradeJoined(user, nextInvestment, trade);
+        financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
+        await persist({ required: true });
+        return nextInvestment;
       });
-      financialService.notifyAdminTradeJoined(user, investment, trade);
-      financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
-      persist();
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id), membership: financialService.getMembershipSummary(user) });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "", ...(error.membership || {}) });
@@ -8863,40 +8825,7 @@ async function handleApi(req, res, url) {
         return true;
       }
       const marketCache = new Map();
-      const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
-      const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
-      const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
-      const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
-      const settlement = releaseTradeInvestmentFunds(user, investment, settledPnlUsdt);
-      const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
-      investment.status = "STOPPED";
-      investment.stoppedAt = nowIso();
-      investment.stopPnlPercent = String(Number(currentPnlPercent.toFixed(8)));
-      investment.settledPnlUsdt = settledPnlUsdt;
-      investment.netSettlementUsdt = settlement.netSettlementUsdt;
-      investment.stopReason = "USER_STOPPED";
-      db.transactions.unshift({
-        id: randomId(12),
-        userId: user.id,
-        type: compare(settledPnlUsdt, "0") >= 0 ? "TRADING_PROFIT" : "TRADING_LOSS",
-        currency: "USDT",
-        amount: settledPnlUsdt,
-        balanceBefore,
-        balanceAfter,
-        reference: investment.id,
-        status: "APPROVED",
-        description: `Stopped ${trade.symbol} investment.`,
-        createdBy: user.id,
-        createdAt: nowIso(),
-        metadata: {
-          tradeId: trade.id,
-          baselinePnlPercent: investment.baselinePnlPercent,
-          stopPnlPercent: investment.stopPnlPercent,
-          releasedPrincipalUsdt: settlement.releasedPrincipalUsdt,
-          netSettlementUsdt: settlement.netSettlementUsdt,
-          releasedSources: settlement.releasedSources,
-        },
-      });
+      const settledInvestment = await settleTradeInvestment(user, investment, trade, marketCache, { reason: "USER_STOPPED", description: `Stopped ${trade.symbol} investment.`, createdBy: user.id });
       financialService.createNotification({
         userId: user.id,
         type: "TRADE_CANCELED",
@@ -8907,8 +8836,7 @@ async function handleApi(req, res, url) {
         category: "tradingSignals",
         route: `/?tab=history&trade=${encodeURIComponent(trade.id)}`,
       });
-      persist();
-      sendJson(res, 200, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id) });
+      sendJson(res, 200, { investment: serializeTradeInvestment(settledInvestment), trade: serializeTradeForUser(trade, user.id) });
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
@@ -9309,6 +9237,7 @@ server.on("upgrade", (req, socket, head) => {
 async function startServer() {
   paystackService.validateProductionEnvironment();
   db = await loadDb();
+  setAuthoritativeDbProvider(() => db);
   ensureAdminUser(db);
   pushNotificationService = new PushNotificationService({ db, persist, logger: console });
   emailNotificationService = new EmailNotificationService({ logger: console });

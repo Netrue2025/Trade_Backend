@@ -2032,6 +2032,7 @@ class FinancialService {
         currency: normalizedCurrency,
         availableBalance: "0",
         lockedBalance: "0",
+        revision: 0,
         createdAt: this.clock(),
         updatedAt: this.clock(),
       };
@@ -2041,6 +2042,7 @@ class FinancialService {
       const lockedFallback = wallet.lockedBalance ?? wallet.locked ?? "0";
       wallet.availableBalance = normalizeNonNegativeAmount(availableFallback, "Available balance");
       wallet.lockedBalance = normalizeNonNegativeAmount(lockedFallback, "Locked balance");
+      wallet.revision = Math.max(0, Number(wallet.revision || 0));
     }
     return wallet;
   }
