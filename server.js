@@ -281,7 +281,7 @@ function isAuthorizedSignalIngestRequest(req) {
   return false;
 }
 
-function persist({ required = false } = {}) {
+function persist({ required = false, operation = null } = {}) {
   if (!db) {
     return required ? Promise.reject(new Error("Application state is unavailable.")) : Promise.resolve();
   }
@@ -290,15 +290,27 @@ function persist({ required = false } = {}) {
   egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
   const requestState = financialRequestState.getStore();
   const durabilityRequired = required || !!requestState?.durableMutation;
-  const operation = saveDb().then(() => scheduleLiveStateBroadcast()).catch((error) => {
+  const persistenceContext = operation || requestState?.lastMutation || (
+    requestState?.operations?.size
+      ? { reason: [...requestState.operations].join(",") }
+      : null
+  );
+  const saveOperation = saveDb(undefined, { context: persistenceContext }).then(() => scheduleLiveStateBroadcast()).catch((error) => {
+    const failureContext = {
+      ...(persistenceContext || {}),
+      saveId: error.persistence?.saveId || null,
+      fields: error.persistence?.changedFields || [],
+      payloadBytes: error.persistence?.payloadBytes || 0,
+      errorClass: error.cause?.constructor?.name || error.constructor?.name || "Error",
+    };
     console.error("Failed to persist application state:", error.message);
     if (durabilityRequired) {
-      financialIntegrity.freeze(error.message || String(error));
+      financialIntegrity.freeze(error.message || String(error), failureContext);
       throw error;
     }
   });
-  if (durabilityRequired && requestState) requestState.pending.add(operation);
-  return operation;
+  if (durabilityRequired && requestState) requestState.pending.add(saveOperation);
+  return saveOperation;
 }
 
 function markRequestDurableMutation(operation) {
@@ -330,6 +342,14 @@ function markFinancialMutation(wallets, reason, reference) {
     reference: String(reference || ""),
     stateRevision: db.meta.stateRevision,
   });
+  const requestState = financialRequestState.getStore();
+  if (requestState) {
+    requestState.lastMutation = {
+      reason: String(reason || "UNKNOWN"),
+      reference: String(reference || ""),
+      userId: String(touched.find(Boolean)?.userId || ""),
+    };
+  }
 }
 
 function persistSignalState() {
@@ -3943,7 +3963,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, pnlPercent: toMoneyDecimal(pnlDeltaPercent), lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
     });
     financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade settled", message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`, entityType: "Trade", entityId: currentInvestment.tradeId });
-    await persist({ required: true });
+    await persist({ required: true, operation: { reason: "TRADE_SETTLEMENT", reference: settlementReference, userId: user.id } });
     return currentInvestment;
   });
 }
@@ -5287,6 +5307,16 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
     const user = getCurrentUser(req);
     sendJson(res, 200, { user: user ? { ...sanitizeUser(user), membership: financialService.getMembershipSummary(user) } : null, exchanges: listExchanges() });
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/persistence-status") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    sendJson(res, 200, {
+      storage: shouldUseMongo() ? "mongodb" : "local-json",
+      financialIntegrity: financialIntegrity.getStatus({ includeReason: true }),
+    });
     return true;
   }
 

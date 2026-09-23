@@ -4,6 +4,10 @@ const assert = require("node:assert/strict");
 const { __testing, mergeMongoSnapshots, saveDb, shouldUseMongo } = require("../lib/db");
 const { TradeLearningService } = require("../services/tradeLearning");
 
+test.beforeEach(() => {
+  __testing.resetMongoPersistedBaseline();
+});
+
 const mongoEnvKeys = [
   "MONGODB_URI",
   "MONGO_URI",
@@ -417,6 +421,140 @@ test("projected startup and subsequent save preserve unknown top-level Mongo fie
 
   assert.deepEqual(document.futureStateSection, { retained: true });
   assert.equal(document.wallets[0].availableBalance, "6000");
+});
+
+test("incremental save sends only changed canonical fields", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({
+    wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "100" }],
+    idempotencyKeys: [{ id: "large-idempotency-state", response: "x".repeat(10000) }],
+    auditLogs: [{ id: "large-audit-state", metadata: "x".repeat(10000) }],
+    notifications: [{ id: "notification-1", message: "Keep me" }],
+  });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const next = JSON.parse(JSON.stringify(baseline));
+  next.wallets[0].availableBalance = "125";
+  const updates = [];
+  const collection = {
+    async updateOne(_filter, update) {
+      updates.push(update);
+      return { acknowledged: true };
+    },
+  };
+
+  await __testing.saveMongoSnapshot(collection, next, { logger: createMemoryLogger(), saveId: 7 });
+
+  assert.equal(updates.length, 1);
+  assert.deepEqual(Object.keys(updates[0].$set), ["wallets"]);
+  assert.equal(updates[0].$set.idempotencyKeys, undefined);
+  assert.equal(updates[0].$set.auditLogs, undefined);
+  assert.equal(updates[0].$set.notifications, undefined);
+});
+
+test("financial multi-field mutation is persisted in one atomic update", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [], tradeInvestments: [], idempotencyKeys: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const next = JSON.parse(JSON.stringify(baseline));
+  next.wallets.push({ userId: "user-1", currency: "NGN", availableBalance: "900" });
+  next.transactions.push({ id: "txn-1", reference: "trade-settlement:investment-1" });
+  next.tradeInvestments.push({ id: "investment-1", userId: "user-1", status: "STOPPED" });
+  next.idempotencyKeys.push({ id: "settlement-1", key: "investment-1" });
+  const updates = [];
+
+  await __testing.saveMongoSnapshot({
+    async updateOne(_filter, update) {
+      updates.push(update);
+      return { acknowledged: true };
+    },
+  }, next, { logger: createMemoryLogger(), saveId: 8 });
+
+  assert.equal(updates.length, 1);
+  assert.deepEqual(Object.keys(updates[0].$set).sort(), ["idempotencyKeys", "tradeInvestments", "transactions", "wallets"]);
+});
+
+test("no-change save performs no Mongo update", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  let updateCount = 0;
+  const logger = createMemoryLogger();
+
+  await __testing.saveMongoSnapshot({
+    async updateOne() {
+      updateCount += 1;
+    },
+  }, baseline, { logger, saveId: 9 });
+
+  assert.equal(updateCount, 0);
+  assert.equal(logger.entries.some((entry) => entry.message.includes("update skipped saveId=9")), true);
+});
+
+test("failed incremental update does not advance persisted baseline", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "100" }] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const next = JSON.parse(JSON.stringify(baseline));
+  next.wallets[0].availableBalance = "200";
+  const updates = [];
+  let fail = true;
+  const collection = {
+    async updateOne(_filter, update) {
+      updates.push(update);
+      if (fail) throw new Error("simulated timeout");
+      return { acknowledged: true };
+    },
+  };
+
+  await assert.rejects(
+    () => __testing.saveMongoSnapshot(collection, next, { logger: createMemoryLogger(), saveId: 10 }),
+    /simulated timeout/
+  );
+  assert.deepEqual(__testing.getChangedAppStateFields(next), ["wallets"]);
+  fail = false;
+  await __testing.saveMongoSnapshot(collection, next, { logger: createMemoryLogger(), saveId: 11 });
+  assert.equal(updates.length, 2);
+  assert.deepEqual(Object.keys(updates[1].$set), ["wallets"]);
+  assert.deepEqual(__testing.getChangedAppStateFields(next), []);
+});
+
+test("coalesced mutation during active incremental save persists in follow-up", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [], notifications: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const db = JSON.parse(JSON.stringify(baseline));
+  const firstUpdatePending = deferred();
+  const releaseFirst = deferred();
+  const updates = [];
+  const collection = {
+    async updateOne(_filter, update) {
+      updates.push(JSON.parse(JSON.stringify(update)));
+      if (updates.length === 1) {
+        firstUpdatePending.resolve();
+        await releaseFirst.promise;
+      }
+      return { acknowledged: true };
+    },
+  };
+  const controller = __testing.createAppStateSaveController({
+    logger: createMemoryLogger(),
+    isMongoEnabled: () => true,
+    getCollection: async () => collection,
+    getSlowWarningMs: () => 1000,
+  });
+
+  db.wallets.push({ userId: "user-1", currency: "NGN", availableBalance: "900" });
+  db.transactions.push({ id: "txn-1", reference: "trade-settlement:investment-1" });
+  const first = controller.requestSave(db);
+  await firstUpdatePending.promise;
+  db.notifications.push({ id: "notification-1", userId: "user-1", message: "Settled" });
+  const second = controller.requestSave(db);
+  releaseFirst.resolve();
+  await Promise.all([first, second]);
+
+  assert.equal(updates.length, 2);
+  assert.deepEqual(Object.keys(updates[0].$set).sort(), ["transactions", "wallets"]);
+  assert.deepEqual(Object.keys(updates[1].$set), ["notifications"]);
 });
 
 test("one persist request produces exactly one app-state save", async () => {
