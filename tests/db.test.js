@@ -154,25 +154,28 @@ test("mongo client options do not allow 1000ms production server selection", () 
   });
 });
 
-test("app-state full snapshot read timeout is not shorter than Mongo server selection", () => {
+test("app-state projected read timeout exceeds the recommended Mongo socket timeout", () => {
   withEnv(["MONGODB_APP_STATE_READ_TIMEOUT_MS"], {}, () => {
-    assert.equal(__testing.getAppStateReadTimeoutMs(), 20000);
+    assert.equal(__testing.getAppStateReadTimeoutMs(), 65000);
   });
   withEnv(["MONGODB_APP_STATE_READ_TIMEOUT_MS"], {
     MONGODB_APP_STATE_READ_TIMEOUT_MS: "8000",
   }, () => {
-    assert.equal(__testing.getAppStateReadTimeoutMs(), 10000);
+    assert.equal(__testing.getAppStateReadTimeoutMs(), 65000);
+  });
+  withEnv(["MONGODB_APP_STATE_READ_TIMEOUT_MS"], {
+    MONGODB_APP_STATE_READ_TIMEOUT_MS: "70000",
+  }, () => {
+    assert.equal(__testing.getAppStateReadTimeoutMs(), 70000);
   });
 });
 
-test("full snapshot read falls back to projected field reads on read failure", async () => {
+test("authoritative startup uses projected fields without starting a full-document read", async () => {
   let callCount = 0;
   const collection = {
     async findOne(_filter, options = {}) {
       callCount += 1;
-      if (!options.projection) {
-        throw new Error("simulated slow full read");
-      }
+      assert.ok(options.projection);
       const field = Object.keys(options.projection).find((key) => key !== "_id");
       return { _id: "trade-mvp-state", [field]: field === "users" ? [{ id: "user-1" }] : [] };
     },
@@ -185,12 +188,9 @@ test("full snapshot read falls back to projected field reads on read failure", a
   assert.deepEqual(snapshot.users, [{ id: "user-1" }]);
 });
 
-test("projected fallback preserves notifications and chatMessages", async () => {
+test("projected loader preserves notifications and chatMessages", async () => {
   const collection = {
     async findOne(_filter, options = {}) {
-      if (!options.projection) {
-        throw new Error("simulated slow full read");
-      }
       const field = Object.keys(options.projection).find((key) => key !== "_id");
       const values = {
         notifications: [{ id: "notification-1", userId: "admin", message: "Order ready" }],
@@ -230,14 +230,11 @@ test("startup refuses to bootstrap defaults when existing app_state cannot be re
   assert.equal(__testing.isMongoAppStatePersistenceReady(), false);
 });
 
-test("startup refuses to persist when projected fallback omits an app_state field", async () => {
+test("startup refuses to persist when projected loading omits an app_state field", async () => {
   __testing.resetMongoAppStatePersistenceReady();
   let insertCalled = false;
   const collection = {
     async findOne(_filter, options = {}) {
-      if (!options.projection) {
-        throw new Error("simulated full read timeout");
-      }
       const field = Object.keys(options.projection).find((key) => key !== "_id");
       if (field === "transactions") {
         return { _id: "trade-mvp-state" };
@@ -273,7 +270,7 @@ test("saveDb refuses Mongo writes before startup state is verified", async () =>
   });
 });
 
-test("projected startup fallback preserves users roles wallets and financial history through save and reload", async () => {
+test("projected startup preserves users roles wallets and financial history through save and reload", async () => {
   await withEnvAsync([
     "MONGODB_APP_STATE_BACKUPS_ENABLED",
     "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
@@ -299,9 +296,6 @@ test("projected startup fallback preserves users roles wallets and financial his
     let document = { _id: "trade-mvp-state", ...JSON.parse(JSON.stringify(baseline)) };
     const collection = {
       async findOne(_filter, options = {}) {
-        if (!options.projection) {
-          throw new Error("simulated full read timeout");
-        }
         const field = Object.keys(options.projection).find((key) => key !== "_id");
         return { _id: document._id, [field]: JSON.parse(JSON.stringify(document[field])) };
       },
@@ -354,10 +348,75 @@ test("projected startup fallback preserves users roles wallets and financial his
   });
 });
 
-test("projected fallback default concurrency is safer for M0", () => {
+test("projected loader defaults to sequential reads and caps configured concurrency", () => {
   withEnv(["MONGODB_APP_STATE_PROJECTION_CONCURRENCY"], {}, () => {
+    assert.equal(__testing.getAppStateProjectionConcurrency(), 1);
+  });
+  withEnv(["MONGODB_APP_STATE_PROJECTION_CONCURRENCY"], {
+    MONGODB_APP_STATE_PROJECTION_CONCURRENCY: "20",
+  }, () => {
     assert.equal(__testing.getAppStateProjectionConcurrency(), 2);
   });
+});
+
+for (const failedField of ["users", "wallets", "transactions", "idempotencyKeys"]) {
+  test(`failed ${failedField} projection blocks authoritative startup`, async () => {
+    __testing.resetMongoAppStatePersistenceReady();
+    let insertCalled = false;
+    const collection = {
+      async findOne(_filter, options = {}) {
+        const field = Object.keys(options.projection).find((key) => key !== "_id");
+        if (field === failedField) {
+          throw new Error(`simulated ${failedField} read failure`);
+        }
+        return { _id: "trade-mvp-state", [field]: [] };
+      },
+      async countDocuments() {
+        return 1;
+      },
+      async insertOne() {
+        insertCalled = true;
+      },
+    };
+
+    await assert.rejects(
+      () => __testing.loadDbFromMongoCollection(collection),
+      new RegExp(`projected read \\(${failedField}\\).*simulated ${failedField} read failure`)
+    );
+    assert.equal(insertCalled, false);
+    assert.equal(__testing.isMongoAppStatePersistenceReady(), false);
+  });
+}
+
+test("projected startup and subsequent save preserve unknown top-level Mongo fields", async () => {
+  __testing.resetMongoAppStatePersistenceReady();
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({
+    users: [{ id: "user-1", email: "admin@example.com", role: "admin" }],
+    wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "5000" }],
+  });
+  let document = {
+    _id: "trade-mvp-state",
+    ...JSON.parse(JSON.stringify(baseline)),
+    futureStateSection: { retained: true },
+  };
+  const collection = {
+    async findOne(_filter, options) {
+      const field = Object.keys(options.projection).find((key) => key !== "_id");
+      return { _id: document._id, [field]: JSON.parse(JSON.stringify(document[field])) };
+    },
+    async updateOne(_filter, update) {
+      document = { ...document, ...(update.$set || {}) };
+      return { acknowledged: true };
+    },
+  };
+
+  const loaded = await __testing.loadDbFromMongoCollection(collection);
+  loaded.wallets[0].availableBalance = "6000";
+  await __testing.saveMongoSnapshot(collection, loaded, { logger: createMemoryLogger() });
+
+  assert.deepEqual(document.futureStateSection, { retained: true });
+  assert.equal(document.wallets[0].availableBalance, "6000");
 });
 
 test("one persist request produces exactly one app-state save", async () => {
@@ -733,6 +792,7 @@ test("backup-due app-state save reads previous state, merges, updates, and backs
     const backups = [];
     const previous = {
       _id: "trade-mvp-state",
+      ...__testing.normalizeDb({}),
       wallets: [{ userId: "user-1", currency: "NGN", availableBalance: "9000", updatedAt: "2026-09-13T12:00:00.000Z" }],
       transactions: [{ id: "txn-current", amount: "-50", createdAt: "2026-09-13T12:00:00.000Z" }],
       systemSettings: {},
@@ -743,9 +803,10 @@ test("backup-due app-state save reads previous state, merges, updates, and backs
       systemSettings: {},
     };
     const collection = {
-      async findOne() {
+      async findOne(_filter, options) {
         findOneCalls += 1;
-        return JSON.parse(JSON.stringify(previous));
+        const field = Object.keys(options.projection).find((key) => key !== "_id");
+        return { _id: previous._id, [field]: JSON.parse(JSON.stringify(previous[field])) };
       },
       async updateOne(filter, update, options) {
         updates.push({ filter, update, options });
@@ -761,7 +822,7 @@ test("backup-due app-state save reads previous state, merges, updates, and backs
     });
     await waitFor(() => backups.length === 1, "backup capture");
 
-    assert.equal(findOneCalls, 1);
+    assert.equal(findOneCalls > 1, true);
     assert.equal(updates.length, 1);
     assert.equal(updates[0].update.$set.wallets[0].availableBalance, "9000");
     assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-current"), true);
