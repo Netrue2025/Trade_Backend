@@ -47,6 +47,7 @@ loadEnvFile();
 
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
+const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -3206,6 +3207,8 @@ async function reconcileTradeStatuses() {
     }
   }
 
+  await reconcileOrphanedClosedTradeInvestments();
+
   if (changed) {
     persist();
   }
@@ -4019,6 +4022,56 @@ async function settleClosedTradeInvestments(trade, options = {}) {
       description: options.description || `${trade.symbol} investment settled.`,
       createdBy: options.createdBy || "system",
     }));
+  }
+
+  return settled;
+}
+
+const loggedInvestmentRecoveryReviews = new Set();
+
+async function reconcileOrphanedClosedTradeInvestments() {
+  const candidates = ensureTradeInvestmentsState().filter((investment) => investment.status === "ACTIVE");
+  const marketCache = new Map();
+  const settled = [];
+
+  for (const investment of candidates) {
+    const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") continue;
+
+    const user = db.users.find((item) => item.id === investment.userId);
+    const assessment = assessClosedTradeInvestmentRecovery({
+      investment,
+      trade,
+      user,
+      transactions: db.transactions,
+      wallets: db.wallets,
+    });
+    if (!assessment.eligible) {
+      if (!loggedInvestmentRecoveryReviews.has(investment.id)) {
+        loggedInvestmentRecoveryReviews.add(investment.id);
+        console.error("INVESTMENT_RECONCILIATION_REVIEW_REQUIRED", {
+          investmentId: investment.id,
+          tradeId: investment.tradeId,
+          reasons: assessment.reasons,
+        });
+      }
+      continue;
+    }
+
+    try {
+      settled.push(await settleTradeInvestment(user, investment, trade, marketCache, {
+        reason: "TRADE_CLOSED_RECOVERY",
+        description: `${trade.symbol} investment settled after closed-trade recovery.`,
+        createdBy: "system",
+      }));
+    } catch (error) {
+      console.error("Closed-trade investment recovery failed", {
+        investmentId: investment.id,
+        tradeId: investment.tradeId,
+        error: error.message,
+      });
+      if (financialIntegrity.getStatus().persistenceFrozen) break;
+    }
   }
 
   return settled;
