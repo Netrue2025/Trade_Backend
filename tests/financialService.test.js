@@ -1617,7 +1617,7 @@ test("admin reply publishes message push notification", async () => {
   assert.equal(published[0].entityId, result.message.id);
 });
 
-test("chat notifications expire after 24 hours", () => {
+test("chat notifications expire from read views after 24 hours without read-triggered persistence", () => {
   const { admin, service, user } = createHarness();
 
   const messages = service.sendSupportMessage(user, {
@@ -1639,8 +1639,8 @@ test("chat notifications expire after 24 hours", () => {
 
   assert.equal(remaining.some((item) => item.type === "MESSAGE"), false);
   assert.equal(remaining.some((item) => item.type === "DEPOSIT"), true);
-  assert.equal(service.db.notifications.some((item) => item.type === "MESSAGE"), false);
-  assert.equal(service.db.chatMessages.length, 0);
+  assert.equal(service.db.notifications.some((item) => item.type === "MESSAGE"), true);
+  assert.equal(service.db.chatMessages.length, 1);
 });
 
 test("VTU settings encrypt credentials and never return secrets", () => {

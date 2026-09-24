@@ -104,6 +104,44 @@ test("a global freeze blocks financial and unrelated durable mutations before st
   assert.equal(saves, baselineSaves);
 });
 
+test("read-only admin dashboards and user summaries remain available during a financial freeze", () => {
+  const integrity = new FinancialIntegrityState();
+  integrity.registerAuthoritativeState();
+  let saves = 0;
+  const db = {
+    users: [
+      { id: "admin-1", role: "admin", name: "Admin" },
+      { id: "user-1", role: "user", name: "Ada", email: "ada@example.com", createdAt: "2026-09-24T08:00:00.000Z" },
+    ],
+  };
+  const service = new FinancialService({
+    db,
+    persist: () => { saves += 1; },
+    financialIntegrity: integrity,
+    clock: () => "2026-09-24T10:00:00.000Z",
+  });
+  service.ensureState();
+  service.createNotification({
+    userId: "admin-1",
+    type: "MESSAGE",
+    message: "Expired temporary message",
+    expiresAt: "2026-09-24T09:00:00.000Z",
+  });
+  const stateBeforeReads = JSON.stringify(db);
+  integrity.freeze("forced persistence failure");
+
+  const dashboard = service.getAdminDashboard();
+  const profile = service.getUserFinanceProfile("user-1");
+  const userDashboard = service.getDashboard(db.users[1]);
+
+  assert.equal(dashboard.totalUsers, 1);
+  assert.equal(profile.user.id, "user-1");
+  assert.equal(userDashboard.user.id, "user-1");
+  assert.equal(dashboard.notifications.length, 0);
+  assert.equal(saves, 0);
+  assert.equal(JSON.stringify(db), stateBeforeReads);
+});
+
 test("quest monetary redemption checks the shared gate before touching quest state", () => {
   const integrity = new FinancialIntegrityState();
   integrity.registerAuthoritativeState();

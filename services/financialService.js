@@ -2444,9 +2444,14 @@ class FinancialService {
 
   listNotifications(user, { limit = 20, includeRead = true } = {}) {
     this.ensureState();
-    this.pruneExpiredMessageNotifications();
+    const now = Date.parse(this.clock());
     return this.db.notifications
-      .filter((item) => item.userId === user.id && (includeRead || !item.readAt))
+      .filter((item) => {
+        if (item.userId !== user.id || (!includeRead && item.readAt)) return false;
+        if (String(item.type || "").toUpperCase() !== "MESSAGE") return true;
+        const expiresAt = Date.parse(item.expiresAt || "");
+        return !Number.isFinite(expiresAt) || expiresAt > now;
+      })
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(0, limit)
       .map((item) => this.enrichUserRecord(item));
