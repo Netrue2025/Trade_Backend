@@ -6,6 +6,7 @@ const { TradeListener, aggregateDailyTradeProfit, getNigeriaDateKey } = require(
 function createListenerHarness(options = {}) {
   const subscriberMessages = [];
   const channelMessages = [];
+  const errors = [];
   const telegramService = {
     isEnabled: () => true,
     sendMessage: async (chatId, message, telegramOptions) => {
@@ -27,7 +28,7 @@ function createListenerHarness(options = {}) {
   const logger = {
     log: () => undefined,
     warn: () => undefined,
-    error: () => undefined,
+    error: (...args) => errors.push(args.join(" ")),
   };
   const listener = new TradeListener({
     telegramService,
@@ -41,6 +42,7 @@ function createListenerHarness(options = {}) {
   });
   return {
     channelMessages,
+    errors,
     listener,
     subscriberMessages,
   };
@@ -76,6 +78,7 @@ function closedTrade(id, profitPercent, closedAt, kind = "TAKE_PROFIT", createdA
   const exitPrice = entryPrice * (1 + (profitPercent / 100));
   return {
     id,
+    symbol: "BTCUSDT",
     exchange: "bybit",
     side: "BUY",
     createdAt,
@@ -88,6 +91,35 @@ function closedTrade(id, profitPercent, closedAt, kind = "TAKE_PROFIT", createdA
     }],
   };
 }
+
+test("recovered TP settlement publishes subscriber and configured channel messages", async () => {
+  const { channelMessages, listener, subscriberMessages } = createListenerHarness();
+  const trade = closedTrade("recovered", 1.25, "2026-09-24T10:00:00.000Z");
+
+  const result = await listener.handleRecoveredSettlement(trade);
+
+  assert.equal(result.sent, 1);
+  assert.equal(subscriberMessages.length, 1);
+  assert.equal(channelMessages.length, 1);
+  assert.equal(channelMessages[0].options.type, "TAKE_PROFIT");
+  assert.match(channelMessages[0].message, /TAKE PROFIT HIT/);
+});
+
+test("recovered settlement channel failure is visible and does not reject durable recovery", async () => {
+  const errors = [];
+  const listener = new TradeListener({
+    telegramService: { isEnabled: () => true, sendMessage: async () => undefined },
+    subscriberModel: { isEnabled: () => true, listSubscribed: async () => [] },
+    logger: { log: () => undefined, warn: () => undefined, error: (...args) => errors.push(args.join(" ")) },
+    channelSender: async () => ({ sent: 1, failed: 1, channelError: "forbidden" }),
+  });
+  const trade = closedTrade("recovered-failure", 0.75, "2026-09-24T11:00:00.000Z");
+
+  const result = await listener.handleRecoveredSettlement(trade);
+
+  assert.equal(result.failed, 1);
+  assert.match(errors.join("\n"), /Telegram channel delivery failed: forbidden/);
+});
 
 test("daily profit is reconstructed from all same-day TP and manual closes", () => {
   const at = "2026-09-22T18:00:00.000Z";

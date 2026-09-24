@@ -4033,6 +4033,7 @@ async function reconcileOrphanedClosedTradeInvestments() {
   const candidates = ensureTradeInvestmentsState().filter((investment) => investment.status === "ACTIVE");
   const marketCache = new Map();
   const settled = [];
+  const recoveredTrades = new Map();
 
   for (const investment of candidates) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
@@ -4064,6 +4065,7 @@ async function reconcileOrphanedClosedTradeInvestments() {
         description: `${trade.symbol} investment settled after closed-trade recovery.`,
         createdBy: "system",
       }));
+      recoveredTrades.set(trade.id, trade);
     } catch (error) {
       console.error("Closed-trade investment recovery failed", {
         investmentId: investment.id,
@@ -4072,6 +4074,12 @@ async function reconcileOrphanedClosedTradeInvestments() {
       });
       if (financialIntegrity.getStatus().persistenceFrozen) break;
     }
+  }
+
+  for (const trade of recoveredTrades.values()) {
+    await tradeListener.handleRecoveredSettlement(trade).catch((error) => {
+      console.error(`Recovered trade Telegram notification failed for trade ${trade.id}:`, error.message || error);
+    });
   }
 
   return settled;

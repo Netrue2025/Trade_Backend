@@ -116,6 +116,8 @@ test("scheduler revisits closed-trade investments through the canonical settleme
   assert.match(recovery, /deriveTradeLifecycle\(trade\) !== "CLOSED"/);
   assert.match(recovery, /assessClosedTradeInvestmentRecovery/);
   assert.match(recovery, /await settleTradeInvestment\(/);
+  assert.ok(recovery.indexOf("await settleTradeInvestment(") < recovery.indexOf("handleRecoveredSettlement"));
+  assert.match(recovery, /Recovered trade Telegram notification failed/);
   assert.match(recovery, /INVESTMENT_RECONCILIATION_REVIEW_REQUIRED/);
   assert.match(recovery, /catch \(error\)/);
 });

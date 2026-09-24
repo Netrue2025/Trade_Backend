@@ -412,10 +412,14 @@ class TradeListener {
       return { sent: 0, skipped: 1, disabled: true };
     }
 
-    return this.channelSender(message, options).catch((error) => {
+    const result = await this.channelSender(message, options).catch((error) => {
       this.logger.warn("Telegram channel alert skipped:", error.message || error);
       return { sent: 0, failed: 1, disabled: false };
     });
+    if (result?.failed) {
+      this.logger.error("Telegram channel delivery failed:", result.channelError || "Channel sender reported a failed delivery.");
+    }
+    return result;
   }
 
   buildTradeKeyboard(trade) {
@@ -551,6 +555,33 @@ class TradeListener {
     }
 
     await this.updateDailyProfit(exchange, profitPercent, { trade, exitOrder });
+  }
+
+  async handleRecoveredSettlement(trade) {
+    const exitOrder = [...(trade?.exitOrders || [])].reverse().find(
+      (item) => getExecutionStatus(item?.adminExecution) === "FILLED"
+    );
+    if (!trade?.symbol || !exitOrder) {
+      return { sent: 0, skipped: 1, reason: "missing_filled_exit" };
+    }
+
+    const exchange = normalizeExchange(trade.exchange || exitOrder.exchange);
+    const profitPercent = calculateProfitPercent(trade, exitOrder);
+    const isTakeProfit = exitOrder.kind === "TAKE_PROFIT";
+    const subscriberMessage = isTakeProfit
+      ? buildTakeProfitHitMessage({ exchange, trade, exitOrder, profitPercent })
+      : buildOrderFilledMessage({ exchange, trade, exitOrder, profitPercent });
+    const channelMessage = isTakeProfit
+      ? buildPublicTakeProfitMessage({ exchange, trade, exitOrder, profitPercent })
+      : buildPublicTradeClosedMessage({ exchange, trade, exitOrder, profitPercent });
+
+    await this.broadcast(subscriberMessage, exchange, { exchange });
+    return this.sendChannel(channelMessage, {
+      type: isTakeProfit ? "TAKE_PROFIT" : "TRADE_CLOSED",
+      exchange,
+      trade,
+      telegramOptions: this.buildTradeTelegramOptions(trade),
+    });
   }
 
   async handleOrderExecuted(orderEvent = {}) {
