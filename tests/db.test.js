@@ -557,6 +557,94 @@ test("coalesced mutation during active incremental save persists in follow-up", 
   assert.deepEqual(Object.keys(updates[1].$set), ["notifications"]);
 });
 
+test("required scoped save excludes unrelated dirty fields and leaves them for follow-up", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [], tradeInvestments: [], notifications: [], sessions: [], digitalServiceProducts: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const db = JSON.parse(JSON.stringify(baseline));
+  db.notifications.push({ id: "notice-1", message: "Unrelated" });
+  db.sessions.push({ id: "session-1" });
+  db.digitalServiceProducts.push({ id: "product-1", name: "Unrelated" });
+  db.wallets.push({ userId: "user-1", currency: "USDT", availableBalance: "90" });
+  db.transactions.push({ id: "txn-1", reference: "trade-settlement:investment-1" });
+  db.tradeInvestments.push({ id: "investment-1", status: "STOPPED" });
+  const updates = [];
+  const followUpStarted = deferred();
+  const releaseFollowUp = deferred();
+  const collection = {
+    async updateOne(_filter, update) {
+      updates.push(JSON.parse(JSON.stringify(update)));
+      if (updates.length === 2) {
+        followUpStarted.resolve();
+        await releaseFollowUp.promise;
+      }
+      return { acknowledged: true };
+    },
+  };
+  const controller = __testing.createAppStateSaveController({
+    logger: createMemoryLogger(),
+    isMongoEnabled: () => true,
+    getCollection: async () => collection,
+    getSlowWarningMs: () => 1000,
+  });
+
+  const requiredSave = controller.requestSave(db, {
+    required: true,
+    fields: ["meta", "wallets", "transactions", "tradeInvestments"],
+    reason: "TRADE_SETTLEMENT",
+  });
+  await followUpStarted.promise;
+  await requiredSave;
+
+  assert.deepEqual(Object.keys(updates[0].$set).sort(), ["tradeInvestments", "transactions", "wallets"]);
+  assert.deepEqual(Object.keys(updates[1].$set).sort(), ["digitalServiceProducts", "notifications", "sessions"]);
+  releaseFollowUp.resolve();
+  await waitFor(() => controller.getDiagnostics().running === false, "unrelated follow-up completion");
+});
+
+test("successful scoped save advances only its persisted fields", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [], notifications: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const next = JSON.parse(JSON.stringify(baseline));
+  next.wallets.push({ userId: "user-1", currency: "USDT", availableBalance: "10" });
+  next.transactions.push({ id: "txn-1" });
+  next.notifications.push({ id: "notice-1" });
+
+  await __testing.saveMongoSnapshot({
+    async updateOne() { return { acknowledged: true }; },
+  }, next, {
+    logger: createMemoryLogger(),
+    allowedFields: ["wallets", "transactions"],
+  });
+
+  assert.deepEqual(__testing.getChangedAppStateFields(next), ["notifications"]);
+});
+
+test("backup failure after a successful required update is best-effort", async () => {
+  __testing.resetBackupThrottle();
+  const baseline = __testing.normalizeDb({ wallets: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const next = JSON.parse(JSON.stringify(baseline));
+  next.wallets.push({ userId: "user-1", currency: "USDT", availableBalance: "10" });
+  let updates = 0;
+
+  await __testing.saveMongoSnapshot({
+    async updateOne() {
+      updates += 1;
+      return { acknowledged: true };
+    },
+  }, next, {
+    logger: createMemoryLogger(),
+    allowedFields: ["wallets"],
+    backupSnapshot: async () => { throw new Error("simulated backup timeout"); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(updates, 1);
+  assert.deepEqual(__testing.getChangedAppStateFields(next), []);
+});
+
 test("one persist request produces exactly one app-state save", async () => {
   const saves = [];
   const controller = __testing.createAppStateSaveController({
@@ -915,7 +1003,7 @@ test("non-backup app-state save uses $set and does not remove unknown top-level 
   });
 });
 
-test("backup-due app-state save reads previous state, merges, updates, and backs up previous state", async () => {
+test("backup-due save writes first without a read and backs up the committed baseline", async () => {
   await withEnvAsync([
     "MONGODB_APP_STATE_BACKUPS_ENABLED",
     "MONGODB_APP_STATE_BACKUP_INTERVAL_MS",
@@ -940,6 +1028,7 @@ test("backup-due app-state save reads previous state, merges, updates, and backs
       transactions: [{ id: "txn-incoming", amount: "-10", createdAt: "2026-09-13T10:00:00.000Z" }],
       systemSettings: {},
     };
+    __testing.initializeMongoPersistedBaseline(previous);
     const collection = {
       async findOne(_filter, options) {
         findOneCalls += 1;
@@ -960,12 +1049,12 @@ test("backup-due app-state save reads previous state, merges, updates, and backs
     });
     await waitFor(() => backups.length === 1, "backup capture");
 
-    assert.equal(findOneCalls > 1, true);
+    assert.equal(findOneCalls, 0);
     assert.equal(updates.length, 1);
-    assert.equal(updates[0].update.$set.wallets[0].availableBalance, "9000");
-    assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-current"), true);
+    assert.equal(updates[0].update.$set.wallets[0].availableBalance, "1000");
+    assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-current"), false);
     assert.equal(updates[0].update.$set.transactions.some((item) => item.id === "txn-incoming"), true);
-    assert.equal(backups[0].wallets[0].availableBalance, "9000");
+    assert.equal(backups[0].wallets[0].availableBalance, "1000");
     assert.equal(__testing.isMongoBackupDue(), false);
   });
 });

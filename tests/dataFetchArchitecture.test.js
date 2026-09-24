@@ -87,3 +87,18 @@ test("admin user and trade participant reads are paginated, authorized, and pers
   assert.match(participantsRoute, /participants: summary\.users/);
   assert.doesNotMatch(participantsRoute, /persist\(|saveDb/);
 });
+
+test("trade settlement persists financial state before creating its success notification", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const start = source.indexOf("async function settleTradeInvestment");
+  const end = source.indexOf("async function settleInactiveTradeInvestmentsForUsers", start);
+  const settlement = source.slice(start, end);
+  const requiredSave = settlement.indexOf("fields: [\"meta\", \"tradeInvestments\", \"wallets\", \"transactions\"]");
+  const notification = settlement.indexOf("financialService.createNotification");
+  const bestEffortSave = settlement.indexOf("persist({ bestEffort: true })", notification);
+
+  assert.ok(requiredSave >= 0);
+  assert.ok(notification > requiredSave);
+  assert.ok(bestEffortSave > notification);
+  assert.doesNotMatch(settlement.slice(0, requiredSave), /createNotification/);
+});

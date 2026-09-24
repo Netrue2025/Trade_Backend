@@ -281,7 +281,7 @@ function isAuthorizedSignalIngestRequest(req) {
   return false;
 }
 
-function persist({ required = false, operation = null } = {}) {
+function persist({ required = false, bestEffort = false, operation = null, fields = null } = {}) {
   if (!db) {
     return required ? Promise.reject(new Error("Application state is unavailable.")) : Promise.resolve();
   }
@@ -289,13 +289,13 @@ function persist({ required = false, operation = null } = {}) {
   egressMetrics.saveDbCount += 1;
   egressMetrics.appStateSerializedBytes = Buffer.byteLength(JSON.stringify(db));
   const requestState = financialRequestState.getStore();
-  const durabilityRequired = required || !!requestState?.durableMutation;
+  const durabilityRequired = !bestEffort && (required || !!requestState?.durableMutation);
   const persistenceContext = operation || requestState?.lastMutation || (
     requestState?.operations?.size
       ? { reason: [...requestState.operations].join(",") }
       : null
   );
-  const saveOperation = saveDb(undefined, { context: persistenceContext }).then(() => scheduleLiveStateBroadcast()).catch((error) => {
+  const saveOperation = saveDb(undefined, { context: persistenceContext, required: durabilityRequired, fields }).then(() => scheduleLiveStateBroadcast()).catch((error) => {
     const failureContext = {
       ...(persistenceContext || {}),
       saveId: error.persistence?.saveId || null,
@@ -3962,8 +3962,13 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       createdBy: options.createdBy || "system", createdAt: nowIso(),
       metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, pnlPercent: toMoneyDecimal(pnlDeltaPercent), lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
     });
+    await persist({
+      required: true,
+      fields: ["meta", "tradeInvestments", "wallets", "transactions"],
+      operation: { reason: "TRADE_SETTLEMENT", reference: settlementReference, userId: user.id },
+    });
     financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade settled", message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`, entityType: "Trade", entityId: currentInvestment.tradeId });
-    await persist({ required: true, operation: { reason: "TRADE_SETTLEMENT", reference: settlementReference, userId: user.id } });
+    void persist({ bestEffort: true });
     return currentInvestment;
   });
 }
