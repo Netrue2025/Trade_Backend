@@ -56,6 +56,7 @@ const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
+const { AdminBonusReversalService, EXECUTION_ACTION: BONUS_REVERSAL_EXECUTION_ACTION } = require("./services/adminBonusReversalService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber, toKobo } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
@@ -139,6 +140,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 let db = null;
 let financialService = null;
+let adminBonusReversalService = null;
 let questService = null;
 let vtuService = null;
 let akundingService = null;
@@ -8976,6 +8978,25 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/admin/bonus-reversals") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const body = await readBody(req);
+      const reference = String(body.originalBonusReference || body.reference || "").trim();
+      if (!reference) throw new Error("Original bonus reference is required.");
+      if (body.action === BONUS_REVERSAL_EXECUTION_ACTION) {
+        const result = await adminBonusReversalService.execute(admin, reference, { action: body.action, reason: body.reason });
+        sendJson(res, result.status === "REVERSED" ? 201 : 200, result);
+      } else {
+        sendJson(res, 200, adminBonusReversalService.inspect(reference));
+      }
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
+    return true;
+  }
+
   const hideTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/hide$/);
   if (req.method === "POST" && hideTradeMatch) {
     const user = requireAuth(req, res, "user");
@@ -9385,6 +9406,13 @@ async function startServer() {
     onDurableMutation: markRequestDurableMutation,
     notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
     emailPublisher: (message) => emailNotificationService.sendAdminOtpRequest(message),
+  });
+  adminBonusReversalService = new AdminBonusReversalService({
+    db,
+    withUserFinancialLock,
+    persist,
+    markFinancialMutation,
+    createNotification: (notification) => financialService.createNotification(notification),
   });
   financialService.ensureState();
   pushNotificationService.ensureState();
