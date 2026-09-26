@@ -158,7 +158,7 @@ test("every FinancialService persist site is protected by the shared frozen gate
   integrity.registerAuthoritativeState();
   const service = new FinancialService({ db: {}, financialIntegrity: integrity });
   const durableMethods = Object.getOwnPropertyNames(FinancialService.prototype)
-    .filter((name) => name !== "constructor" && /\bthis\.persist\(\)/.test(FinancialService.prototype[name]?.toString?.() || ""));
+    .filter((name) => name !== "constructor" && /\bthis\.persist\(/.test(FinancialService.prototype[name]?.toString?.() || ""));
   assert.equal(durableMethods.length, 74);
   integrity.freeze("forced trade persistence failure");
   for (const method of durableMethods) {

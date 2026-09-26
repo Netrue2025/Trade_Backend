@@ -77,7 +77,7 @@ test("deposit approval credits once and submission does not change balance", () 
 
   service.approveDeposit(admin, deposit.id);
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
-  assert.throws(() => service.approveDeposit(admin, deposit.id), /no longer pending/i);
+  assert.equal(service.approveDeposit(admin, deposit.id).status, "APPROVED");
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
 });
 

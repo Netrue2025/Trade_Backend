@@ -57,6 +57,7 @@ const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
 const { AdminBonusReversalService, EXECUTION_ACTION: BONUS_REVERSAL_EXECUTION_ACTION } = require("./services/adminBonusReversalService");
+const { DepositApprovalService } = require("./services/depositApprovalService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber, toKobo } = require("./services/paystackService");
 const { TelegramService } = require("./services/telegramService");
@@ -141,6 +142,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 let db = null;
 let financialService = null;
 let adminBonusReversalService = null;
+let depositApprovalService = null;
 let questService = null;
 let vtuService = null;
 let akundingService = null;
@@ -312,7 +314,16 @@ function persist({ required = false, bestEffort = false, operation = null, field
       throw error;
     }
   });
-  if (durabilityRequired && requestState) requestState.pending.add(saveOperation);
+  if (durabilityRequired && requestState) {
+    requestState.pending.add(saveOperation);
+    saveOperation.then(
+      () => {
+        requestState.pending.delete(saveOperation);
+        completeRequestDurableMutation();
+      },
+      () => requestState.pending.delete(saveOperation),
+    );
+  }
   return saveOperation;
 }
 
@@ -322,6 +333,14 @@ function markRequestDurableMutation(operation) {
     requestState.durableMutation = true;
     requestState.operations.add(String(operation || "unknown"));
   }
+}
+
+function completeRequestDurableMutation() {
+  const requestState = financialRequestState.getStore();
+  if (!requestState) return;
+  requestState.durableMutation = false;
+  requestState.lastMutation = null;
+  requestState.operations.clear();
 }
 
 function withUserFinancialLock(userId, operation) {
@@ -6658,12 +6677,11 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      const deposit = financialService.approveDeposit(
-        admin,
-        decodeURIComponent(adminDepositApproveMatch[1]),
-        await readBody(req),
-        getRequestMeta(req)
-      );
+      const depositId = decodeURIComponent(adminDepositApproveMatch[1]);
+      const input = await readBody(req);
+      const requestMeta = getRequestMeta(req);
+      const result = await depositApprovalService.approve(admin, depositId, input, requestMeta);
+      const deposit = result.deposit;
       financialService.evaluateReferralQualification(deposit.userId, getRequestMeta(req));
       await sendDepositSuccessChannelAlert(deposit);
       const targetUser = db.users.find((item) => item.id === deposit.userId && item.role === "user");
@@ -9397,7 +9415,11 @@ async function startServer() {
   setAuthoritativeDbProvider(() => db);
   financialIntegrity.registerAuthoritativeState();
   ensureAdminUser(db);
-  pushNotificationService = new PushNotificationService({ db, persist, logger: console });
+  pushNotificationService = new PushNotificationService({
+    db,
+    persist: () => persist({ bestEffort: true, operation: { reason: "PUSH_NOTIFICATION" }, fields: ["pushSubscriptions", "pushNotificationEvents"] }),
+    logger: console,
+  });
   emailNotificationService = new EmailNotificationService({ logger: console });
   financialService = new FinancialService({
     db,
@@ -9406,6 +9428,13 @@ async function startServer() {
     onDurableMutation: markRequestDurableMutation,
     notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
     emailPublisher: (message) => emailNotificationService.sendAdminOtpRequest(message),
+  });
+  depositApprovalService = new DepositApprovalService({
+    financialService,
+    withUserFinancialLock,
+    markFinancialMutation,
+    persist,
+    completeDurableMutation: completeRequestDurableMutation,
   });
   adminBonusReversalService = new AdminBonusReversalService({
     db,

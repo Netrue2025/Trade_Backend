@@ -400,7 +400,7 @@ class FinancialService {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver);
           if (typeof value !== "function" || property === "constructor") return value;
-          const isDurableMutation = /\bthis\.persist\(\)/.test(value.toString());
+          const isDurableMutation = /\bthis\.persist\(/.test(value.toString());
           if (!isDurableMutation) return value.bind(receiver);
           return (...args) => {
             financialIntegrity.assertWritable();
@@ -3262,7 +3262,7 @@ class FinancialService {
     this.notifyAdminDepositSubmitted(user, deposit);
     this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency }, requestMeta);
     this.saveIdempotent("deposit:create", user.id, requestMeta.idempotencyKey, deposit);
-    this.persist();
+    this.persist({ fields: ["deposits", "idempotencyKeys"] });
     return clone(deposit);
   }
 
@@ -3280,8 +3280,19 @@ class FinancialService {
   }
 
   approveDeposit(admin, depositId, input = {}, requestMeta = {}) {
+    const result = this.mutateDepositApproval(admin, depositId, input);
+    if (!result.duplicate) this.recordDepositApprovalSideEffects(admin, result.deposit, requestMeta);
+    this.persist();
+    return clone(result.deposit);
+  }
+
+  mutateDepositApproval(admin, depositId, input = {}) {
     this.ensureState();
     const deposit = this.getDeposit(depositId);
+    const existingCredits = this.db.transactions.filter((item) => item.type === "DEPOSIT" && item.reference === deposit.id);
+    if (deposit.status === "APPROVED" && deposit.creditedAt && existingCredits.length === 1) {
+      return { deposit: clone(deposit), duplicate: true };
+    }
     if (deposit.status !== "PENDING") {
       throw new Error("Deposit request is no longer pending.");
     }
@@ -3323,6 +3334,10 @@ class FinancialService {
       transaction.reviewedAt = deposit.reviewedAt;
       transaction.reviewedBy = admin.id;
     }
+    return { deposit: clone(deposit), duplicate: false };
+  }
+
+  recordDepositApprovalSideEffects(admin, deposit, requestMeta = {}) {
     this.createNotification({
       userId: deposit.userId,
       type: "DEPOSIT",
@@ -3332,8 +3347,6 @@ class FinancialService {
       entityId: deposit.id,
     });
     this.audit(admin, "DEPOSIT_APPROVED", "Deposit", deposit.id, { amount: deposit.amount, currency: deposit.currency }, requestMeta);
-    this.persist();
-    return clone(deposit);
   }
 
   rejectDeposit(admin, depositId, input = {}, requestMeta = {}) {
