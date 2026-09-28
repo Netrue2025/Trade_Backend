@@ -9,7 +9,14 @@ const {
   isCoreFinancialValidationMode,
   isFinancialRecoveryMode,
   isRecoveryOperationAllowed,
+  isTradingIsolationMode,
+  isTradingOperationsEnabled,
+  isVtuOperationsEnabled,
+  isShopWalletPaymentsEnabled,
   assertRecoveryOperationAllowed,
+  assertTradingOperationAllowed,
+  assertVtuOperationAllowed,
+  assertShopWalletPaymentAllowed,
 } = require("../lib/financialRecoveryMode");
 
 function withEnv(values, callback) {
@@ -90,15 +97,50 @@ test("request-like context cannot enable validation without trusted server confi
   });
 });
 
+test("trading remains isolated after recovery mode is disabled until separately enabled", () => {
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: undefined }, () => {
+    assert.equal(isFinancialRecoveryMode(), false);
+    assert.equal(isTradingOperationsEnabled(), false);
+    assert.equal(isTradingIsolationMode(), true);
+    assert.throws(() => assertTradingOperationAllowed(), { code: "TRADING_OPERATIONS_ISOLATED" });
+  });
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: "true" }, () => {
+    assert.equal(isTradingOperationsEnabled(), true);
+    assert.equal(isTradingIsolationMode(), false);
+  });
+  withEnv({ FINANCIAL_RECOVERY_MODE: "true", TRADING_OPERATIONS_ENABLED: "true" }, () => {
+    assert.equal(isTradingOperationsEnabled(), false);
+  });
+});
+
+test("unsafe VTU and wallet shop flows remain independently disabled after recovery ends", () => {
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", VTU_OPERATIONS_ENABLED: undefined, SHOP_WALLET_PAYMENTS_ENABLED: undefined }, () => {
+    assert.equal(isVtuOperationsEnabled(), false);
+    assert.equal(isShopWalletPaymentsEnabled(), false);
+    assert.throws(() => assertVtuOperationAllowed(), { code: "VTU_OPERATIONS_DISABLED" });
+    assert.throws(() => assertShopWalletPaymentAllowed(), { code: "SHOP_WALLET_PAYMENTS_DISABLED" });
+  });
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", VTU_OPERATIONS_ENABLED: "true", SHOP_WALLET_PAYMENTS_ENABLED: "true" }, () => {
+    assert.equal(isVtuOperationsEnabled(), true);
+    assert.equal(isShopWalletPaymentsEnabled(), true);
+  });
+  withEnv({ FINANCIAL_RECOVERY_MODE: "true", VTU_OPERATIONS_ENABLED: "true", SHOP_WALLET_PAYMENTS_ENABLED: "true" }, () => {
+    assert.equal(isVtuOperationsEnabled(), false);
+    assert.equal(isShopWalletPaymentsEnabled(), false);
+  });
+});
+
 test("server recovery gates cover trade creation, reconciliation, settlement, deposits, withdrawals, gift cards, and quest money", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert.match(server, /FINANCIAL_RECOVERY_MODE trade reconciliation skipped/);
-  assert.match(server, /if \(isFinancialRecoveryMode\(\)\) \{\s*return null;/);
-  assert.match(server, /async function settleTradeInvestment[\s\S]*?isFinancialRecoveryMode\(\)/);
-  assert.match(server, /async function settleStaleTradeInvestmentsForWithdrawal[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{[\s\S]*?settled: \[\]/);
-  assert.match(server, /async function reconcileExternalClosuresForOwner[\s\S]*?isFinancialRecoveryMode\(\)/);
-  assert.match(server, /assertRecoveryOperationAllowed\("TRADE"\)/);
-  assert.match(server, /assertRecoveryOperationAllowed\("TRADE_JOIN"\)/);
+  assert.match(server, /TRADING_OPERATIONS_ISOLATED trade reconciliation skipped/);
+  assert.match(server, /if \(isTradingIsolationMode\(\)\) \{\s*return null;/);
+  assert.match(server, /async function settleTradeInvestment[\s\S]*?isTradingIsolationMode\(\)/);
+  assert.match(server, /async function settleStaleTradeInvestmentsForWithdrawal[\s\S]*?if \(isTradingIsolationMode\(\)\) \{[\s\S]*?settled: \[\]/);
+  assert.match(server, /async function reconcileExternalClosuresForOwner[\s\S]*?isTradingIsolationMode\(\)/);
+  assert.match(server, /async function createTradeIntent[\s\S]*?assertTradingOperationAllowed\(\)/);
+  assert.match(server, /async function executeTradeExit[\s\S]*?assertTradingOperationAllowed\(\)/);
+  assert.match(server, /async function autoPlaceTakeProfit[\s\S]*?assertTradingOperationAllowed\(\)/);
+  assert.match(server, /takeProfitMatch[\s\S]*?assertTradingOperationAllowed\(\)[\s\S]*?trade\.takeProfitTargetPrice = price/);
   assert.match(server, /assertRecoveryOperationAllowed\("DEPOSIT_CREATE", \{ actorUserId: user\.id, targetUserId: user\.id \}\)/);
   assert.match(server, /assertRecoveryOperationAllowed\("WITHDRAWAL_CREATE", \{ actorUserId: user\.id, targetUserId: user\.id \}\)/);
   assert.match(server, /assertRecoveryOperationAllowed\("DEPOSIT_APPROVAL", \{ actorUserId: admin\.id, targetUserId: targetDeposit\.userId, isAdmin: admin\.role === "admin" \}\)/);
@@ -107,15 +149,18 @@ test("server recovery gates cover trade creation, reconciliation, settlement, de
   assert.match(server, /async function syncProcessingPaystackWithdrawals[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return;/);
   assert.match(server, /assertRecoveryOperationAllowed\("GIFT_CARD"\)/);
   assert.match(server, /assertRecoveryOperationAllowed\("QUEST_REWARD"\)/);
+  assert.match(server, /\/api\/vtu\/airtime[\s\S]*?assertVtuOperationAllowed\(\)/);
+  assert.match(server, /\/api\/vtu\/data[\s\S]*?assertVtuOperationAllowed\(\)/);
+  assert.match(server, /paymentMethod === "wallet"[\s\S]*?assertShopWalletPaymentAllowed\(\)/);
 });
 
 test("minimal core startup does not start optional signal, Telegram, or reconciliation workers", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert.match(server, /FINANCIAL_RECOVERY_MODE minimal core active; optional workers are disabled\./);
-  assert.match(server, /async function ensureSignalEngineRunning[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return false;/);
-  assert.match(server, /async function ensureTradeListenerRunning[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return false;/);
-  assert.match(server, /async function sweepExpiredSignals[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return \[\];/);
-  assert.match(server, /if \(!isFinancialRecoveryMode\(\)\) \{\s*socketSignalService\.attach/);
+  assert.match(server, /TRADING_OPERATIONS_ISOLATED minimal core active; optional workers are disabled\./);
+  assert.match(server, /async function ensureSignalEngineRunning[\s\S]*?if \(isTradingIsolationMode\(\)\) \{\s*return false;/);
+  assert.match(server, /async function ensureTradeListenerRunning[\s\S]*?if \(isTradingIsolationMode\(\)\) \{\s*return false;/);
+  assert.match(server, /async function sweepExpiredSignals[\s\S]*?if \(isTradingIsolationMode\(\)\) \{\s*return \[\];/);
+  assert.match(server, /if \(!isTradingIsolationMode\(\)\) \{\s*socketSignalService\.attach/);
   assert.match(server, /const mongoReady = !shouldUseMongo\(\) \|\| isMongoAppStatePersistenceReady\(\)/);
   assert.match(server, /Service is initializing authoritative state/);
 });

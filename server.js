@@ -50,7 +50,7 @@ const { financialIntegrity, createUserFinancialLock } = require("./lib/financial
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { isTradeQuarantined } = require("./lib/tradeQuarantine");
-const { isFinancialRecoveryMode, assertRecoveryOperationAllowed } = require("./lib/financialRecoveryMode");
+const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -345,7 +345,8 @@ function getHealthPayload() {
     mongoConnected: mongoReady,
     authoritativeStateLoaded: mongoReady,
     startupBarrierPassed: mongoReady,
-    minimalCoreMode: isFinancialRecoveryMode(),
+    minimalCoreMode: isTradingIsolationMode(),
+    tradingOperationsEnabled: !isTradingIsolationMode(),
     startup: {
       ready: startupState.ready,
       listening: startupState.listening,
@@ -403,7 +404,7 @@ function markFinancialMutation(wallets, reason, reference) {
 }
 
 function persistSignalState() {
-  if (!db || isFinancialRecoveryMode()) {
+  if (!db || isTradingIsolationMode()) {
     return;
   }
 
@@ -510,7 +511,7 @@ function getSignalAutoTradeSettingsSnapshot() {
 }
 
 async function sweepExpiredSignals() {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return [];
   }
   const expiredSignals = await signalEngine.expireSignals();
@@ -521,7 +522,7 @@ async function sweepExpiredSignals() {
 }
 
 async function ensureSignalEngineRunning(force = false, options = {}) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return false;
   }
   if (signalEngine.started && !force) {
@@ -549,7 +550,7 @@ async function ensureSignalEngineRunning(force = false, options = {}) {
 }
 
 async function ensureTradeListenerRunning(force = false) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return false;
   }
   if (tradeListener.started && !force && (!telegramTradeService?.isHealthy || telegramTradeService.isHealthy())) {
@@ -2968,7 +2969,7 @@ function inferBaseAssetFromSymbol(symbol) {
 }
 
 async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, openOrders, exchangeInfoOverride = null, userId = null) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return false;
   }
   const exchange = getTradeExchange(trade);
@@ -3123,8 +3124,8 @@ function shouldReconcileTrade(trade) {
 }
 
 async function reconcileTradeStatuses() {
-  if (isFinancialRecoveryMode()) {
-    console.warn("FINANCIAL_RECOVERY_MODE trade reconciliation skipped");
+  if (isTradingIsolationMode()) {
+    console.warn("TRADING_OPERATIONS_ISOLATED trade reconciliation skipped");
     return;
   }
   let changed = false;
@@ -3302,7 +3303,7 @@ async function reconcileTradeStatuses() {
 }
 
 function startTradeReconciliation(force = false) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return null;
   }
   const now = Date.now();
@@ -4021,7 +4022,7 @@ function getWithdrawalBlockingTradeInvestments(userId) {
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return investment;
   }
   if (trade && isTradeQuarantined(db, trade)) {
@@ -4187,7 +4188,7 @@ async function reconcileOrphanedClosedTradeInvestments() {
 }
 
 async function settleStaleTradeInvestmentsForWithdrawal(user) {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return {
       blocking: getWithdrawalBlockingTradeInvestments(user.id),
       settled: [],
@@ -4886,7 +4887,7 @@ function getMirroringUsers(exchange) {
 }
 
 async function createTradeIntent(admin, exchange, orderInput, options = {}) {
-  assertRecoveryOperationAllowed("TRADE");
+  assertTradingOperationAllowed();
   const exchangeLabel = getExchangeLabel(exchange);
   const adminAccount = getExchangeAccount(admin, exchange);
   if (!adminAccount) {
@@ -4970,8 +4971,8 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
 }
 
 async function executeSignalAutoTrade(signal, context = {}) {
-  if (isFinancialRecoveryMode()) {
-    return { ok: false, skipped: true, reason: "financial_recovery_mode" };
+  if (isTradingIsolationMode()) {
+    return { ok: false, skipped: true, reason: "trading_operations_isolated" };
   }
   const settings = normalizeSignalAutoTradeConfig(context.config || autoTradeService.getConfig());
   const admin = getSignalAutoTradeAdminUser();
@@ -5071,6 +5072,7 @@ async function executeSignalAutoTrade(signal, context = {}) {
 autoTradeService.setExecutor(executeSignalAutoTrade);
 
 async function executeTradeExit(trade, admin, options = {}) {
+  assertTradingOperationAllowed();
   const exchange = getTradeExchange(trade);
   const adminAccount = getExchangeAccount(admin, exchange);
   if (!adminAccount) {
@@ -5204,6 +5206,7 @@ async function executeTradeExit(trade, admin, options = {}) {
 }
 
 async function autoPlaceTakeProfit(trade, options = {}) {
+  assertTradingOperationAllowed();
   const force = !!options.force;
   if (!trade.takeProfitTargetPrice || trade.side !== "BUY") {
     return;
@@ -6106,6 +6109,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertVtuOperationAllowed();
       const body = await readBody(req);
       const settings = financialService.getSettings().vtu;
       if (!settings.configured || !settings.airtimeEnabled) {
@@ -6181,6 +6185,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertVtuOperationAllowed();
       const body = await readBody(req);
       const settings = financialService.getSettings().vtu;
       if (!settings.configured || !settings.dataEnabled) {
@@ -6424,6 +6429,9 @@ async function handleApi(req, res, url) {
       const orderPromise = (async () => {
         const body = await readBody(req);
         const paymentMethod = String(body.paymentMethod || "wallet").trim().toLowerCase() === "paystack" ? "paystack" : "wallet";
+        if (paymentMethod === "wallet") {
+          assertShopWalletPaymentAllowed();
+        }
         const order = await digitalServicesService.purchase(user, {
           productId: body.productId,
           quantity: body.quantity || 1,
@@ -8699,7 +8707,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("TRADE_JOIN");
+      assertTradingOperationAllowed();
     } catch (error) {
       sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
       return true;
@@ -9032,7 +9040,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("TRADE_JOIN");
+      assertTradingOperationAllowed();
     } catch (error) {
       sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
       return true;
@@ -9101,6 +9109,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertTradingOperationAllowed();
       const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(stopTradeMatch[1] || ""));
       if (!trade) {
         sendJson(res, 404, { error: "Trade not found." });
@@ -9268,6 +9277,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && takeProfitMatch) {
     const admin = requireAuth(req, res, "admin");
     if (!admin) {
+      return true;
+    }
+    try {
+      assertTradingOperationAllowed();
+    } catch (error) {
+      sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
       return true;
     }
     const trade = db.tradeIntents.find((item) => item.id === takeProfitMatch[1]);
@@ -9454,7 +9469,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (!isFinancialRecoveryMode()) {
+if (!isTradingIsolationMode()) {
   socketSignalService.attach(server, {
     authorize: (request) => {
       const session = getSession(request);
@@ -9652,8 +9667,8 @@ async function startServer() {
   console.info(`[startup] total-to-ready duration=${Date.now() - startupStartedAt}ms`);
   console.log(`Telegram signal bot diagnostics: ${JSON.stringify(getSignalBotDiagnostics())}`);
 
-  if (isFinancialRecoveryMode()) {
-    console.log("FINANCIAL_RECOVERY_MODE minimal core active; optional workers are disabled.");
+  if (isTradingIsolationMode()) {
+    console.log("TRADING_OPERATIONS_ISOLATED minimal core active; optional workers are disabled.");
     return;
   }
 
@@ -9672,7 +9687,7 @@ async function startServer() {
 }
 
 async function runPostListenStartupTasks() {
-  if (isFinancialRecoveryMode()) {
+  if (isTradingIsolationMode()) {
     return;
   }
   try {
