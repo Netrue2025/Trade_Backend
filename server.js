@@ -49,7 +49,8 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
-const { isTradeQuarantined } = require("./lib/tradeQuarantine");
+const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
+const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
@@ -5385,6 +5386,30 @@ function clearSessionCookie(req, res) {
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/health") {
     sendJson(res, 200, getHealthPayload());
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/trading/reconciliation/dry-run") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    if (!shouldUseMongo() || !isMongoAppStatePersistenceReady() || !startupState.ready) {
+      sendJson(res, 503, { error: "Authoritative MongoDB state is required for reconciliation inspection.", code: "AUTHORITATIVE_STATE_REQUIRED" });
+      return true;
+    }
+    try {
+      sendJson(res, 200, {
+        dryRun: true,
+        ...buildTradeReconciliationDryRun({
+          db,
+          deriveTradeLifecycle,
+          isTradeQuarantined,
+          isHistoricalTradeExcluded,
+          assessClosedTradeInvestmentRecovery,
+        }),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
     return true;
   }
 
