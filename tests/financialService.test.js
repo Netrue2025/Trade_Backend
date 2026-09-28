@@ -218,6 +218,51 @@ test("wallet history includes deposit and withdrawal request statuses", () => {
   assert.ok(history.some((item) => item.id === pendingWithdrawal.id && item.kind === "WITHDRAWAL" && item.status === "PENDING"));
 });
 
+test("mixed-currency ARX recovery history stays display-only without weakening currency validation", () => {
+  const { db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "1250");
+  setWallet(service, user.id, "USDT", "2.5");
+  db.transactions.unshift({
+    id: "arx-release-1",
+    userId: user.id,
+    type: "ABANDONED_TRADE_PRINCIPAL_RELEASE",
+    currency: "MIXED",
+    amount: "0",
+    reference: "admin-recovery:arx-release-1",
+    status: "APPROVED",
+    createdAt: "2026-08-30T10:00:00.000Z",
+    metadata: {
+      releasedSources: [
+        { currency: "NGN", amount: "1250" },
+        { currency: "USDT", amount: "2.5" },
+      ],
+    },
+  });
+  const before = JSON.stringify(db);
+
+  const profile = service.getUserFinanceProfile(user.id);
+  const dashboard = service.getDashboard(user);
+  const mixedRecent = profile.recentTransactions.find((transaction) => transaction.id === "arx-release-1");
+  const mixedHistory = dashboard.walletHistory.find((transaction) => transaction.id === "arx-release-1");
+
+  assert.deepEqual(profile.wallets.map((wallet) => [wallet.currency, wallet.availableBalance]), [["USDT", "2.5"], ["NGN", "1250"]]);
+  assert.deepEqual(mixedRecent.mixedCurrencyBreakdown, [{ currency: "NGN", amount: "1250" }, { currency: "USDT", amount: "2.5" }]);
+  assert.equal(mixedRecent.displayAmounts, null);
+  assert.deepEqual(mixedHistory.mixedCurrencyBreakdown, mixedRecent.mixedCurrencyBreakdown);
+  assert.equal(mixedHistory.displayAmounts, null);
+  assert.equal(JSON.stringify(db), before);
+
+  db.transactions.unshift({
+    id: "bad-currency-1",
+    userId: user.id,
+    type: "UNSUPPORTED_TEST_RECORD",
+    currency: "INVALID",
+    amount: "1",
+    createdAt: "2026-08-30T10:00:01.000Z",
+  });
+  assert.throws(() => service.getDashboard(user), /Unsupported currency: INVALID/);
+});
+
 test("withdrawal completion reserves funds and clears locked balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

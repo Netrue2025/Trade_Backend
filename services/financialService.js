@@ -2084,7 +2084,28 @@ class FinancialService {
       .filter((item) => item.userId === userId)
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
       .slice(offset, offset + limit)
-      .map(clone);
+      .map((transaction) => this.serializeTransactionForDisplay(transaction));
+  }
+
+  serializeTransactionForDisplay(transaction) {
+    const record = clone(transaction);
+    if (String(record.currency || "").trim().toUpperCase() !== "MIXED") {
+      return record;
+    }
+
+    // MIXED is an audit-only aggregate used by the ARX principal release. It is
+    // not a monetary currency and must never be converted as one.
+    if (record.type !== "ABANDONED_TRADE_PRINCIPAL_RELEASE" || !Array.isArray(record.metadata?.releasedSources)) {
+      throw new Error("Unsupported currency: MIXED");
+    }
+
+    const releasedSources = record.metadata.releasedSources.map((source) => ({
+      currency: normalizeCurrency(source?.currency),
+      amount: normalizeNonNegativeAmount(source?.amount || "0", "Released principal amount"),
+    }));
+    record.displayAmounts = null;
+    record.mixedCurrencyBreakdown = releasedSources;
+    return record;
   }
 
   listTransactions(user, { limit = 200, offset = 0 } = {}) {
@@ -2196,11 +2217,16 @@ class FinancialService {
       }));
     const ledgerTransactions = this.db.transactions
       .filter((transaction) => canSee(transaction) && !["DEPOSIT", "WITHDRAWAL", "WITHDRAWAL_COMPLETED", "REVERSAL", ...VTU_LEDGER_TYPES, ...DIGITAL_SERVICE_LEDGER_TYPES].includes(transaction.type))
-      .map((transaction) => ({
-        ...clone(transaction),
-        kind: "LEDGER",
-        displayAmounts: transaction.metadata?.displayAmounts || this.getDisplayAmounts(transaction.amount, transaction.currency),
-      }));
+      .map((transaction) => {
+        const displayRecord = this.serializeTransactionForDisplay(transaction);
+        return {
+          ...displayRecord,
+          kind: "LEDGER",
+          displayAmounts: displayRecord.displayAmounts === null
+            ? null
+            : displayRecord.metadata?.displayAmounts || this.getDisplayAmounts(displayRecord.amount, displayRecord.currency),
+        };
+      });
 
     return [...deposits, ...withdrawals, ...vtuPurchases, ...digitalPurchases, ...ledgerTransactions]
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
