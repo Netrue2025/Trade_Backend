@@ -154,6 +154,11 @@ let efemResellerService = null;
 let emailNotificationService = null;
 let digitalServicesService = null;
 let pushNotificationService = null;
+const startupState = {
+  ready: false,
+  listening: false,
+  startedAt: new Date().toISOString(),
+};
 let liveStateVersion = 1;
 let liveStateBroadcastScheduled = false;
 const liveStateSignatures = new Map();
@@ -257,7 +262,6 @@ function getSignalBotDiagnostics() {
   return {
     tokenLoaded: !!token,
     chatIdLoaded: !!signalConfig?.telegram?.chatId,
-    tokenPreview: token ? `${token.slice(0, 6)}...${token.slice(-4)}` : "",
     queueDepth: signalTelegramService.queue.length,
   };
 }
@@ -328,6 +332,25 @@ function persist({ required = false, bestEffort = false, operation = null, field
     );
   }
   return saveOperation;
+}
+
+function getHealthPayload() {
+  const mongoReady = !shouldUseMongo() || isMongoAppStatePersistenceReady();
+  return {
+    ok: startupState.ready,
+    status: startupState.ready ? "ready" : "starting",
+    storage: shouldUseMongo() ? "mongodb" : "local-json",
+    mongoConnected: mongoReady,
+    authoritativeStateLoaded: mongoReady,
+    startupBarrierPassed: mongoReady,
+    minimalCoreMode: isFinancialRecoveryMode(),
+    startup: {
+      ready: startupState.ready,
+      listening: startupState.listening,
+      startedAt: startupState.startedAt,
+    },
+    financialIntegrity: financialIntegrity.getStatus(),
+  };
 }
 
 function markRequestDurableMutation(operation) {
@@ -5326,6 +5349,16 @@ function clearSessionCookie(req, res) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    sendJson(res, 200, getHealthPayload());
+    return true;
+  }
+
+  if (!startupState.ready) {
+    sendJson(res, 503, { error: "Service is initializing authoritative state. Please retry shortly.", code: "STARTUP_INITIALIZING" });
+    return true;
+  }
+
   const withdrawalAdminPageMatch = url.pathname.match(/^\/admin\/withdrawals\/([^/]+)\/?$/);
   if (req.method === "GET" && withdrawalAdminPageMatch) {
     sendRedirect(res, buildWithdrawalAdminUrl({ id: decodeURIComponent(withdrawalAdminPageMatch[1] || "") }));
@@ -5437,19 +5470,6 @@ async function handleApi(req, res, url) {
     } catch (error) {
       sendJson(res, 400, { error: error.message });
     }
-    return true;
-  }
-
-  if (req.method === "GET" && url.pathname === "/api/health") {
-    sendJson(res, 200, {
-      ok: true,
-      storage: shouldUseMongo() ? "mongodb" : "local-json",
-      mongoConnected: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
-      authoritativeStateLoaded: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
-      startupBarrierPassed: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
-      minimalCoreMode: isFinancialRecoveryMode(),
-      financialIntegrity: financialIntegrity.getStatus(),
-    });
     return true;
   }
 
@@ -9494,6 +9514,11 @@ settingsUsersWss.on("connection", (socket, request, auth = {}) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
+  if (!startupState.ready) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+    socket.destroy();
+    return;
+  }
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.pathname !== SETTINGS_USERS_WS_PATH) {
     return;
@@ -9515,8 +9540,18 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 async function startServer() {
+  const startupStartedAt = Date.now();
+  const paystackValidationStartedAt = Date.now();
   paystackService.validateProductionEnvironment();
+  console.info(`[startup] payment-config-validation duration=${Date.now() - paystackValidationStartedAt}ms`);
+  const listenStartedAt = Date.now();
+  const listeningPort = await listenOnAvailablePort(server, port);
+  startupState.listening = true;
+  console.info(`[startup] health-only-listen duration=${Date.now() - listenStartedAt}ms`);
+  const authoritativeLoadStartedAt = Date.now();
   db = await loadDb();
+  console.info(`[startup] authoritative-load duration=${Date.now() - authoritativeLoadStartedAt}ms`);
+  const coreInitializationStartedAt = Date.now();
   setAuthoritativeDbProvider(() => db);
   financialIntegrity.registerAuthoritativeState();
   ensureAdminUser(db);
@@ -9568,8 +9603,9 @@ async function startServer() {
   questService.ensureState();
   primeLiveStateSignatures();
   autoTradeService.updateConfig(normalizeSignalAutoTradeConfig(db.meta?.signalAutoTrade || {}));
-
-  const listeningPort = await listenOnAvailablePort(server, port);
+  console.info(`[startup] core-service-initialization duration=${Date.now() - coreInitializationStartedAt}ms`);
+  startupState.ready = true;
+  console.info("[startup] startup-ready=true");
   const storageMode = shouldUseMongo() ? "MongoDB" : "local JSON file";
 
   if (listeningPort !== port) {
@@ -9577,6 +9613,7 @@ async function startServer() {
   }
 
   console.log(`Trade MVP running on http://localhost:${listeningPort} using ${storageMode} storage`);
+  console.info(`[startup] total-to-ready duration=${Date.now() - startupStartedAt}ms`);
   console.log(`Telegram signal bot diagnostics: ${JSON.stringify(getSignalBotDiagnostics())}`);
 
   if (isFinancialRecoveryMode()) {

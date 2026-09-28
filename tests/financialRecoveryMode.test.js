@@ -61,7 +61,8 @@ test("minimal core startup does not start optional signal, Telegram, or reconcil
   assert.match(server, /async function ensureTradeListenerRunning[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return false;/);
   assert.match(server, /async function sweepExpiredSignals[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return \[\];/);
   assert.match(server, /if \(!isFinancialRecoveryMode\(\)\) \{\s*socketSignalService\.attach/);
-  assert.match(server, /mongoConnected: !shouldUseMongo\(\) \|\| isMongoAppStatePersistenceReady\(\)/);
+  assert.match(server, /const mongoReady = !shouldUseMongo\(\) \|\| isMongoAppStatePersistenceReady\(\)/);
+  assert.match(server, /Service is initializing authoritative state/);
 });
 
 test("core financial save paths are explicitly scoped away from optional side effects", () => {
