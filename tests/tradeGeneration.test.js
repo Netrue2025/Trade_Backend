@@ -81,6 +81,16 @@ test("reconciliation selects current-generation trades before exchange reads", (
   assert.match(sourceBetween("function shouldReconcileTrade", "async function reconcileTradeStatuses"), /!isCurrentGenerationTrade\(trade\)/);
 });
 
+test("Telegram and user push notifications follow durable reconciliation persistence", () => {
+  const reconcile = sourceBetween("async function reconcileTradeStatuses", "function startTradeReconciliation");
+  const save = reconcile.lastIndexOf('await persist({ required: true, fields: ["tradeIntents"] });');
+  const entryNotice = reconcile.indexOf("for (const { trade, exchange } of entryNotificationsAfterPersist)");
+  const updateNotice = reconcile.indexOf("for (const { previousTrade, trade } of tradeUpdatesAfterPersist)");
+  assert.ok(save >= 0 && entryNotice > save && updateNotice > entryNotice);
+  assert.match(reconcile, /entryNotificationsAfterPersist\.push\(\{ trade, exchange \}\)/);
+  assert.match(reconcile, /tradeUpdatesAfterPersist\.push\(\{ previousTrade, trade \}\)/);
+});
+
 test("investment reconciliation resolves and filters the current-generation parent first", () => {
   for (const section of [
     sourceBetween("async function settleInactiveTradeInvestmentsForUsers", "async function settleClosedTradeInvestments"),

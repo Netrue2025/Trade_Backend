@@ -92,6 +92,33 @@ function closedTrade(id, profitPercent, closedAt, kind = "TAKE_PROFIT", createdA
   };
 }
 
+test("filled entry notifies Telegram subscribers and configured channel once per execution key", async () => {
+  const { channelMessages, listener, subscriberMessages } = createListenerHarness();
+  const trade = {
+    id: "entry-notification",
+    symbol: "BTCUSDT",
+    exchange: "bybit",
+    side: "BUY",
+    createdAt: "2026-09-28T10:00:00.000Z",
+    adminExecution: { orderId: "order-1", status: "FILLED", executedQty: "1", price: "100" },
+    exitOrders: [],
+  };
+  const event = {
+    eventKey: "entry-notification:order-1",
+    trade,
+    execution: trade.adminExecution,
+    kind: "ENTRY",
+  };
+
+  assert.equal((await listener.handleOrderExecuted(event)).ok, true);
+  assert.equal(subscriberMessages.length, 1);
+  assert.equal(channelMessages.length, 1);
+  assert.equal(channelMessages[0].options.type, "OPEN_TRADE");
+  assert.equal((await listener.handleOrderExecuted(event)).reason, "duplicate_order_execution");
+  assert.equal(subscriberMessages.length, 1);
+  assert.equal(channelMessages.length, 1);
+});
+
 test("recovered TP settlement publishes subscriber and configured channel messages", async () => {
   const { channelMessages, listener, subscriberMessages } = createListenerHarness();
   const trade = closedTrade("recovered", 1.25, "2026-09-24T10:00:00.000Z");

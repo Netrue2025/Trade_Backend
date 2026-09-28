@@ -3143,6 +3143,8 @@ async function reconcileTradeStatuses() {
   }
   let changed = false;
   const ownerSnapshotCache = new Map();
+  const entryNotificationsAfterPersist = [];
+  const tradeUpdatesAfterPersist = [];
 
   async function getOwnerSnapshot(user, exchange) {
     const account = getExchangeAccount(user, exchange);
@@ -3281,7 +3283,7 @@ async function reconcileTradeStatuses() {
         String(previousTrade?.adminExecution?.status || "").trim().toUpperCase() !== "FILLED"
         && String(trade?.adminExecution?.status || "").trim().toUpperCase() === "FILLED"
       ) {
-        await publishTradeOpenNotifications(trade, exchange);
+        entryNotificationsAfterPersist.push({ trade, exchange });
       }
 
       if (JSON.stringify(previousTrade || null) !== JSON.stringify(trade)) {
@@ -3300,9 +3302,7 @@ async function reconcileTradeStatuses() {
             fields: ["meta", "tradeIntents", "tradeInvestments", "wallets", "transactions"],
           });
         }
-        await tradeListener.handleTradeUpdated(previousTrade, trade).catch((error) => {
-          console.error(`Trade listener update failed for trade ${trade.id}:`, error.message);
-        });
+        tradeUpdatesAfterPersist.push({ previousTrade, trade });
       }
     } catch (error) {
       console.error(`Failed to reconcile trade ${trade.id}:`, error.message);
@@ -3313,6 +3313,15 @@ async function reconcileTradeStatuses() {
 
   if (changed) {
     await persist({ required: true, fields: ["tradeIntents"] });
+  }
+
+  for (const { trade, exchange } of entryNotificationsAfterPersist) {
+    await publishTradeOpenNotifications(trade, exchange);
+  }
+  for (const { previousTrade, trade } of tradeUpdatesAfterPersist) {
+    await tradeListener.handleTradeUpdated(previousTrade, trade).catch((error) => {
+      console.error(`Trade listener update failed for trade ${trade.id}:`, error.message);
+    });
   }
 }
 

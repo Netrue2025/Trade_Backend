@@ -122,16 +122,18 @@ function inferCategory(notification = {}) {
 }
 
 class PushNotificationService {
-  constructor({ db, persist = () => undefined, logger = console } = {}) {
+  constructor({ db, persist = () => undefined, logger = console, webPushClient = webpush } = {}) {
     this.db = db;
     this.persist = persist;
     this.logger = logger;
+    this.webPushClient = webPushClient;
+    this.deliveryPromises = new Map();
     this.publicKey = String(getEnvValue("VAPID_PUBLIC_KEY") || "").trim();
     this.privateKey = String(getEnvValue("VAPID_PRIVATE_KEY") || "").trim();
     this.subject = String(getEnvValue("VAPID_SUBJECT") || "mailto:support@netruefi.org").trim();
     this.configured = !!(this.publicKey && this.privateKey && this.subject);
     if (this.configured) {
-      webpush.setVapidDetails(this.subject, this.publicKey, this.privateKey);
+      this.webPushClient.setVapidDetails(this.subject, this.publicKey, this.privateKey);
     }
   }
 
@@ -253,34 +255,48 @@ class PushNotificationService {
       .map((item) => this.sanitizeSubscription(item));
   }
 
-  hasSentEvent(dedupeKey) {
-    if (!dedupeKey) {
-      return false;
-    }
-    return this.db.pushNotificationEvents.some((item) => item.dedupeKey === dedupeKey);
-  }
-
   recordEvent(dedupeKey, details = {}) {
-    if (!dedupeKey || this.hasSentEvent(dedupeKey)) {
+    if (!dedupeKey) {
       return;
     }
-    this.db.pushNotificationEvents.unshift({
-      id: randomId(12),
-      dedupeKey,
-      ...details,
-      createdAt: nowIso(),
-    });
+    const existing = this.db.pushNotificationEvents.find((item) => item.dedupeKey === dedupeKey);
+    if (existing) {
+      const deliveredEndpoints = new Set([
+        ...(existing.deliveredEndpoints || []),
+        ...(details.deliveredEndpoints || []),
+      ]);
+      Object.assign(existing, details, { deliveredEndpoints: [...deliveredEndpoints], updatedAt: nowIso() });
+    } else {
+      this.db.pushNotificationEvents.unshift({
+        id: randomId(12),
+        dedupeKey,
+        ...details,
+        createdAt: nowIso(),
+      });
+    }
     this.db.pushNotificationEvents = this.db.pushNotificationEvents.slice(0, 5000);
     this.persist();
   }
 
   async sendToUser(userId, payload = {}, { category = "appUpdates", dedupeKey = "" } = {}) {
+    const deliveryKey = dedupeKey ? `${userId}:${dedupeKey}` : "";
+    if (deliveryKey && this.deliveryPromises.has(deliveryKey)) {
+      return this.deliveryPromises.get(deliveryKey);
+    }
+    const delivery = this.deliverToUser(userId, payload, { category, dedupeKey });
+    if (!deliveryKey) return delivery;
+    this.deliveryPromises.set(deliveryKey, delivery);
+    try {
+      return await delivery;
+    } finally {
+      this.deliveryPromises.delete(deliveryKey);
+    }
+  }
+
+  async deliverToUser(userId, payload = {}, { category = "appUpdates", dedupeKey = "" } = {}, retryAttempt = 0) {
     this.ensureState();
     if (!this.configured || !userId) {
       return { sent: 0, skipped: true };
-    }
-    if (dedupeKey && this.hasSentEvent(dedupeKey)) {
-      return { sent: 0, skipped: true, duplicate: true };
     }
 
     const user = this.db.users.find((item) => item.id === userId);
@@ -290,11 +306,28 @@ class PushNotificationService {
     }
 
     const subscriptions = this.db.pushSubscriptions.filter((item) => item.userId === userId && item.enabled !== false);
+    if (!subscriptions.length) {
+      return { sent: 0, failed: 0, skipped: true, reason: "no_active_subscriptions" };
+    }
+    const event = dedupeKey
+      ? this.db.pushNotificationEvents.find((item) => item.dedupeKey === dedupeKey)
+      : null;
+    const deliveredEndpoints = new Set(event?.deliveredEndpoints || []);
+    if (
+      event
+      && event.failed === 0
+      && event.sent > 0
+      && (!Array.isArray(event.deliveredEndpoints) || subscriptions.every((item) => deliveredEndpoints.has(item.endpoint)))
+    ) {
+      return { sent: 0, failed: 0, skipped: true, duplicate: true };
+    }
     let sent = 0;
     let failed = 0;
+    let retryableFailure = false;
     for (const subscription of subscriptions) {
+      if (deliveredEndpoints.has(subscription.endpoint)) continue;
       try {
-        await webpush.sendNotification(
+        await this.webPushClient.sendNotification(
           {
             endpoint: subscription.endpoint,
             keys: subscription.keys,
@@ -302,6 +335,7 @@ class PushNotificationService {
           JSON.stringify(payload)
         );
         subscription.lastUsedAt = nowIso();
+        deliveredEndpoints.add(subscription.endpoint);
         sent += 1;
       } catch (error) {
         failed += 1;
@@ -309,13 +343,31 @@ class PushNotificationService {
           subscription.enabled = false;
           subscription.updatedAt = nowIso();
         } else {
+          retryableFailure = true;
           this.logger.warn("Web push delivery failed:", error.message || error);
         }
       }
     }
 
-    this.recordEvent(dedupeKey, { userId, category, sent, failed });
-    return { sent, failed };
+    if (sent || failed) {
+      this.recordEvent(dedupeKey, {
+        userId,
+        category,
+        sent: deliveredEndpoints.size,
+        failed,
+        deliveredEndpoints: [...deliveredEndpoints],
+      });
+    }
+    if (retryableFailure && retryAttempt < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const retryResult = await this.deliverToUser(userId, payload, { category, dedupeKey }, retryAttempt + 1);
+      return {
+        sent: sent + retryResult.sent,
+        failed: retryResult.failed,
+        retryable: retryResult.retryable,
+      };
+    }
+    return { sent, failed, retryable: failed > 0 };
   }
 
   async sendForNotification(notification = {}) {
