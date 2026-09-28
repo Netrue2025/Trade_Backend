@@ -60,6 +60,7 @@ const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
 const { AdminBonusReversalService, EXECUTION_ACTION: BONUS_REVERSAL_EXECUTION_ACTION } = require("./services/adminBonusReversalService");
+const { ArxAbandonedPrincipalReleaseService, EXECUTION_ACTION: ARX_PRINCIPAL_RELEASE_EXECUTION_ACTION } = require("./services/arxAbandonedPrincipalReleaseService");
 const { DepositApprovalService } = require("./services/depositApprovalService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber, toKobo } = require("./services/paystackService");
@@ -145,6 +146,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 let db = null;
 let financialService = null;
 let adminBonusReversalService = null;
+let arxAbandonedPrincipalReleaseService = null;
 let depositApprovalService = null;
 let questService = null;
 let vtuService = null;
@@ -9138,6 +9140,25 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/admin/recovery/arx-principal-release") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const body = await readBody(req);
+      const investmentId = String(body.investmentId || "").trim();
+      if (!investmentId) throw new Error("Investment ID is required.");
+      if (body.action === ARX_PRINCIPAL_RELEASE_EXECUTION_ACTION) {
+        const result = await arxAbandonedPrincipalReleaseService.execute(admin, investmentId, { action: body.action });
+        sendJson(res, result.status === "RELEASED" ? 201 : 200, result);
+      } else {
+        sendJson(res, 200, arxAbandonedPrincipalReleaseService.inspect(investmentId));
+      }
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
+    return true;
+  }
+
   const hideTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/hide$/);
   if (req.method === "POST" && hideTradeMatch) {
     const user = requireAuth(req, res, "user");
@@ -9582,6 +9603,12 @@ async function startServer() {
     persist,
     markFinancialMutation,
     createNotification: (notification) => financialService.createNotification(notification),
+  });
+  arxAbandonedPrincipalReleaseService = new ArxAbandonedPrincipalReleaseService({
+    db,
+    withUserFinancialLock,
+    persist,
+    markFinancialMutation,
   });
   financialService.ensureState();
   pushNotificationService.ensureState();
