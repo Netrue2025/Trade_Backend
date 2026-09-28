@@ -4,9 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { isTradeQuarantined } = require("../lib/tradeQuarantine");
+const { HISTORICAL_EXCLUDED_TRADE_IDS, isTradeQuarantined } = require("../lib/tradeQuarantine");
 
 const ARX_TRADE_ID = "89eaf6636270d40f995fde20";
+const XRP_HISTORICAL_TRADE_ID = "b0002ec3b525ec6de7d69a12";
 
 test("quarantine is generic, trade-id scoped, and does not affect another ARX trade", () => {
   const db = { systemSettings: { trading: { quarantinedTradeIds: [ARX_TRADE_ID] } } };
@@ -14,6 +15,14 @@ test("quarantine is generic, trade-id scoped, and does not affect another ARX tr
   assert.equal(isTradeQuarantined(db, { id: ARX_TRADE_ID, symbol: "ARXUSDT" }), true);
   assert.equal(isTradeQuarantined(db, { id: "future-arx", symbol: "ARXUSDT" }), false);
   assert.equal(isTradeQuarantined(db, "f171417518d760bb741e348c"), false);
+});
+
+test("ARX and historical XRP are permanently excluded without changing financial state", () => {
+  const emptySettings = { systemSettings: { trading: { quarantinedTradeIds: [] } } };
+  assert.equal(HISTORICAL_EXCLUDED_TRADE_IDS.has(ARX_TRADE_ID), true);
+  assert.equal(HISTORICAL_EXCLUDED_TRADE_IDS.has(XRP_HISTORICAL_TRADE_ID), true);
+  assert.equal(isTradeQuarantined(emptySettings, ARX_TRADE_ID), true);
+  assert.equal(isTradeQuarantined(emptySettings, XRP_HISTORICAL_TRADE_ID), true);
 });
 
 test("server skips quarantined trades in startup, periodic, and every automatic settlement path", () => {

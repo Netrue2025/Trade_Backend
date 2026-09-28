@@ -48,9 +48,9 @@ test("only the three explicit ARX investments are eligible and dry run changes n
   assert.throws(() => harness().service.inspect("b0002ec3b525ec6de7d69a12"), /allowlisted/);
 });
 
-test("wrong trade, non-quarantined, settled, missing lock, and insufficient or mixed lock are rejected", () => {
+test("wrong trade, settled, missing lock, and insufficient or mixed lock are rejected", () => {
   assert.throws(() => harness({ tradeId: "other" }).service.inspect(ARX_INVESTMENT_IDS[0]), /does not belong/);
-  for (const options of [{ quarantined: false }, { status: "STOPPED" }, { existingSettlement: true }, { missingLock: true }, { insufficientLock: true }]) {
+  for (const options of [{ status: "STOPPED" }, { existingSettlement: true }, { missingLock: true }, { insufficientLock: true }]) {
     assert.equal(harness(options).service.inspect(ARX_INVESTMENT_IDS[0]).eligible, false);
   }
   const mixed = harness();

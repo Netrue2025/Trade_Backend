@@ -143,3 +143,43 @@ test("required persistence failure still freezes financial integrity", () => {
   assert.match(persistence, /financialIntegrity\.freeze/);
   assert.match(persistence, /throw error/);
 });
+
+test("trade joins, creation, exits, and reconciliation use scoped required persistence", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const reconciliation = server.slice(server.indexOf("async function reconcileTradeStatuses"), server.indexOf("function startTradeReconciliation"));
+  const creation = server.slice(server.indexOf("async function createTradeIntent"), server.indexOf("async function executeSignalAutoTrade"));
+  const exit = server.slice(server.indexOf("async function executeTradeExit"), server.indexOf("async function autoPlaceTakeProfit"));
+  const takeProfit = server.slice(server.indexOf("async function autoPlaceTakeProfit"), server.indexOf("function isSecureRequest"));
+  const adminJoin = server.slice(server.indexOf("const adminUserJoinTradeMatch"), server.indexOf("const adminUserMessageMatch"));
+  const userJoin = server.slice(server.indexOf("const joinTradeMatch"), server.indexOf("const stopTradeMatch"));
+
+  assert.match(reconciliation, /fields: \["meta", "tradeIntents", "tradeInvestments", "wallets", "transactions"\]/);
+  assert.match(reconciliation, /await persist\(\{ required: true, fields: \["tradeIntents"\] \}\)/);
+  assert.match(creation, /await persist\(\{ required: true, fields: \["tradeIntents"\] \}\)/);
+  assert.match(exit, /fields: \["meta", "tradeIntents", "tradeInvestments", "wallets", "transactions"\]/);
+  assert.match(takeProfit, /await persist\(\{ required: true, fields: \["tradeIntents"\] \}\)/);
+  assert.match(adminJoin, /fields: \["meta", "tradeInvestments", "wallets", "transactions"\]/);
+  assert.match(userJoin, /fields: \["meta", "tradeInvestments", "wallets", "transactions", "referrals"\]/);
+  assert.match(server, /trade\.userJoinOpenNotifiedAt = nowIso\(\);\s*void persist\(\{ bestEffort: true, fields: \["tradeIntents", "notifications"\] \}\)/);
+  assert.doesNotMatch(adminJoin, /await persist\(\{ required: true \}\)/);
+  assert.doesNotMatch(userJoin, /await persist\(\{ required: true \}\)/);
+});
+
+test("settlement requires a complete filled exit and never uses a ticker snapshot", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const lifecycle = server.slice(server.indexOf("function deriveTradeLifecycle"), server.indexOf("function getStrategyReason"));
+  const settlement = server.slice(
+    server.indexOf("async function settleTradeInvestment"),
+    server.indexOf("async function settleInactiveTradeInvestmentsForUsers")
+  );
+  const closedPnl = server.slice(server.indexOf("function getAuthoritativeClosedTradePnlPercent"), server.indexOf("async function buildUserTradeInvestmentSummary"));
+
+  assert.match(lifecycle, /exitStatuses\.includes\("FILLED"\) && getRemainingTradeQuantity\(trade\) <= 1e-8/);
+  assert.match(closedPnl, /getWeightedAverageExecutionPrice\(getFilledExitExecutions\(trade\)\)/);
+  assert.match(closedPnl, /getRemainingTradeQuantity\(trade\) > 1e-8/);
+  assert.match(settlement, /getAuthoritativeClosedTradePnlPercent\(trade\)/);
+  assert.match(settlement, /TRADE_SETTLEMENT_EVIDENCE_INCOMPLETE/);
+  assert.doesNotMatch(settlement, /getTradePnlPercentSnapshot/);
+  assert.doesNotMatch(settlement, /getTickerPrice/);
+  assert.match(settlement, /void persist\(\{ bestEffort: true, fields: \["notifications", "auditLogs"\] \}\)/);
+});

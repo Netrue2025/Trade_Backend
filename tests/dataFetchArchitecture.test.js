@@ -95,7 +95,7 @@ test("trade settlement persists financial state before creating its success noti
   const settlement = source.slice(start, end);
   const requiredSave = settlement.indexOf("fields: [\"meta\", \"tradeInvestments\", \"wallets\", \"transactions\"]");
   const notification = settlement.indexOf("financialService.createNotification");
-  const bestEffortSave = settlement.indexOf("persist({ bestEffort: true })", notification);
+  const bestEffortSave = settlement.indexOf("persist({ bestEffort: true, fields: [\"notifications\", \"auditLogs\"] })", notification);
 
   assert.ok(requiredSave >= 0);
   assert.ok(notification > requiredSave);

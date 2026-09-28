@@ -3284,7 +3284,10 @@ async function reconcileTradeStatuses() {
           if (settledInvestments.length) {
             changed = true;
           }
-          await persist({ required: true });
+          await persist({
+            required: true,
+            fields: ["meta", "tradeIntents", "tradeInvestments", "wallets", "transactions"],
+          });
         }
         await tradeListener.handleTradeUpdated(previousTrade, trade).catch((error) => {
           console.error(`Trade listener update failed for trade ${trade.id}:`, error.message);
@@ -3298,7 +3301,7 @@ async function reconcileTradeStatuses() {
   await reconcileOrphanedClosedTradeInvestments();
 
   if (changed) {
-    persist();
+    await persist({ required: true, fields: ["tradeIntents"] });
   }
 }
 
@@ -3344,7 +3347,7 @@ async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS, {
 
 function deriveTradeLifecycle(trade) {
   const exitStatuses = (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution?.status).filter(Boolean);
-  if (exitStatuses.includes("FILLED")) {
+  if (exitStatuses.includes("FILLED") && getRemainingTradeQuantity(trade) <= 1e-8) {
     return "CLOSED";
   }
   const adminStatus = String(trade.adminExecution?.status || "").trim().toUpperCase();
@@ -3776,7 +3779,7 @@ function notifyUsersTradeOpenToJoin(trade) {
     });
   }
   trade.userJoinOpenNotifiedAt = nowIso();
-  persist();
+  void persist({ bestEffort: true, fields: ["tradeIntents", "notifications"] });
   return true;
 }
 
@@ -3958,6 +3961,19 @@ async function getTradePnlPercentSnapshot(trade, marketCache = new Map()) {
   return ((currentPrice - entryPrice) / entryPrice) * 100 * multiplier;
 }
 
+function getAuthoritativeClosedTradePnlPercent(trade) {
+  if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") {
+    return null;
+  }
+  const entryPrice = getTradeEntryPriceSnapshot(trade);
+  const exitPrice = getWeightedAverageExecutionPrice(getFilledExitExecutions(trade));
+  if (entryPrice <= 0 || exitPrice <= 0 || getTradeFilledEntryQuantity(trade) <= 0 || getRemainingTradeQuantity(trade) > 1e-8) {
+    return null;
+  }
+  const multiplier = trade.side === "SELL" ? -1 : 1;
+  return ((exitPrice - entryPrice) / entryPrice) * 100 * multiplier;
+}
+
 async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
   const dashboard = financialService.getDashboard(user);
   const rate = String(dashboard.totalBalance.usdtToNgnRate || "1600");
@@ -4028,9 +4044,13 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
   if (trade && isTradeQuarantined(db, trade)) {
     return investment;
   }
-  const pnlPercent = trade
-    ? await getTradePnlPercentSnapshot(trade, marketCache).catch(() => Number(investment.baselinePnlPercent || 0))
-    : Number(investment.baselinePnlPercent || 0);
+  const pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
+  if (pnlPercent === null) {
+    const error = new Error("Trade settlement requires a complete authoritative filled exit.");
+    error.code = "TRADE_SETTLEMENT_EVIDENCE_INCOMPLETE";
+    error.statusCode = 409;
+    throw error;
+  }
   const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
   const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
   return withUserFinancialLock(user.id, async () => {
@@ -4069,7 +4089,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       operation: { reason: "TRADE_SETTLEMENT", reference: settlementReference, userId: user.id },
     });
     financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade settled", message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`, entityType: "Trade", entityId: currentInvestment.tradeId });
-    void persist({ bestEffort: true });
+    void persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
     return currentInvestment;
   });
 }
@@ -4086,7 +4106,7 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
     if (trade && isTradeQuarantined(db, trade)) {
       continue;
     }
-    if (trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+    if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") {
       continue;
     }
     const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
@@ -4104,7 +4124,7 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
 }
 
 async function settleClosedTradeInvestments(trade, options = {}) {
-  if (!trade || isTradeQuarantined(db, trade) || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+  if (!trade || isTradeQuarantined(db, trade) || deriveTradeLifecycle(trade) !== "CLOSED") {
     return [];
   }
 
@@ -4944,7 +4964,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   }
 
   db.tradeIntents.unshift(trade);
-  persist();
+  await persist({ required: true, fields: ["tradeIntents"] });
   await tradeListener.handleTradeCreated(trade).catch((error) => {
     console.error(`Trade listener create event failed for trade ${trade.id}:`, error.message);
   });
@@ -5198,7 +5218,10 @@ async function executeTradeExit(trade, admin, options = {}) {
       createdBy: admin.id,
     });
   }
-  await persist({ required: true });
+  await persist({
+    required: true,
+    fields: ["meta", "tradeIntents", "tradeInvestments", "wallets", "transactions"],
+  });
   await tradeListener.handleExitOrderCreated(trade, exitOrder).catch((error) => {
     console.error(`Trade listener exit event failed for trade ${trade.id}:`, error.message);
   });
@@ -5309,7 +5332,7 @@ async function autoPlaceTakeProfit(trade, options = {}) {
   }
 
   trade.exitOrders.push(exitOrder);
-  persist();
+  await persist({ required: true, fields: ["tradeIntents"] });
   return exitOrder;
 }
 
@@ -8752,7 +8775,11 @@ async function handleApi(req, res, url) {
         ensureTradeInvestmentsState().unshift(nextInvestment);
         financialService.createNotification({ userId: targetUser.id, type: "TRADE", title: "Trade joined", message: `Admin added you to ${trade.symbol}.`, entityType: "Trade", entityId: trade.id, category: "tradingSignals", route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}` });
         financialService.notifyAdminTradeJoined(targetUser, nextInvestment, trade);
-        await persist({ required: true });
+        await persist({
+          required: true,
+          fields: ["meta", "tradeInvestments", "wallets", "transactions"],
+        });
+        void persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
         return nextInvestment;
       });
       scheduleSettingsUsersBroadcast("admin_user_trade_joined");
@@ -9090,7 +9117,11 @@ async function handleApi(req, res, url) {
         financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade joined", message: `You joined ${trade.symbol}.`, entityType: "Trade", entityId: trade.id, category: "tradingSignals", route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}` });
         financialService.notifyAdminTradeJoined(user, nextInvestment, trade);
         financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
-        await persist({ required: true });
+        await persist({
+          required: true,
+          fields: ["meta", "tradeInvestments", "wallets", "transactions", "referrals"],
+        });
+        void persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
         return nextInvestment;
       });
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id), membership: financialService.getMembershipSummary(user) });
