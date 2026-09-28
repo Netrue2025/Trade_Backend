@@ -344,6 +344,7 @@ function defaultSettings() {
       dailyPerformanceMode: "manual",
       supportedExchanges: ["bybit", "binance"],
       minJoinUsdt: getEnvValue("MIN_TRADE_JOIN_USDT") || DEFAULT_MIN_TRADE_JOIN_USDT,
+      quarantinedTradeIds: ["89eaf6636270d40f995fde20"],
     },
     referral: {
       enabled: true,
@@ -465,6 +466,14 @@ class FinancialService {
       trading: {
         ...defaultSettings().trading,
         ...(this.db.systemSettings?.trading || {}),
+        quarantinedTradeIds: [
+          ...new Set([
+            ...defaultSettings().trading.quarantinedTradeIds,
+            ...(Array.isArray(this.db.systemSettings?.trading?.quarantinedTradeIds)
+              ? this.db.systemSettings.trading.quarantinedTradeIds.map(String)
+              : []),
+          ]),
+        ],
       },
       referral: {
         ...defaultSettings().referral,

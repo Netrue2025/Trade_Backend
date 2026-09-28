@@ -49,6 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
+const { isTradeQuarantined } = require("./lib/tradeQuarantine");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -3061,6 +3062,10 @@ function shouldReconcileTrade(trade) {
     return false;
   }
 
+  if (isTradeQuarantined(db, trade)) {
+    return false;
+  }
+
   if (isExecutionActive(trade.adminExecution)) {
     return true;
   }
@@ -3490,7 +3495,7 @@ function serializeTradeForAdmin(trade) {
   return {
     ...trade,
     exchange: getTradeExchange(trade),
-    lifecycleStatus: deriveTradeLifecycle(trade),
+    lifecycleStatus: isTradeQuarantined(db, trade) ? "QUARANTINED" : deriveTradeLifecycle(trade),
     closedAt: getTradeClosedAt(trade),
     joinedUsersCount: joinedUsers.count,
     joinedUsers: joinedUsers.users,
@@ -3500,7 +3505,8 @@ function serializeTradeForAdmin(trade) {
 function serializeTradeForUser(trade, userId) {
   const mirror = (trade.mirroredExecutions || []).find((item) => item.userId === userId);
   const investment = getUserTradeInvestmentRecord(trade.id, userId);
-  const lifecycleStatus = investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
+  const quarantined = isTradeQuarantined(db, trade);
+  const lifecycleStatus = quarantined ? "QUARANTINED" : investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
   const exits = (trade.exitOrders || []).map((item) => ({
     ...item,
     mirroredExecution: (item.mirroredExecutions || []).find((row) => row.userId === userId) || null,
@@ -3519,7 +3525,7 @@ function serializeTradeForUser(trade, userId) {
     stopLossTargetPrice: trade.stopLossTargetPrice || null,
     strategyContext: trade.strategyContext || null,
     lifecycleStatus,
-    actualLifecycleStatus: deriveTradeLifecycle(trade),
+    actualLifecycleStatus: quarantined ? "QUARANTINED" : deriveTradeLifecycle(trade),
     closedAt: getTradeClosedAt(trade),
     adminExecution: trade.adminExecution,
     mirroredExecution: mirror || null,
@@ -3962,11 +3968,14 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
 function getWithdrawalBlockingTradeInvestments(userId) {
   return getActiveUserTradeInvestments(userId).filter((investment) => {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
-    return !!trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
+    return !!trade && !isTradeQuarantined(db, trade) && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
   });
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
+  if (trade && isTradeQuarantined(db, trade)) {
+    return investment;
+  }
   const pnlPercent = trade
     ? await getTradePnlPercentSnapshot(trade, marketCache).catch(() => Number(investment.baselinePnlPercent || 0))
     : Number(investment.baselinePnlPercent || 0);
@@ -4022,6 +4031,9 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
 
   for (const investment of activeInvestments) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (trade && isTradeQuarantined(db, trade)) {
+      continue;
+    }
     if (trade && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
       continue;
     }
@@ -4040,7 +4052,7 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
 }
 
 async function settleClosedTradeInvestments(trade, options = {}) {
-  if (!trade || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+  if (!trade || isTradeQuarantined(db, trade) || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
     return [];
   }
 
@@ -4074,6 +4086,7 @@ async function reconcileOrphanedClosedTradeInvestments() {
 
   for (const investment of candidates) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (trade && isTradeQuarantined(db, trade)) continue;
     if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") continue;
 
     const user = db.users.find((item) => item.id === investment.userId);
@@ -8932,6 +8945,10 @@ async function handleApi(req, res, url) {
       const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(joinTradeMatch[1] || ""));
       if (!trade) {
         sendJson(res, 404, { error: "Trade not found." });
+        return true;
+      }
+      if (isTradeQuarantined(db, trade)) {
+        sendJson(res, 409, { error: "This trade is under review and cannot accept joins.", code: "TRADE_QUARANTINED" });
         return true;
       }
       const lifecycleStatus = deriveTradeLifecycle(trade);
