@@ -139,8 +139,12 @@ test("unsafe VTU and wallet shop flows remain independently disabled after recov
 
 test("server recovery gates cover trade creation, reconciliation, settlement, deposits, withdrawals, gift cards, and quest money", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert.match(server, /TRADING_OPERATIONS_ISOLATED trade reconciliation skipped/);
-  assert.match(server, /if \(isTradingIsolationMode\(\)\) \{\s*return null;/);
+  assert.match(server, /TRADE_RECONCILIATION_NOT_READY_OR_NOT_AUTHORIZED skipped/);
+  const startReconciliation = server.slice(server.indexOf("function startTradeReconciliation"), server.indexOf("async function waitForTradeReconciliation"));
+  assert.match(startReconciliation, /!startupState\.ready/);
+  assert.match(startReconciliation, /isTradingIsolationMode\(\)/);
+  assert.match(startReconciliation, /isMongoAppStatePersistenceReady/);
+  assert.match(startReconciliation, /financialIntegrity\.getStatus\(\)\.writable/);
   assert.match(server, /async function settleTradeInvestment[\s\S]*?isTradingIsolationMode\(\)/);
   assert.match(server, /async function settleStaleTradeInvestmentsForWithdrawal[\s\S]*?if \(isTradingIsolationMode\(\)\) \{[\s\S]*?settled: \[\]/);
   assert.match(server, /async function reconcileExternalClosuresForOwner[\s\S]*?isTradingIsolationMode\(\)/);

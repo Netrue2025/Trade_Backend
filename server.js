@@ -59,6 +59,12 @@ const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/e
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { deriveTradeLifecycle: classifyTradeLifecycle } = require("./lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL, FIXED_ROUND_TRIP_FEE_RATE, calculateFixedRoundTripSettlement } = require("./lib/tradingFee");
+const {
+  isCurrentGenerationTrade,
+  requireCurrentGenerationTrade,
+  selectCurrentGenerationInvestments,
+  selectCurrentGenerationTrades,
+} = require("./lib/tradeGeneration");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
@@ -2686,6 +2692,7 @@ function detachUserFromMirroring(userId) {
   let changed = false;
 
   for (const trade of db.tradeIntents) {
+    if (!isCurrentGenerationTrade(trade)) continue;
     const nextMirrors = (trade.mirroredExecutions || []).filter((mirror) => mirror.userId !== userId);
     if (nextMirrors.length !== (trade.mirroredExecutions || []).length) {
       trade.mirroredExecutions = nextMirrors;
@@ -2901,6 +2908,7 @@ async function syncCanceledOrderInTrades(user, canceledOrder, symbol) {
   let changed = false;
 
   for (const trade of db.tradeIntents) {
+    if (!isCurrentGenerationTrade(trade)) continue;
     if (
       user.role === "admin" &&
       trade.createdByUserId === user.id &&
@@ -3103,7 +3111,7 @@ async function reconcileExecution(account, symbol, execution, exchange = getAcco
 }
 
 function shouldReconcileTrade(trade) {
-  if (!trade) {
+  if (!trade || !isCurrentGenerationTrade(trade)) {
     return false;
   }
 
@@ -3127,8 +3135,10 @@ function shouldReconcileTrade(trade) {
 }
 
 async function reconcileTradeStatuses() {
-  if (isTradingIsolationMode()) {
-    console.warn("TRADING_OPERATIONS_ISOLATED trade reconciliation skipped");
+  if (!startupState.ready || !startupState.listening || isTradingIsolationMode()
+    || (shouldUseMongo() && !isMongoAppStatePersistenceReady())
+    || !financialIntegrity.getStatus().writable || financialIntegrity.getStatus().persistenceFrozen) {
+    console.warn("TRADE_RECONCILIATION_NOT_READY_OR_NOT_AUTHORIZED skipped");
     return;
   }
   let changed = false;
@@ -3158,10 +3168,8 @@ async function reconcileTradeStatuses() {
     }
   }
 
-  for (const trade of db.tradeIntents) {
-    if (!shouldReconcileTrade(trade)) {
-      continue;
-    }
+  const candidates = selectCurrentGenerationTrades(db.tradeIntents).filter(shouldReconcileTrade);
+  for (const trade of candidates) {
 
     const previousTrade = cloneSerializable(trade);
     try {
@@ -3309,7 +3317,9 @@ async function reconcileTradeStatuses() {
 }
 
 function startTradeReconciliation(force = false) {
-  if (isTradingIsolationMode()) {
+  if (!startupState.ready || !startupState.listening || isTradingIsolationMode()
+    || (shouldUseMongo() && !isMongoAppStatePersistenceReady())
+    || !financialIntegrity.getStatus().writable || financialIntegrity.getStatus().persistenceFrozen) {
     return null;
   }
   const now = Date.now();
@@ -3538,7 +3548,7 @@ function serializeTradeForUser(trade, userId) {
   const mirror = (trade.mirroredExecutions || []).find((item) => item.userId === userId);
   const investment = getUserTradeInvestmentRecord(trade.id, userId);
   const quarantined = isTradeQuarantined(db, trade);
-  const lifecycleStatus = quarantined ? "QUARANTINED" : investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
+  const lifecycleStatus = quarantined ? "QUARANTINED" : !isCurrentGenerationTrade(trade) ? "HISTORICAL" : investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
   const exits = (trade.exitOrders || []).map((item) => ({
     ...item,
     mirroredExecution: (item.mirroredExecutions || []).find((row) => row.userId === userId) || null,
@@ -3614,6 +3624,7 @@ function buildLiveState(user) {
   const ngnLocked = String(ngnWallet.lockedBalance || "0");
   const usdtLocked = String(usdtWallet.lockedBalance || "0");
   const visibleTrades = (db.tradeIntents || []).filter((trade) => {
+    if (!isCurrentGenerationTrade(trade)) return false;
     const lifecycle = deriveTradeLifecycle(trade);
     if (!['OPEN', 'PENDING'].includes(lifecycle)) return false;
     if (user.role === "admin") return true;
@@ -4066,6 +4077,20 @@ function getWithdrawalBlockingTradeInvestments(userId) {
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
+  const persistedInvestment = (Array.isArray(db.tradeInvestments) ? db.tradeInvestments : [])
+    .find((item) => item.id === investment?.id && item.userId === user?.id);
+  const parentTrade = persistedInvestment
+    ? (db.tradeIntents || []).find((item) => item.id === persistedInvestment.tradeId)
+    : null;
+  if (!persistedInvestment || !parentTrade || (trade && trade.id !== parentTrade.id)) {
+    const error = new Error("Trade settlement parent does not match this investment.");
+    error.code = "TRADE_SETTLEMENT_PARENT_MISMATCH";
+    error.statusCode = 409;
+    throw error;
+  }
+  requireCurrentGenerationTrade(parentTrade);
+  investment = persistedInvestment;
+  trade = parentTrade;
   if (isTradingIsolationMode()) {
     return investment;
   }
@@ -4131,13 +4156,12 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
 async function settleInactiveTradeInvestmentsForUsers(options = {}) {
   const marketCache = new Map();
   const settled = [];
-  const activeInvestments = ensureTradeInvestmentsState().filter(
-    (investment) => investment.status === "ACTIVE" && (!options.userId || investment.userId === options.userId)
-  );
+  const activeInvestments = selectCurrentGenerationInvestments(ensureTradeInvestmentsState(), db.tradeIntents)
+    .filter((investment) => investment.status === "ACTIVE" && (!options.userId || investment.userId === options.userId));
 
   for (const investment of activeInvestments) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
-    if (trade && isTradeQuarantined(db, trade)) {
+    if (!isCurrentGenerationTrade(trade) || isTradeQuarantined(db, trade)) {
       continue;
     }
     if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") {
@@ -4158,7 +4182,7 @@ async function settleInactiveTradeInvestmentsForUsers(options = {}) {
 }
 
 async function settleClosedTradeInvestments(trade, options = {}) {
-  if (!trade || isTradeQuarantined(db, trade) || deriveTradeLifecycle(trade) !== "CLOSED") {
+  if (!isCurrentGenerationTrade(trade) || isTradeQuarantined(db, trade) || deriveTradeLifecycle(trade) !== "CLOSED") {
     return [];
   }
 
@@ -4185,15 +4209,15 @@ async function settleClosedTradeInvestments(trade, options = {}) {
 const loggedInvestmentRecoveryReviews = new Set();
 
 async function reconcileOrphanedClosedTradeInvestments() {
-  const candidates = ensureTradeInvestmentsState().filter((investment) => investment.status === "ACTIVE");
+  const candidates = selectCurrentGenerationInvestments(ensureTradeInvestmentsState(), db.tradeIntents)
+    .filter((investment) => investment.status === "ACTIVE");
   const marketCache = new Map();
   const settled = [];
   const recoveredTrades = new Map();
 
   for (const investment of candidates) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
-    if (trade && isTradeQuarantined(db, trade)) continue;
-    if (!trade || deriveTradeLifecycle(trade) !== "CLOSED") continue;
+    if (!isCurrentGenerationTrade(trade) || isTradeQuarantined(db, trade) || deriveTradeLifecycle(trade) !== "CLOSED") continue;
 
     const user = db.users.find((item) => item.id === investment.userId);
     const assessment = assessClosedTradeInvestmentRecovery({
@@ -5128,6 +5152,7 @@ autoTradeService.setExecutor(executeSignalAutoTrade);
 
 async function executeTradeExit(trade, admin, options = {}) {
   assertTradingOperationAllowed();
+  requireCurrentGenerationTrade(trade);
   const exchange = getTradeExchange(trade);
   const adminAccount = getExchangeAccount(admin, exchange);
   if (!adminAccount) {
@@ -5265,6 +5290,7 @@ async function executeTradeExit(trade, admin, options = {}) {
 
 async function autoPlaceTakeProfit(trade, options = {}) {
   assertTradingOperationAllowed();
+  requireCurrentGenerationTrade(trade);
   const force = !!options.force;
   if (!trade.takeProfitTargetPrice || trade.side !== "BUY") {
     return;
@@ -8814,6 +8840,10 @@ async function handleApi(req, res, url) {
         sendJson(res, 404, { error: "Trade not found." });
         return true;
       }
+      if (!isCurrentGenerationTrade(trade)) {
+        sendJson(res, 409, { error: "Historical trades are read-only and cannot accept joins.", code: "HISTORICAL_TRADE_READ_ONLY" });
+        return true;
+      }
       if (deriveTradeLifecycle(trade) !== "OPEN") {
         sendJson(res, 400, { error: "This order is still queued. Users can only join filled open trades." });
         return true;
@@ -9142,6 +9172,10 @@ async function handleApi(req, res, url) {
         sendJson(res, 404, { error: "Trade not found." });
         return true;
       }
+      if (!isCurrentGenerationTrade(trade)) {
+        sendJson(res, 409, { error: "Historical trades are read-only and cannot accept joins.", code: "HISTORICAL_TRADE_READ_ONLY" });
+        return true;
+      }
       if (isTradeQuarantined(db, trade)) {
         sendJson(res, 409, { error: "This trade is under review and cannot accept joins.", code: "TRADE_QUARANTINED" });
         return true;
@@ -9203,6 +9237,10 @@ async function handleApi(req, res, url) {
       const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(stopTradeMatch[1] || ""));
       if (!trade) {
         sendJson(res, 404, { error: "Trade not found." });
+        return true;
+      }
+      if (!isCurrentGenerationTrade(trade)) {
+        sendJson(res, 409, { error: "Historical trades are read-only.", code: "HISTORICAL_TRADE_READ_ONLY" });
         return true;
       }
       const investment = getUserTradeInvestment(trade.id, user.id);
@@ -9315,7 +9353,7 @@ async function handleApi(req, res, url) {
         return false;
       }
       const lifecycleStatus = deriveTradeLifecycle(trade);
-      return lifecycleStatus === "OPEN" || lifecycleStatus === "PENDING";
+      return !isCurrentGenerationTrade(trade) || lifecycleStatus === "OPEN" || lifecycleStatus === "PENDING";
     });
 
     if (protectedTrades.length) {
@@ -9378,6 +9416,10 @@ async function handleApi(req, res, url) {
     const trade = db.tradeIntents.find((item) => item.id === takeProfitMatch[1]);
     if (!trade) {
       sendJson(res, 404, { error: "Trade not found." });
+      return true;
+    }
+    if (!isCurrentGenerationTrade(trade)) {
+      sendJson(res, 409, { error: "Historical trades are read-only.", code: "HISTORICAL_TRADE_READ_ONLY" });
       return true;
     }
     const exchange = getTradeExchange(trade);
