@@ -48,6 +48,7 @@ loadEnvFile();
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
+const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -2919,20 +2920,6 @@ async function syncCanceledOrderInTrades(user, canceledOrder, symbol) {
   return changed;
 }
 
-function createExternalCloseExecution(quantity) {
-  return {
-    status: "FILLED",
-    type: "MARKET",
-    side: "SELL",
-    price: "0",
-    origQty: String(quantity),
-    executedQty: String(quantity),
-    cummulativeQuoteQty: "0",
-    transactTime: Date.now(),
-    external: true,
-  };
-}
-
 function inferBaseAssetFromSymbol(symbol) {
   const normalizedSymbol = String(symbol || "").trim().toUpperCase();
   const quoteAsset = KNOWN_QUOTE_ASSETS.find(
@@ -2995,15 +2982,44 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     return false;
   }
 
+  const entryExecution = userId
+    ? (trade.mirroredExecutions || []).find((mirror) => mirror.userId === userId)?.order
+    : trade.adminExecution;
+  const knownExitOrderIds = (trade.exitOrders || []).flatMap((exitOrder) => {
+    if (!userId) return [exitOrder.adminExecution?.orderId];
+    return [(exitOrder.mirroredExecutions || []).find((mirror) => mirror.userId === userId)?.order?.orderId];
+  }).filter(Boolean);
+  const executionHistoryReader = getExchangeClient(exchange).getExecutionHistory;
+  if (typeof executionHistoryReader !== "function") {
+    console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "execution_history_unavailable" });
+    return false;
+  }
+  const executions = await executionHistoryReader(account, trade.symbol, {
+    startTime: Math.max(0, Number(entryExecution?.transactTime || 0) - 60_000),
+  }).catch(() => null);
+  const authoritativeExecution = executions && reconstructExternalClose({
+    entryExecution,
+    knownExitOrderIds,
+    executions,
+    baseAsset,
+    remainingQuantity: remainingQty,
+    currentBaseBalance: normalizedBalance,
+    tolerance: Math.max(Number(minQty || 0), 1e-8),
+  });
+  if (!authoritativeExecution) {
+    console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "authoritative_exit_not_proven" });
+    return false;
+  }
+
   const externalExit = {
     id: randomId(10),
     kind: "EXTERNAL_CLOSE",
     createdAt: nowIso(),
     side: "SELL",
     type: "MARKET",
-    price: null,
-    quantity: String(remainingQty),
-    adminExecution: userId ? null : createExternalCloseExecution(remainingQty),
+    price: authoritativeExecution.price,
+    quantity: authoritativeExecution.executedQty,
+    adminExecution: userId ? null : authoritativeExecution,
     mirroredExecutions: userId
       ? [
           {
@@ -3012,7 +3028,7 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
             purpose: "EXTERNAL_CLOSE",
             status: "FILLED",
             error: null,
-            order: createExternalCloseExecution(remainingQty),
+            order: authoritativeExecution,
           },
         ]
       : [],
