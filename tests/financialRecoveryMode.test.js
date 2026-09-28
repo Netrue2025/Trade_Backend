@@ -97,7 +97,7 @@ test("request-like context cannot enable validation without trusted server confi
   });
 });
 
-test("trading remains isolated after recovery mode is disabled until separately approved", () => {
+test("trading requires its explicit enable and approval flags independently of other recovery operations", () => {
   withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: undefined, TRADING_RESTORATION_APPROVED: undefined }, () => {
     assert.equal(isFinancialRecoveryMode(), false);
     assert.equal(isTradingOperationsEnabled(), false);
@@ -113,7 +113,10 @@ test("trading remains isolated after recovery mode is disabled until separately 
     assert.equal(isTradingIsolationMode(), false);
   });
   withEnv({ FINANCIAL_RECOVERY_MODE: "true", TRADING_OPERATIONS_ENABLED: "true", TRADING_RESTORATION_APPROVED: "true" }, () => {
-    assert.equal(isTradingOperationsEnabled(), false);
+    assert.equal(isTradingOperationsEnabled(), true);
+    assert.equal(isTradingIsolationMode(), false);
+    assert.equal(isRecoveryOperationAllowed("DEPOSIT_CREATE", { actorUserId: "user-1", targetUserId: "user-1" }), false);
+    assert.equal(isRecoveryOperationAllowed("WITHDRAWAL_CREATE", { actorUserId: "user-1", targetUserId: "user-1" }), false);
   });
 });
 

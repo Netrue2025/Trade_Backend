@@ -167,14 +167,15 @@ test("trade joins, creation, exits, and reconciliation use scoped required persi
 
 test("settlement requires a complete filled exit and never uses a ticker snapshot", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const lifecycle = server.slice(server.indexOf("function deriveTradeLifecycle"), server.indexOf("function getStrategyReason"));
+  const lifecycle = fs.readFileSync(path.join(__dirname, "..", "lib", "tradeLifecycle.js"), "utf8");
   const settlement = server.slice(
     server.indexOf("async function settleTradeInvestment"),
     server.indexOf("async function settleInactiveTradeInvestmentsForUsers")
   );
   const closedPnl = server.slice(server.indexOf("function getAuthoritativeClosedTradePnlPercent"), server.indexOf("async function buildUserTradeInvestmentSummary"));
 
-  assert.match(lifecycle, /exitStatuses\.includes\("FILLED"\) && getRemainingTradeQuantity\(trade\) <= 1e-8/);
+  assert.match(lifecycle, /exitStatuses\.includes\("FILLED"\) && entryQuantity > 0 && remainingQuantity <= 1e-8/);
+  assert.match(lifecycle, /remainingQuantity > 1e-8/);
   assert.match(closedPnl, /getWeightedAverageExecutionPrice\(getFilledExitExecutions\(trade\)\)/);
   assert.match(closedPnl, /getRemainingTradeQuantity\(trade\) > 1e-8/);
   assert.match(settlement, /getAuthoritativeClosedTradePnlPercent\(trade\)/);

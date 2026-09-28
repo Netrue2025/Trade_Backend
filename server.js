@@ -57,6 +57,8 @@ const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
+const { deriveTradeLifecycle: classifyTradeLifecycle } = require("./lib/tradeLifecycle");
+const { CURRENT_TRADE_FEE_MODEL, FIXED_ROUND_TRIP_FEE_RATE, calculateFixedRoundTripSettlement } = require("./lib/tradingFee");
 const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
@@ -3347,30 +3349,7 @@ async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS, {
 }
 
 function deriveTradeLifecycle(trade) {
-  const exitStatuses = (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution?.status).filter(Boolean);
-  if (exitStatuses.includes("FILLED") && getRemainingTradeQuantity(trade) <= 1e-8) {
-    return "CLOSED";
-  }
-  const adminStatus = String(trade.adminExecution?.status || "").trim().toUpperCase();
-  if (!trade.adminExecution || !adminStatus) {
-    return "CANCELED";
-  }
-  if (adminStatus === "NEW" || adminStatus === "PARTIALLY_FILLED") {
-    return "PENDING";
-  }
-  if (adminStatus === "FILLED" && trade.side === "BUY") {
-    return "OPEN";
-  }
-  if (adminStatus === "FILLED" && trade.side === "SELL") {
-    return "CLOSED";
-  }
-  if (adminStatus === "CANCELED") {
-    return "CANCELED";
-  }
-  if (adminStatus === "ERROR") {
-    return "ERROR";
-  }
-  return "CANCELED";
+  return classifyTradeLifecycle(trade, getRemainingTradeQuantity);
 }
 
 function getStrategyReason(trade) {
@@ -3873,8 +3852,56 @@ function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user
   }));
 }
 
-function releaseTradeInvestmentFunds(user, investment, settledPnlUsdt) {
+function releaseCurrentGenerationTradeInvestmentFunds(user, investment, grossPnlPercent) {
   const fundingSources = getInvestmentFundingSources(investment);
+  const rate = db.systemSettings.exchangeRate.usdtToNgn;
+  const releasedSources = fundingSources.map((source) => {
+    const wallet = financialService.ensureWallet(user.id, source.currency);
+    if (compare(wallet.lockedBalance, source.amount) < 0) {
+      throw new Error("Investment locked balance is out of sync.");
+    }
+    const calculation = calculateFixedRoundTripSettlement(source.amount, grossPnlPercent);
+    const balanceBefore = wallet.availableBalance;
+    const lockedBefore = wallet.lockedBalance;
+    wallet.lockedBalance = subtract(wallet.lockedBalance, source.amount);
+    wallet.availableBalance = add(wallet.availableBalance, calculation.settlementAmount);
+    wallet.updatedAt = nowIso();
+    return {
+      currency: source.currency,
+      lockedAmount: source.amount,
+      releasedAmount: calculation.settlementAmount,
+      balanceBefore,
+      balanceAfter: wallet.availableBalance,
+      lockedBalanceBefore: lockedBefore,
+      lockedBalanceAfter: wallet.lockedBalance,
+      grossPnl: calculation.grossPnl,
+      tradingFee: calculation.tradingFee,
+      netPnl: calculation.netPnl,
+      netPnlPercent: calculation.netPnlPercent,
+    };
+  });
+
+  const toUsdt = (amount, currency) => currency === "USDT"
+    ? amount
+    : financialService.convertAmount(amount, currency, "USDT", rate);
+  return {
+    releasedPrincipalUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.lockedAmount, source.currency)), "0"),
+    grossPnlUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.grossPnl, source.currency)), "0"),
+    tradingFeeUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.tradingFee, source.currency)), "0"),
+    netPnlUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.netPnl, source.currency)), "0"),
+    netPnlPercent: subtract(grossPnlPercent, "0.2"),
+    netSettlementUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.releasedAmount, source.currency)), "0"),
+    releasedSources,
+    tradingFeeModel: CURRENT_TRADE_FEE_MODEL,
+    tradingFeeRate: FIXED_ROUND_TRIP_FEE_RATE,
+  };
+}
+
+function releaseTradeInvestmentFunds(user, investment, settledPnlUsdt, options = {}) {
+  const fundingSources = getInvestmentFundingSources(investment);
+  if (options.applyFixedRoundTripFee && fundingSources.length) {
+    return releaseCurrentGenerationTradeInvestmentFunds(user, investment, options.grossPnlPercent);
+  }
   if (!fundingSources.length) {
     const wallet = financialService.ensureWallet(user.id, "USDT");
     wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
@@ -4053,7 +4080,9 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     throw error;
   }
   const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
-  const settledPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
+  const grossPnlPercent = toMoneyDecimal(pnlDeltaPercent);
+  const grossPnlUsdt = multiplyRatio(investment.amountUsdt || "0", grossPnlPercent, "100");
+  const applyFixedRoundTripFee = trade?.settlementFeeModel === CURRENT_TRADE_FEE_MODEL;
   return withUserFinancialLock(user.id, async () => {
     const currentInvestment = ensureTradeInvestmentsState().find((item) => item.id === investment.id);
     if (!currentInvestment || currentInvestment.status !== "ACTIVE") return currentInvestment || investment;
@@ -4062,7 +4091,11 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     if (existingTransaction) return currentInvestment;
 
     const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
-    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, settledPnlUsdt);
+    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, grossPnlUsdt, {
+      applyFixedRoundTripFee,
+      grossPnlPercent,
+    });
+    const settledPnlUsdt = applyFixedRoundTripFee ? settlement.netPnlUsdt : grossPnlUsdt;
     const touchedWallets = settlement.releasedSources.map((source) => financialService.ensureWallet(user.id, source.currency));
     if (!touchedWallets.length) touchedWallets.push(financialService.ensureWallet(user.id, "USDT"));
     markFinancialMutation(touchedWallets, "TRADE_SETTLEMENT", settlementReference);
@@ -4070,7 +4103,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     currentInvestment.status = "STOPPED";
     currentInvestment.stoppedAt = nowIso();
     currentInvestment.updatedAt = currentInvestment.stoppedAt;
-    currentInvestment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
+    currentInvestment.stopPnlPercent = applyFixedRoundTripFee ? settlement.netPnlPercent : String(Number(pnlPercent.toFixed(8)));
     currentInvestment.settledPnlUsdt = settledPnlUsdt;
     currentInvestment.netSettlementUsdt = settlement.netSettlementUsdt;
     currentInvestment.stopReason = options.reason || (trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND");
@@ -4082,7 +4115,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       reference: settlementReference, status: "APPROVED",
       description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
       createdBy: options.createdBy || "system", createdAt: nowIso(),
-      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, pnlPercent: toMoneyDecimal(pnlDeltaPercent), lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
+      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, grossPnlPercent, pnlPercent: applyFixedRoundTripFee ? settlement.netPnlPercent : grossPnlPercent, grossPnlUsdt: settlement.grossPnlUsdt || grossPnlUsdt, tradingFeeModel: settlement.tradingFeeModel || null, tradingFeeRate: settlement.tradingFeeRate || null, tradingFeeUsdt: settlement.tradingFeeUsdt || "0", netPnlUsdt: settledPnlUsdt, lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
     });
     await persist({
       required: true,
@@ -4940,6 +4973,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     adminExecution: sanitizeExecution(adminOrder),
     mirroredExecutions: [],
     exitOrders: [],
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
     strategyContext: options.strategyContext || null,
   };
 
