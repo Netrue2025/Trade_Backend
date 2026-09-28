@@ -45,7 +45,7 @@ function loadEnvFile() {
 
 loadEnvFile();
 
-const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo } = require("./lib/db");
+const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo, isMongoAppStatePersistenceReady } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
@@ -378,7 +378,7 @@ function markFinancialMutation(wallets, reason, reference) {
 }
 
 function persistSignalState() {
-  if (!db) {
+  if (!db || isFinancialRecoveryMode()) {
     return;
   }
 
@@ -485,6 +485,9 @@ function getSignalAutoTradeSettingsSnapshot() {
 }
 
 async function sweepExpiredSignals() {
+  if (isFinancialRecoveryMode()) {
+    return [];
+  }
   const expiredSignals = await signalEngine.expireSignals();
   if (expiredSignals.length) {
     console.log(`Expired ${expiredSignals.length} signal${expiredSignals.length === 1 ? "" : "s"} after 24 hours.`);
@@ -493,6 +496,9 @@ async function sweepExpiredSignals() {
 }
 
 async function ensureSignalEngineRunning(force = false, options = {}) {
+  if (isFinancialRecoveryMode()) {
+    return false;
+  }
   if (signalEngine.started && !force) {
     return true;
   }
@@ -518,6 +524,9 @@ async function ensureSignalEngineRunning(force = false, options = {}) {
 }
 
 async function ensureTradeListenerRunning(force = false) {
+  if (isFinancialRecoveryMode()) {
+    return false;
+  }
   if (tradeListener.started && !force && (!telegramTradeService?.isHealthy || telegramTradeService.isHealthy())) {
     return true;
   }
@@ -5435,6 +5444,10 @@ async function handleApi(req, res, url) {
     sendJson(res, 200, {
       ok: true,
       storage: shouldUseMongo() ? "mongodb" : "local-json",
+      mongoConnected: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
+      authoritativeStateLoaded: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
+      startupBarrierPassed: !shouldUseMongo() || isMongoAppStatePersistenceReady(),
+      minimalCoreMode: isFinancialRecoveryMode(),
       financialIntegrity: financialIntegrity.getStatus(),
     });
     return true;
@@ -9391,16 +9404,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-socketSignalService.attach(server, {
-  authorize: (request) => {
-    const session = getSession(request);
-    if (!session || !db) {
-      return null;
-    }
-    return db.users.find((item) => item.id === session.userId) || null;
-  },
-  snapshotProvider: () => signalController.getSnapshot(),
-});
+if (!isFinancialRecoveryMode()) {
+  socketSignalService.attach(server, {
+    authorize: (request) => {
+      const session = getSession(request);
+      if (!session || !db) {
+        return null;
+      }
+      return db.users.find((item) => item.id === session.userId) || null;
+    },
+    snapshotProvider: () => signalController.getSnapshot(),
+  });
+}
 
 const settingsUsersWss = new WebSocketServer({ noServer: true });
 const settingsUsersClients = new Set();
@@ -9564,6 +9579,11 @@ async function startServer() {
   console.log(`Trade MVP running on http://localhost:${listeningPort} using ${storageMode} storage`);
   console.log(`Telegram signal bot diagnostics: ${JSON.stringify(getSignalBotDiagnostics())}`);
 
+  if (isFinancialRecoveryMode()) {
+    console.log("FINANCIAL_RECOVERY_MODE minimal core active; optional workers are disabled.");
+    return;
+  }
+
   void runPostListenStartupTasks();
   void ensureTradeListenerRunning(true);
   void startTradeReconciliation(true);
@@ -9579,6 +9599,9 @@ async function startServer() {
 }
 
 async function runPostListenStartupTasks() {
+  if (isFinancialRecoveryMode()) {
+    return;
+  }
   try {
     await tradeLearningService.init();
   } catch (error) {

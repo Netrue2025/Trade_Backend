@@ -54,6 +54,16 @@ test("server recovery gates cover trade creation, reconciliation, settlement, de
   assert.match(server, /assertRecoveryOperationAllowed\("QUEST_REWARD"\)/);
 });
 
+test("minimal core startup does not start optional signal, Telegram, or reconciliation workers", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.match(server, /FINANCIAL_RECOVERY_MODE minimal core active; optional workers are disabled\./);
+  assert.match(server, /async function ensureSignalEngineRunning[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return false;/);
+  assert.match(server, /async function ensureTradeListenerRunning[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return false;/);
+  assert.match(server, /async function sweepExpiredSignals[\s\S]*?if \(isFinancialRecoveryMode\(\)\) \{\s*return \[\];/);
+  assert.match(server, /if \(!isFinancialRecoveryMode\(\)\) \{\s*socketSignalService\.attach/);
+  assert.match(server, /mongoConnected: !shouldUseMongo\(\) \|\| isMongoAppStatePersistenceReady\(\)/);
+});
+
 test("core financial save paths are explicitly scoped away from optional side effects", () => {
   const financial = fs.readFileSync(path.join(__dirname, "..", "services", "financialService.js"), "utf8");
   assert.match(financial, /fields: \["wallets", "transactions", "giftCards", "idempotencyKeys"\]/);
