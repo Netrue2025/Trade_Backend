@@ -1541,7 +1541,7 @@ async function syncProcessingPaystackWithdrawals(requestMeta = {}) {
         ...(withdrawal.metadata || {}),
         paystackLastSyncError: String(error.message || error).slice(0, 180),
       };
-      persist();
+      await persist({ required: true, fields: ["withdrawals"] });
     }
   }
 }
@@ -1553,7 +1553,7 @@ async function approvePaystackWithdrawalFlow(admin, withdrawalId, requestMeta) {
   }
   if (financialService.isUnpaidReviewedPaystackWithdrawal(withdrawal)) {
     withdrawal = financialService.restoreReviewedPaystackReservation(withdrawal);
-    persist();
+    await persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
   }
   if (withdrawal.status === "SUCCESS") {
     return withdrawal;

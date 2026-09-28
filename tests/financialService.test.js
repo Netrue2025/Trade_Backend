@@ -141,6 +141,75 @@ test("deposit, withdrawal, and gift-card side effects wait for their scoped requ
   assert.ok(calls.slice(3).every((context) => context.bestEffort === true));
 });
 
+test("withdrawal lifecycle has no unsafe unscoped persistence calls", () => {
+  const withdrawalPersistenceMethods = [
+    "processWithdrawal",
+    "setWithdrawalTelegramMessage",
+    "setWithdrawalRecipientCode",
+    "approvePaystackWithdrawal",
+    "markPaystackTransferAttempt",
+    "markPaystackTransferRetryable",
+    "markPaystackTransferProcessing",
+    "markPaystackTransferUnclear",
+    "completeWithdrawal",
+    "completeReviewedWithdrawal",
+    "completeManualWithdrawal",
+    "finalizeLegacyReviewedPaystackReopen",
+    "rejectWithdrawal",
+    "applyPaystackTransferSuccess",
+    "applyPaystackTransferFailed",
+    "applyPaystackTransferReversed",
+    "recordPaystackWebhookEvent",
+    "markPaystackWebhookEventProcessed",
+    "changeWithdrawalStatus",
+  ];
+  const unsafeCalls = withdrawalPersistenceMethods.flatMap((method) => {
+    const source = FinancialService.prototype[method]?.toString?.() || "";
+    return (source.match(/\bthis\.persist\(\s*\)/g) || []).map(() => method);
+  });
+
+  assert.equal(unsafeCalls.length, 0, `UNSAFE_FINANCIAL_UNSCOPED_CALLS_REMAINING: ${unsafeCalls.length} (${unsafeCalls.join(", ")})`);
+});
+
+test("withdrawal completion keeps required persistence narrow when optional state is large", async () => {
+  const calls = [];
+  const { admin, db, service, user } = createHarness({
+    persist: (context = {}) => {
+      calls.push(context);
+      return Promise.resolve();
+    },
+  });
+  setWallet(service, user.id, "USDT", "100");
+  const withdrawal = service.createWithdrawal(user, {
+    amount: "50",
+    currency: "USDT",
+    destination: { address: "TUserWalletAddress", network: "TRC20" },
+  });
+  await nextMicrotask();
+  await nextMicrotask();
+  calls.length = 0;
+
+  const largeOptionalRecord = { id: "optional", payload: "x".repeat(256 * 1024) };
+  db.notifications = Array.from({ length: 8 }, () => ({ ...largeOptionalRecord }));
+  db.auditLogs = Array.from({ length: 8 }, () => ({ ...largeOptionalRecord }));
+  db.chatMessages = Array.from({ length: 8 }, () => ({ ...largeOptionalRecord }));
+  db.questSessions = Array.from({ length: 8 }, () => ({ ...largeOptionalRecord }));
+
+  service.completeWithdrawal(admin, withdrawal.id, { transactionHash: "0xwithdrawal-complete" });
+  await nextMicrotask();
+  await nextMicrotask();
+
+  assert.deepEqual(calls[0], {
+    required: true,
+    fields: ["wallets", "transactions", "withdrawals"],
+  });
+  assert.deepEqual(calls[1], {
+    bestEffort: true,
+    fields: ["notifications", "auditLogs"],
+  });
+  assert.equal(calls.some((context) => context.fields?.some((field) => ["chatMessages", "questSessions"].includes(field))), false);
+});
+
 test("naira deposit approval credits NGN wallet", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "2500");

@@ -4210,16 +4210,28 @@ class FinancialService {
       .map((withdrawal) => this.enrichUserRecord(withdrawal));
   }
 
+  queueWithdrawalSideEffects(requiredPersistence, effect) {
+    void Promise.resolve(requiredPersistence).then(() => {
+      effect();
+      return this.persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
+    }).catch(() => undefined);
+  }
+
   processWithdrawal(admin, withdrawalId, input = {}, requestMeta = {}) {
     const current = this.getWithdrawal(withdrawalId);
     if (current.currency === "NGN" && current.paystackReference) {
       throw new Error("Use Paystack approval for NGN bank withdrawals.");
     }
-    const withdrawal = this.changeWithdrawalStatus(admin, withdrawalId, "PROCESSING", input, requestMeta);
+    const withdrawal = this.getWithdrawal(withdrawalId);
+    withdrawal.status = "PROCESSING";
+    withdrawal.adminNote = String(input.adminNote || withdrawal.adminNote || "").trim();
     withdrawal.processingAt = this.clock();
     withdrawal.processedBy = admin.id;
     this.markWithdrawalReservationTransactions(withdrawal, "PROCESSING", "Withdrawal amount held for processing.");
-    this.persist();
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals", "transactions"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.audit(admin, "WITHDRAWAL_PROCESSING", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
+    });
     return clone(withdrawal);
   }
 
@@ -4227,7 +4239,7 @@ class FinancialService {
     this.ensureState();
     const withdrawal = this.getWithdrawal(withdrawalId);
     withdrawal.telegramMessageId = String(telegramMessageId || "").trim();
-    this.persist();
+    this.persist({ bestEffort: true, fields: ["withdrawals"] });
     return clone(withdrawal);
   }
 
@@ -4246,7 +4258,7 @@ class FinancialService {
           : account
       );
     }
-    this.persist();
+    this.persist({ required: true, fields: ["users", "withdrawals"] });
     return clone(withdrawal);
   }
 
@@ -4282,20 +4294,22 @@ class FinancialService {
       };
       withdrawal.metadata.fraudReviewStatus = "APPROVED";
     }
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal approved",
-      message: "Your withdrawal has been approved and payment is being processed.",
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal approved",
+        message: "Your withdrawal has been approved and payment is being processed.",
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(admin, "WITHDRAWAL_APPROVED", "Withdrawal", withdrawal.id, {
+        amount: withdrawal.amount,
+        currency: withdrawal.currency,
+        maskedAccountNumber: withdrawal.bank?.maskedAccountNumber || maskAccountNumber(withdrawal.bank?.accountNumber),
+      }, requestMeta);
     });
-    this.audit(admin, "WITHDRAWAL_APPROVED", "Withdrawal", withdrawal.id, {
-      amount: withdrawal.amount,
-      currency: withdrawal.currency,
-      maskedAccountNumber: withdrawal.bank?.maskedAccountNumber || maskAccountNumber(withdrawal.bank?.accountNumber),
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4307,7 +4321,10 @@ class FinancialService {
       paystackTransferAttemptedAt: withdrawal.metadata?.paystackTransferAttemptedAt || this.clock(),
       paystackTransferAttemptedBy: admin.id,
     };
-    this.persist();
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.audit(admin, "PAYSTACK_TRANSFER_ATTEMPTED", "Withdrawal", withdrawal.id, { reference: withdrawal.paystackReference }, requestMeta);
+    });
     return clone(withdrawal);
   }
 
@@ -4334,11 +4351,13 @@ class FinancialService {
       paystackApprovalFailureReason: withdrawal.failureReason,
     };
     this.markWithdrawalReservationTransactions(withdrawal, "PENDING", "Withdrawal amount reserved.");
-    this.audit(admin, "PAYSTACK_TRANSFER_RETRYABLE", "Withdrawal", withdrawal.id, {
-      reference: withdrawal.paystackReference,
-      reason: withdrawal.failureReason,
-    }, requestMeta);
-    this.persist();
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals", "transactions"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.audit(admin, "PAYSTACK_TRANSFER_RETRYABLE", "Withdrawal", withdrawal.id, {
+        reference: withdrawal.paystackReference,
+        reason: withdrawal.failureReason,
+      }, requestMeta);
+    });
     return clone(withdrawal);
   }
 
@@ -4366,12 +4385,14 @@ class FinancialService {
       },
     };
     this.markWithdrawalReservationTransactions(withdrawal, "PROCESSING", "Withdrawal amount held while payment is processing.");
-    this.audit(admin, "PAYSTACK_TRANSFER_INITIATED", "Withdrawal", withdrawal.id, {
-      amountKobo: withdrawal.amountKobo,
-      reference: withdrawal.paystackReference,
-      transferCode: withdrawal.paystackTransferCode,
-    }, requestMeta);
-    this.persist();
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals", "transactions"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.audit(admin, "PAYSTACK_TRANSFER_INITIATED", "Withdrawal", withdrawal.id, {
+        amountKobo: withdrawal.amountKobo,
+        reference: withdrawal.paystackReference,
+        transferCode: withdrawal.paystackTransferCode,
+      }, requestMeta);
+    });
     return clone(withdrawal);
   }
 
@@ -4384,10 +4405,12 @@ class FinancialService {
       paystackTransferUnclearAt: this.clock(),
       paystackTransferUnclearReason: String(error?.message || error || "").slice(0, 180),
     };
-    this.audit(admin, "PAYSTACK_TRANSFER_UNCLEAR", "Withdrawal", withdrawal.id, {
-      reference: withdrawal.paystackReference,
-    }, requestMeta);
-    this.persist();
+    const requiredPersistence = this.persist({ required: true, fields: ["withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.audit(admin, "PAYSTACK_TRANSFER_UNCLEAR", "Withdrawal", withdrawal.id, {
+        reference: withdrawal.paystackReference,
+      }, requestMeta);
+    });
     return clone(withdrawal);
   }
 
@@ -4439,16 +4462,18 @@ class FinancialService {
     withdrawal.balanceReserved = false;
     withdrawal.externalTransactionReference = String(input.externalTransactionReference || input.transactionHash || "").trim();
     withdrawal.adminNote = String(input.adminNote || "").trim();
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal complete",
-      message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal complete",
+        message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(admin, "WITHDRAWAL_COMPLETED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
     });
-    this.audit(admin, "WITHDRAWAL_COMPLETED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4487,19 +4512,21 @@ class FinancialService {
       fraudReviewStatus: "APPROVED",
       reviewedApprovalAt: this.clock(),
     };
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal successful",
-      message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal successful",
+        message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(admin, "WITHDRAWAL_REVIEW_APPROVED", "Withdrawal", withdrawal.id, {
+        amount: withdrawal.amount,
+        currency: withdrawal.currency,
+      }, requestMeta);
     });
-    this.audit(admin, "WITHDRAWAL_REVIEW_APPROVED", "Withdrawal", withdrawal.id, {
-      amount: withdrawal.amount,
-      currency: withdrawal.currency,
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4549,21 +4576,23 @@ class FinancialService {
       };
       withdrawal.metadata.fraudReviewStatus = "APPROVED";
     }
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal successful",
-      message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal successful",
+        message: `${withdrawal.amount} ${withdrawal.currency} sent.`,
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(admin, "WITHDRAWAL_MANUAL_COMPLETED", "Withdrawal", withdrawal.id, {
+        amount: withdrawal.amount,
+        currency: withdrawal.currency,
+        manualReference,
+        paystackReference: withdrawal.paystackReference || "",
+      }, requestMeta);
     });
-    this.audit(admin, "WITHDRAWAL_MANUAL_COMPLETED", "Withdrawal", withdrawal.id, {
-      amount: withdrawal.amount,
-      currency: withdrawal.currency,
-      manualReference,
-      paystackReference: withdrawal.paystackReference || "",
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4601,7 +4630,7 @@ class FinancialService {
       paystackRetryable: false,
     };
     this.markWithdrawalReservationTransactions(withdrawal, "SUCCESS", "Reviewed withdrawal finalized by admin.");
-    this.persist();
+    this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
     return withdrawal;
   }
 
@@ -4619,16 +4648,18 @@ class FinancialService {
     withdrawal.rejectionReason = String(input.reason || input.adminNote || "").trim();
     withdrawal.adminNote = withdrawal.rejectionReason;
     withdrawal.balanceReserved = false;
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal rejected",
-      message: "Your withdrawal request was rejected.",
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal rejected",
+        message: "Your withdrawal request was rejected.",
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(admin, "WITHDRAWAL_REJECTED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
     });
-    this.audit(admin, "WITHDRAWAL_REJECTED", "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4771,19 +4802,21 @@ class FinancialService {
       ...(withdrawal.metadata || {}),
       paystackStatus: String(eventData.status || "success"),
     };
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal paid",
-      message: `Your withdrawal payout of ${withdrawal.netAmount || withdrawal.amount} NGN has been successfully paid to your bank account.`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal paid",
+        message: `Your withdrawal payout of ${withdrawal.netAmount || withdrawal.amount} NGN has been successfully paid to your bank account.`,
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_SUCCESS", "Withdrawal", withdrawal.id, {
+        reference: withdrawal.paystackReference,
+        amountKobo: withdrawal.amountKobo,
+      }, requestMeta);
     });
-    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_SUCCESS", "Withdrawal", withdrawal.id, {
-      reference: withdrawal.paystackReference,
-      amountKobo: withdrawal.amountKobo,
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4801,19 +4834,21 @@ class FinancialService {
     withdrawal.status = "FAILED";
     withdrawal.failureReason = String(eventData.reason || eventData.gateway_response || "Paystack transfer failed.").slice(0, 180);
     withdrawal.balanceReserved = false;
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal failed",
-      message: "We could not complete your withdrawal. The amount has been returned to your available balance.",
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal failed",
+        message: "We could not complete your withdrawal. The amount has been returned to your available balance.",
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_FAILED", "Withdrawal", withdrawal.id, {
+        reference: withdrawal.paystackReference,
+        amountKobo: withdrawal.amountKobo,
+      }, requestMeta);
     });
-    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_FAILED", "Withdrawal", withdrawal.id, {
-      reference: withdrawal.paystackReference,
-      amountKobo: withdrawal.amountKobo,
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -4832,19 +4867,21 @@ class FinancialService {
     withdrawal.status = "REVERSED";
     withdrawal.failureReason = String(eventData.reason || eventData.gateway_response || "Paystack transfer reversed.").slice(0, 180);
     withdrawal.balanceReserved = false;
-    this.createNotification({
-      userId: withdrawal.userId,
-      type: "WITHDRAWAL",
-      title: "Withdrawal reversed",
-      message: "Your withdrawal was reversed. The amount has been returned to your available balance.",
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
+    const requiredPersistence = this.persist({ required: true, fields: ["wallets", "transactions", "withdrawals"] });
+    this.queueWithdrawalSideEffects(requiredPersistence, () => {
+      this.createNotification({
+        userId: withdrawal.userId,
+        type: "WITHDRAWAL",
+        title: "Withdrawal reversed",
+        message: "Your withdrawal was reversed. The amount has been returned to your available balance.",
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_REVERSED", "Withdrawal", withdrawal.id, {
+        reference: withdrawal.paystackReference,
+        amountKobo: withdrawal.amountKobo,
+      }, requestMeta);
     });
-    this.audit({ id: "paystack", role: "system" }, "PAYSTACK_TRANSFER_REVERSED", "Withdrawal", withdrawal.id, {
-      reference: withdrawal.paystackReference,
-      amountKobo: withdrawal.amountKobo,
-    }, requestMeta);
-    this.persist();
     return clone(withdrawal);
   }
 
@@ -5174,7 +5211,7 @@ class FinancialService {
       processedAt: null,
     };
     this.db.webhookEvents.unshift(event);
-    this.persist();
+    this.persist({ required: true, fields: ["webhookEvents"] });
     return { duplicate: false, event };
   }
 
@@ -5208,7 +5245,7 @@ class FinancialService {
     if (event) {
       event.processed = true;
       event.processedAt = this.clock();
-      this.persist();
+      this.persist({ required: true, fields: ["webhookEvents"] });
     }
   }
 
@@ -5234,7 +5271,7 @@ class FinancialService {
     withdrawal.status = status;
     withdrawal.adminNote = String(input.adminNote || withdrawal.adminNote || "").trim();
     this.audit(admin, `WITHDRAWAL_${status}`, "Withdrawal", withdrawal.id, { amount: withdrawal.amount, currency: withdrawal.currency }, requestMeta);
-    this.persist();
+    this.persist({ required: true, fields: ["withdrawals"] });
     return withdrawal;
   }
 
