@@ -50,6 +50,7 @@ const { financialIntegrity, createUserFinancialLock } = require("./lib/financial
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { isTradeQuarantined } = require("./lib/tradeQuarantine");
+const { isFinancialRecoveryMode, assertRecoveryOperationAllowed } = require("./lib/financialRecoveryMode");
 const { resolveGoogleAccount } = require("./lib/googleAccountLinking");
 const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
@@ -1466,6 +1467,9 @@ function applyPaystackTransferStatus(reference, data, requestMeta = {}) {
 }
 
 async function syncProcessingPaystackWithdrawals(requestMeta = {}) {
+  if (isFinancialRecoveryMode()) {
+    return;
+  }
   const systemActor = { id: "paystack-sync", role: "system" };
   const candidates = (db.withdrawals || []).filter((withdrawal) =>
     withdrawal.currency === "NGN" &&
@@ -2930,6 +2934,9 @@ function inferBaseAssetFromSymbol(symbol) {
 }
 
 async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, openOrders, exchangeInfoOverride = null, userId = null) {
+  if (isFinancialRecoveryMode()) {
+    return false;
+  }
   const exchange = getTradeExchange(trade);
   const account = getExchangeAccount(ownerUser, exchange);
   if (!account || trade.side !== "BUY") {
@@ -3082,6 +3089,10 @@ function shouldReconcileTrade(trade) {
 }
 
 async function reconcileTradeStatuses() {
+  if (isFinancialRecoveryMode()) {
+    console.warn("FINANCIAL_RECOVERY_MODE trade reconciliation skipped");
+    return;
+  }
   let changed = false;
   const ownerSnapshotCache = new Map();
 
@@ -3257,6 +3268,9 @@ async function reconcileTradeStatuses() {
 }
 
 function startTradeReconciliation(force = false) {
+  if (isFinancialRecoveryMode()) {
+    return null;
+  }
   const now = Date.now();
 
   if (tradeReconcilePromise) {
@@ -3973,6 +3987,9 @@ function getWithdrawalBlockingTradeInvestments(userId) {
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
+  if (isFinancialRecoveryMode()) {
+    return investment;
+  }
   if (trade && isTradeQuarantined(db, trade)) {
     return investment;
   }
@@ -4829,6 +4846,7 @@ function getMirroringUsers(exchange) {
 }
 
 async function createTradeIntent(admin, exchange, orderInput, options = {}) {
+  assertRecoveryOperationAllowed("TRADE");
   const exchangeLabel = getExchangeLabel(exchange);
   const adminAccount = getExchangeAccount(admin, exchange);
   if (!adminAccount) {
@@ -4912,6 +4930,9 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
 }
 
 async function executeSignalAutoTrade(signal, context = {}) {
+  if (isFinancialRecoveryMode()) {
+    return { ok: false, skipped: true, reason: "financial_recovery_mode" };
+  }
   const settings = normalizeSignalAutoTradeConfig(context.config || autoTradeService.getConfig());
   const admin = getSignalAutoTradeAdminUser();
   if (!admin) {
@@ -5315,6 +5336,10 @@ async function handleApi(req, res, url) {
       const eventType = String(payload.event || "").trim();
       const data = payload.data || {};
       const reference = String(data.reference || "").trim();
+      if (eventType.startsWith("transfer.") && isFinancialRecoveryMode()) {
+        sendJson(res, 503, { error: "Withdrawal updates are temporarily unavailable during financial recovery." });
+        return true;
+      }
       const webhookEvent = financialService.recordPaystackWebhookEvent({ eventType, reference, payloadHash });
       if (webhookEvent.duplicate) {
         sendJson(res, 200, { received: true, duplicate: true });
@@ -6413,10 +6438,12 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("DEPOSIT");
       const deposit = financialService.createDeposit(user, await readBody(req), getRequestMeta(req));
+      await persist({ required: true, fields: ["deposits", "idempotencyKeys"] });
       sendJson(res, 201, { deposit });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6426,15 +6453,22 @@ async function handleApi(req, res, url) {
     if (!user) {
       return true;
     }
+    try {
+      assertRecoveryOperationAllowed("GIFT_CARD");
+    } catch (error) {
+      sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
+      return true;
+    }
     if (isPaymentRateLimited(req, user.id, "gift-card-redeem")) {
       sendJson(res, 429, { error: "Too many gift card attempts. Please try again shortly." });
       return true;
     }
     try {
       const result = financialService.redeemGiftCard(user, await readBody(req), getRequestMeta(req));
+      await persist({ required: true, fields: ["wallets", "transactions", "giftCards", "idempotencyKeys"] });
       sendJson(res, 200, result);
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6459,10 +6493,11 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("QUEST_REWARD");
       const result = questService.startQuest(user, decodeURIComponent(questStartMatch[1] || ""), getRequestMeta(req));
       sendJson(res, 201, result);
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6474,6 +6509,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("QUEST_REWARD");
       const sessionId = decodeURIComponent(questSessionActionMatch[1] || "");
       const action = questSessionActionMatch[2];
       const body = action === "answer" ? await readBody(req) : {};
@@ -6487,7 +6523,7 @@ async function handleApi(req, res, url) {
             : questService.redeemReward(user, sessionId, meta);
       sendJson(res, 200, result);
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6548,6 +6584,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const body = await readBody(req);
       const investmentStatus = await settleStaleTradeInvestmentsForWithdrawal(user);
       if (investmentStatus.blocking.length) {
@@ -6573,7 +6610,7 @@ async function handleApi(req, res, url) {
         }
       }
       const withdrawal = financialService.createWithdrawal(user, body, getRequestMeta(req));
-      await persist({ required: true });
+      await persist({ required: true, fields: ["wallets", "transactions", "withdrawals", "idempotencyKeys"] });
       if (withdrawal.currency === "NGN") {
         const sent = await sendWithdrawalTelegramMessage(withdrawal, "NEW WITHDRAWAL REQUEST", [
           "Status: Pending Admin Approval",
@@ -6584,7 +6621,7 @@ async function handleApi(req, res, url) {
       }
       sendJson(res, 201, { withdrawal });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6706,6 +6743,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("DEPOSIT");
       const depositId = decodeURIComponent(adminDepositApproveMatch[1]);
       const input = await readBody(req);
       const requestMeta = getRequestMeta(req);
@@ -6722,7 +6760,7 @@ async function handleApi(req, res, url) {
         financeSummary,
       });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6734,6 +6772,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("DEPOSIT");
       const deposit = financialService.rejectDeposit(
         admin,
         decodeURIComponent(adminDepositRejectMatch[1]),
@@ -6742,7 +6781,7 @@ async function handleApi(req, res, url) {
       );
       sendJson(res, 200, { deposit });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6785,6 +6824,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawal = await approvePaystackWithdrawalFlow(
         admin,
         decodeURIComponent(adminWithdrawalApproveMatch[1]),
@@ -6804,6 +6844,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawalId = decodeURIComponent(adminWithdrawalFinalizeMatch[1]);
       const withdrawal = financialService.getWithdrawal(withdrawalId);
       const body = await readBody(req);
@@ -6820,7 +6861,7 @@ async function handleApi(req, res, url) {
       }
       sendJson(res, 200, { withdrawal: nextWithdrawal });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message });
     }
     return true;
   }
@@ -6975,6 +7016,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawal = financialService.processWithdrawal(
         admin,
         decodeURIComponent(adminWithdrawalProcessMatch[1]),
@@ -6995,6 +7037,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawal = financialService.completeWithdrawal(
         admin,
         decodeURIComponent(adminWithdrawalCompleteMatch[1]),
@@ -7016,6 +7059,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawal = financialService.completeManualWithdrawal(
         admin,
         decodeURIComponent(adminWithdrawalManualCompleteMatch[1]),
@@ -7040,6 +7084,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
+      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawal = financialService.rejectWithdrawal(
         admin,
         decodeURIComponent(adminWithdrawalRejectMatch[1]),
@@ -8609,6 +8654,12 @@ async function handleApi(req, res, url) {
     if (!admin) {
       return true;
     }
+    try {
+      assertRecoveryOperationAllowed("TRADE_JOIN");
+    } catch (error) {
+      sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
+      return true;
+    }
     let joinedUserLockId = "";
     try {
       const userId = decodeURIComponent(adminUserJoinTradeMatch[1] || "").trim();
@@ -8934,6 +8985,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && joinTradeMatch) {
     const user = requireAuth(req, res, "user");
     if (!user) {
+      return true;
+    }
+    try {
+      assertRecoveryOperationAllowed("TRADE_JOIN");
+    } catch (error) {
+      sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" });
       return true;
     }
     if (tradeJoinRequests.has(user.id)) {

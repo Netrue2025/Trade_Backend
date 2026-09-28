@@ -3268,10 +3268,13 @@ class FinancialService {
       adminNote: "",
     };
     this.db.deposits.unshift(deposit);
-    this.notifyAdminDepositSubmitted(user, deposit);
-    this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency }, requestMeta);
     this.saveIdempotent("deposit:create", user.id, requestMeta.idempotencyKey, deposit);
-    this.persist({ fields: ["deposits", "idempotencyKeys"] });
+    const requiredPersistence = this.persist({ fields: ["deposits", "idempotencyKeys"] });
+    void Promise.resolve(requiredPersistence).then(() => {
+      this.notifyAdminDepositSubmitted(user, deposit);
+      this.audit(user, "DEPOSIT_SUBMITTED", "Deposit", deposit.id, { amount, currency }, requestMeta);
+      return this.persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
+    }).catch(() => undefined);
     return clone(deposit);
   }
 
@@ -3558,29 +3561,32 @@ class FinancialService {
     giftCard.redeemedByName = user.name || "";
     giftCard.redeemedByEmail = user.email || "";
     giftCard.transactionId = transaction.id;
-    this.createNotification({
-      userId: user.id,
-      type: "GIFT_CARD",
-      title: "Gift card redeemed",
-      message: `${amount} ${currency} added to your wallet.`,
-      entityType: "GiftCard",
-      entityId: giftCard.id,
-    });
-    this.notifyAdmins({
-      type: "GIFT_CARD",
-      title: "Gift card used",
-      message: `${user.name || "User"} redeemed ${amount} ${currency}.`,
-      entityType: "GiftCard",
-      entityId: giftCard.id,
-    });
-    this.audit(user, "GIFT_CARD_REDEEMED", "GiftCard", giftCard.id, { amount, currency }, requestMeta);
     const response = {
       giftCard: clone(giftCard),
       transaction: clone(transaction),
       dashboard: this.getDashboard(user),
     };
     this.saveIdempotent("gift-card:redeem", user.id, requestMeta.idempotencyKey, response);
-    this.persist();
+    const requiredPersistence = this.persist({ fields: ["wallets", "transactions", "giftCards", "idempotencyKeys"] });
+    void Promise.resolve(requiredPersistence).then(() => {
+      this.createNotification({
+        userId: user.id,
+        type: "GIFT_CARD",
+        title: "Gift card redeemed",
+        message: `${amount} ${currency} added to your wallet.`,
+        entityType: "GiftCard",
+        entityId: giftCard.id,
+      });
+      this.notifyAdmins({
+        type: "GIFT_CARD",
+        title: "Gift card used",
+        message: `${user.name || "User"} redeemed ${amount} ${currency}.`,
+        entityType: "GiftCard",
+        entityId: giftCard.id,
+      });
+      this.audit(user, "GIFT_CARD_REDEEMED", "GiftCard", giftCard.id, { amount, currency }, requestMeta);
+      return this.persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
+    }).catch(() => undefined);
     return response;
   }
 
@@ -4145,20 +4151,23 @@ class FinancialService {
     const withdrawalSplitMessage = currency === "NGN" && compare(fee, "0") > 0
       ? ` Fee: ${fee} ${currency}. Payout: ${netAmount} ${currency}.`
       : "";
-    this.notifyAdminWithdrawalRequested(user, withdrawal);
-    this.createNotification({
-      userId: user.id,
-      type: "WITHDRAWAL",
-      title: "Withdrawal submitted",
-      message: withdrawalSplitMessage
-        ? `Your withdrawal request of ${amount} ${currency} is awaiting approval.${withdrawalSplitMessage}`
-        : `Your withdrawal request of ${amount} ${currency} is awaiting approval.`,
-      entityType: "Withdrawal",
-      entityId: withdrawal.id,
-    });
-    this.audit(user, "WITHDRAWAL_CREATED", "Withdrawal", withdrawal.id, { amount, currency, fraudReviewStatus: fraudReview.status }, requestMeta);
     this.saveIdempotent("withdrawal:create", user.id, requestMeta.idempotencyKey, withdrawal);
-    this.persist();
+    const requiredPersistence = this.persist({ fields: ["wallets", "transactions", "withdrawals", "idempotencyKeys"] });
+    void Promise.resolve(requiredPersistence).then(() => {
+      this.notifyAdminWithdrawalRequested(user, withdrawal);
+      this.createNotification({
+        userId: user.id,
+        type: "WITHDRAWAL",
+        title: "Withdrawal submitted",
+        message: withdrawalSplitMessage
+          ? `Your withdrawal request of ${amount} ${currency} is awaiting approval.${withdrawalSplitMessage}`
+          : `Your withdrawal request of ${amount} ${currency} is awaiting approval.`,
+        entityType: "Withdrawal",
+        entityId: withdrawal.id,
+      });
+      this.audit(user, "WITHDRAWAL_CREATED", "Withdrawal", withdrawal.id, { amount, currency, fraudReviewStatus: fraudReview.status }, requestMeta);
+      return this.persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
+    }).catch(() => undefined);
     return clone(withdrawal);
   }
 

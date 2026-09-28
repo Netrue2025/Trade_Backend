@@ -28,7 +28,7 @@ function createHarness(options = {}) {
   };
   const service = new FinancialService({
     db,
-    persist: () => undefined,
+    persist: options.persist || (() => undefined),
     idGenerator: () => `id-${++id}`,
     clock: () => "2026-08-30T10:00:00.000Z",
     notificationPublisher: options.notificationPublisher || null,
@@ -41,6 +41,10 @@ function createHarness(options = {}) {
     service,
     user: db.users[1],
   };
+}
+
+function nextMicrotask() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function setWallet(service, userId, currency, availableBalance, lockedBalance = "0") {
@@ -79,6 +83,62 @@ test("deposit approval credits once and submission does not change balance", () 
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
   assert.equal(service.approveDeposit(admin, deposit.id).status, "APPROVED");
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "150");
+});
+
+test("deposit, withdrawal, and gift-card side effects wait for their scoped required save", async () => {
+  const pending = [];
+  const calls = [];
+  const persist = (context = {}) => {
+    calls.push(context);
+    if (context.bestEffort) return Promise.resolve();
+    return new Promise((resolve) => pending.push(resolve));
+  };
+  const { db, service, user } = createHarness({ persist });
+  setWallet(service, user.id, "NGN", "10000");
+  const giftCard = {
+    id: "gift-1",
+    code: "12345678901234",
+    pin: "123456",
+    amount: "200",
+    currency: "NGN",
+    status: "UNUSED",
+  };
+  db.giftCards.unshift(giftCard);
+
+  service.createDeposit(user, { amount: "1000", currency: "NGN", depositorName: "Ada" });
+  service.createWithdrawal(user, {
+    amount: "500",
+    currency: "NGN",
+    bankAccount: {
+      bankName: "Test Bank",
+      bankCode: "058",
+      accountNumber: "1234567890",
+      accountName: "ADA USER",
+    },
+  });
+  service.redeemGiftCard(user, { code: giftCard.code });
+
+  assert.deepEqual(calls.slice(0, 3).map((context) => context.fields), [
+    ["deposits", "idempotencyKeys"],
+    ["wallets", "transactions", "withdrawals", "idempotencyKeys"],
+    ["wallets", "transactions", "giftCards", "idempotencyKeys"],
+  ]);
+  assert.equal(db.notifications.length, 0);
+  assert.equal(db.auditLogs.length, 0);
+
+  pending.splice(0).forEach((resolve) => resolve());
+  await nextMicrotask();
+
+  assert.ok(db.notifications.length >= 3);
+  assert.ok(db.auditLogs.some((item) => item.action === "DEPOSIT_SUBMITTED"));
+  assert.ok(db.auditLogs.some((item) => item.action === "WITHDRAWAL_CREATED"));
+  assert.ok(db.auditLogs.some((item) => item.action === "GIFT_CARD_REDEEMED"));
+  assert.deepEqual(calls.slice(3).map((context) => context.fields), [
+    ["notifications", "auditLogs"],
+    ["notifications", "auditLogs"],
+    ["notifications", "auditLogs"],
+  ]);
+  assert.ok(calls.slice(3).every((context) => context.bestEffort === true));
 });
 
 test("naira deposit approval credits NGN wallet", () => {

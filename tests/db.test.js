@@ -557,7 +557,7 @@ test("coalesced mutation during active incremental save persists in follow-up", 
   assert.deepEqual(Object.keys(updates[1].$set), ["notifications"]);
 });
 
-test("required scoped save excludes unrelated dirty fields and leaves them for follow-up", async () => {
+test("required scoped save excludes unrelated dirty fields without an implicit broad follow-up", async () => {
   __testing.markBackupThrottleNow();
   const baseline = __testing.normalizeDb({ wallets: [], transactions: [], tradeInvestments: [], notifications: [], sessions: [], digitalServiceProducts: [] });
   __testing.initializeMongoPersistedBaseline(baseline);
@@ -569,15 +569,9 @@ test("required scoped save excludes unrelated dirty fields and leaves them for f
   db.transactions.push({ id: "txn-1", reference: "trade-settlement:investment-1" });
   db.tradeInvestments.push({ id: "investment-1", status: "STOPPED" });
   const updates = [];
-  const followUpStarted = deferred();
-  const releaseFollowUp = deferred();
   const collection = {
     async updateOne(_filter, update) {
       updates.push(JSON.parse(JSON.stringify(update)));
-      if (updates.length === 2) {
-        followUpStarted.resolve();
-        await releaseFollowUp.promise;
-      }
       return { acknowledged: true };
     },
   };
@@ -593,13 +587,35 @@ test("required scoped save excludes unrelated dirty fields and leaves them for f
     fields: ["meta", "wallets", "transactions", "tradeInvestments"],
     reason: "TRADE_SETTLEMENT",
   });
-  await followUpStarted.promise;
   await requiredSave;
 
   assert.deepEqual(Object.keys(updates[0].$set).sort(), ["tradeInvestments", "transactions", "wallets"]);
-  assert.deepEqual(Object.keys(updates[1].$set).sort(), ["digitalServiceProducts", "notifications", "sessions"]);
-  releaseFollowUp.resolve();
-  await waitFor(() => controller.getDiagnostics().running === false, "unrelated follow-up completion");
+  assert.equal(updates.length, 1);
+  assert.deepEqual(__testing.getChangedAppStateFields(db).sort(), ["digitalServiceProducts", "notifications", "sessions"]);
+});
+
+test("explicit optional scoped save remains separate from a financial scoped save", async () => {
+  __testing.markBackupThrottleNow();
+  const baseline = __testing.normalizeDb({ wallets: [], transactions: [], notifications: [], auditLogs: [] });
+  __testing.initializeMongoPersistedBaseline(baseline);
+  const db = JSON.parse(JSON.stringify(baseline));
+  db.wallets.push({ userId: "user-1", currency: "NGN", availableBalance: "100" });
+  db.transactions.push({ id: "gift-card-credit" });
+  db.notifications.push({ id: "notice-1" });
+  db.auditLogs.push({ id: "audit-1" });
+  const updates = [];
+  const controller = __testing.createAppStateSaveController({
+    logger: createMemoryLogger(),
+    isMongoEnabled: () => true,
+    getCollection: async () => ({ async updateOne(_filter, update) { updates.push(JSON.parse(JSON.stringify(update))); return { acknowledged: true }; } }),
+    getSlowWarningMs: () => 1000,
+  });
+
+  await controller.requestSave(db, { required: true, fields: ["wallets", "transactions"] });
+  await controller.requestSave(db, { fields: ["notifications", "auditLogs"] });
+
+  assert.deepEqual(Object.keys(updates[0].$set).sort(), ["transactions", "wallets"]);
+  assert.deepEqual(Object.keys(updates[1].$set).sort(), ["auditLogs", "notifications"]);
 });
 
 test("successful scoped save advances only its persisted fields", async () => {
