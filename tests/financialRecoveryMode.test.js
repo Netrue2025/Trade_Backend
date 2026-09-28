@@ -97,18 +97,22 @@ test("request-like context cannot enable validation without trusted server confi
   });
 });
 
-test("trading remains isolated after recovery mode is disabled until separately enabled", () => {
-  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: undefined }, () => {
+test("trading remains isolated after recovery mode is disabled until separately approved", () => {
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: undefined, TRADING_RESTORATION_APPROVED: undefined }, () => {
     assert.equal(isFinancialRecoveryMode(), false);
     assert.equal(isTradingOperationsEnabled(), false);
     assert.equal(isTradingIsolationMode(), true);
     assert.throws(() => assertTradingOperationAllowed(), { code: "TRADING_OPERATIONS_ISOLATED" });
   });
-  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: "true" }, () => {
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: "true", TRADING_RESTORATION_APPROVED: undefined }, () => {
+    assert.equal(isTradingOperationsEnabled(), false);
+    assert.equal(isTradingIsolationMode(), true);
+  });
+  withEnv({ FINANCIAL_RECOVERY_MODE: "false", TRADING_OPERATIONS_ENABLED: "true", TRADING_RESTORATION_APPROVED: "true" }, () => {
     assert.equal(isTradingOperationsEnabled(), true);
     assert.equal(isTradingIsolationMode(), false);
   });
-  withEnv({ FINANCIAL_RECOVERY_MODE: "true", TRADING_OPERATIONS_ENABLED: "true" }, () => {
+  withEnv({ FINANCIAL_RECOVERY_MODE: "true", TRADING_OPERATIONS_ENABLED: "true", TRADING_RESTORATION_APPROVED: "true" }, () => {
     assert.equal(isTradingOperationsEnabled(), false);
   });
 });
