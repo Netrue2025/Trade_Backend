@@ -4187,6 +4187,12 @@ async function reconcileOrphanedClosedTradeInvestments() {
 }
 
 async function settleStaleTradeInvestmentsForWithdrawal(user) {
+  if (isFinancialRecoveryMode()) {
+    return {
+      blocking: getWithdrawalBlockingTradeInvestments(user.id),
+      settled: [],
+    };
+  }
   const settled = await settleInactiveTradeInvestmentsForUsers({
     userId: user.id,
     reason: "TRADE_INACTIVE",
@@ -5381,8 +5387,8 @@ async function handleApi(req, res, url) {
       const data = payload.data || {};
       const reference = String(data.reference || "").trim();
       if (eventType.startsWith("transfer.") && isFinancialRecoveryMode()) {
-        sendJson(res, 503, { error: "Withdrawal updates are temporarily unavailable during financial recovery." });
-        return true;
+        const recoveryWithdrawal = financialService.getWithdrawalByPaystackReference(reference);
+        assertRecoveryOperationAllowed("WITHDRAWAL_PROVIDER_RESULT", { targetUserId: recoveryWithdrawal.userId, providerVerified: true });
       }
       const webhookEvent = financialService.recordPaystackWebhookEvent({ eventType, reference, payloadHash });
       if (webhookEvent.duplicate) {
@@ -6473,7 +6479,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("DEPOSIT");
+      assertRecoveryOperationAllowed("DEPOSIT_CREATE", { actorUserId: user.id, targetUserId: user.id });
       const deposit = financialService.createDeposit(user, await readBody(req), getRequestMeta(req));
       await persist({ required: true, fields: ["deposits", "idempotencyKeys"] });
       sendJson(res, 201, { deposit });
@@ -6619,7 +6625,7 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("WITHDRAWAL");
+      assertRecoveryOperationAllowed("WITHDRAWAL_CREATE", { actorUserId: user.id, targetUserId: user.id });
       const body = await readBody(req);
       const investmentStatus = await settleStaleTradeInvestmentsForWithdrawal(user);
       if (investmentStatus.blocking.length) {
@@ -6778,8 +6784,9 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("DEPOSIT");
       const depositId = decodeURIComponent(adminDepositApproveMatch[1]);
+      const targetDeposit = financialService.getDeposit(depositId);
+      assertRecoveryOperationAllowed("DEPOSIT_APPROVAL", { actorUserId: admin.id, targetUserId: targetDeposit.userId, isAdmin: admin.role === "admin" });
       const input = await readBody(req);
       const requestMeta = getRequestMeta(req);
       const result = await depositApprovalService.approve(admin, depositId, input, requestMeta);
@@ -6859,10 +6866,12 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("WITHDRAWAL");
-      const withdrawal = await approvePaystackWithdrawalFlow(
+      const withdrawalId = decodeURIComponent(adminWithdrawalApproveMatch[1]);
+      let withdrawal = financialService.getWithdrawal(withdrawalId);
+      assertRecoveryOperationAllowed("WITHDRAWAL_APPROVAL", { actorUserId: admin.id, targetUserId: withdrawal.userId, isAdmin: admin.role === "admin" });
+      withdrawal = await approvePaystackWithdrawalFlow(
         admin,
-        decodeURIComponent(adminWithdrawalApproveMatch[1]),
+        withdrawalId,
         getRequestMeta(req)
       );
       sendJson(res, 200, { withdrawal });
@@ -6879,9 +6888,9 @@ async function handleApi(req, res, url) {
       return true;
     }
     try {
-      assertRecoveryOperationAllowed("WITHDRAWAL");
       const withdrawalId = decodeURIComponent(adminWithdrawalFinalizeMatch[1]);
       const withdrawal = financialService.getWithdrawal(withdrawalId);
+      assertRecoveryOperationAllowed("WITHDRAWAL_APPROVAL", { actorUserId: admin.id, targetUserId: withdrawal.userId, isAdmin: admin.role === "admin" });
       const body = await readBody(req);
       const result = await paystackService.finalizeTransfer({
         transferCode: withdrawal.paystackTransferCode,
