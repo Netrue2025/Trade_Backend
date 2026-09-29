@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { reconstructKnownExitClosure, reconstructKnownExitExecution } = require("../lib/knownExitExecutionRecovery");
+const { diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution } = require("../lib/knownExitExecutionRecovery");
 
 const exitOrder = { orderId: "tp-order", side: "SELL", status: "NEW", origQty: "10", executedQty: "0" };
 
@@ -97,6 +97,27 @@ test("fee-adjusted close evidence rejects unknown TP ids and quantity/balance mi
   }), null);
 });
 
+test("close diagnostic reports the exact missing-evidence category and aggregate metrics", () => {
+  const diagnosis = diagnoseKnownExitClosure({
+    tradeId: "trade-1",
+    entryExecution: { orderId: "entry-order", transactTime: 10, executedQty: "10" },
+    exitExecutions: [{ orderId: "tp-order" }],
+    baseAsset: "FLOCK",
+    currentBaseBalance: "0.5",
+    tolerance: 0.001,
+    executions: [
+      { orderId: "entry-order", side: "BUY", execQty: "10", execPrice: "2", execTime: 11 },
+      { orderId: "tp-order", side: "SELL", execQty: "9", execPrice: "2.1", execTime: 20 },
+    ],
+  });
+  assert.equal(diagnosis.evidence, null);
+  assert.equal(diagnosis.reason, "EXIT_QUANTITY_BALANCE_MISMATCH");
+  assert.equal(diagnosis.metrics.historyRowCount, 2);
+  assert.equal(diagnosis.metrics.entryFillCount, 1);
+  assert.equal(diagnosis.metrics.matchingExitFillCount, 1);
+  assert.equal(diagnosis.metrics.accountingDelta, 0.5);
+});
+
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const exitReconciler = server.slice(server.indexOf("async function reconcileExitExecution"), server.indexOf("function shouldReconcileTrade"));
@@ -114,7 +135,7 @@ test("validated Bybit close evidence runs before external-close synthesis and is
   const lifecycle = fs.readFileSync(path.join(__dirname, "..", "lib", "tradeLifecycle.js"), "utf8");
   const externalRecovery = server.slice(server.indexOf("async function reconcileExternalClosuresForOwner"), server.indexOf("function sameExecution"));
   const pnl = server.slice(server.indexOf("function getAuthoritativeClosedTradePnlPercent"), server.indexOf("async function buildUserTradeInvestmentSummary"));
-  assert.match(externalRecovery, /reconstructKnownExitClosure/);
+  assert.match(externalRecovery, /diagnoseKnownExitClosure/);
   assert.match(externalRecovery, /trade\.authoritativeCloseEvidence = closeEvidence/);
   assert.ok(externalRecovery.indexOf("trade.authoritativeCloseEvidence = closeEvidence") < externalRecovery.indexOf("reconstructExternalClose"));
   assert.match(lifecycle, /hasVerifiedExchangeCloseEvidence\(trade\)/);

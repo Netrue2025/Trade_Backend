@@ -49,7 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
-const { reconstructKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
+const { diagnoseKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
 const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
@@ -2980,6 +2980,59 @@ function inferBaseAssetFromSymbol(symbol) {
   return quoteAsset ? normalizedSymbol.slice(0, -quoteAsset.length) : normalizedSymbol;
 }
 
+const tradeExitDiagnosticLogAt = new Map();
+const TRADE_EXIT_DIAGNOSTIC_INTERVAL_MS = 60_000;
+
+function diagnosticQuantity(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Number(number.toFixed(12)) : null;
+}
+
+function reportTradeExitReconciliationDiagnostic({ trade, entryExecution, exitExecutions = [], executions, knownExitDiagnostic, historyUnavailable }) {
+  const now = Date.now();
+  const previous = tradeExitDiagnosticLogAt.get(String(trade.id));
+  if (previous && now - previous < TRADE_EXIT_DIAGNOSTIC_INTERVAL_MS) return;
+  tradeExitDiagnosticLogAt.set(String(trade.id), now);
+  if (tradeExitDiagnosticLogAt.size > 2000) {
+    tradeExitDiagnosticLogAt.delete(tradeExitDiagnosticLogAt.keys().next().value);
+  }
+
+  const knownOrderIds = new Set(exitExecutions.map((item) => String(item?.orderId || "")).filter(Boolean));
+  const rows = Array.isArray(executions) ? executions : [];
+  const matchingKnownExitFills = rows.filter((item) => (
+    knownOrderIds.has(String(item?.orderId || ""))
+    && String(item?.side || "").toUpperCase() === "SELL"
+    && Number(item?.execQty || 0) > 0
+    && Number(item?.execPrice || 0) > 0
+  ));
+  const unmatchedSellFillCount = rows.filter((item) => (
+    !knownOrderIds.has(String(item?.orderId || ""))
+    && String(item?.side || "").toUpperCase() === "SELL"
+    && Number(item?.execQty || 0) > 0
+    && Number(item?.execPrice || 0) > 0
+  )).length;
+
+  console.warn("TRADE_EXIT_RECONCILIATION_DIAGNOSTIC", {
+    tradeId: String(trade.id),
+    symbol: String(trade.symbol || ""),
+    exchange: getTradeExchange(trade),
+    reason: historyUnavailable ? "EXECUTION_HISTORY_UNAVAILABLE" : knownExitDiagnostic?.reason || "KNOWN_EXIT_EVIDENCE_UNAVAILABLE",
+    historyExecutionCount: rows.length,
+    entryOrderId: String(entryExecution?.orderId || "") || null,
+    entryOrderStatus: String(entryExecution?.status || "") || null,
+    entryExecutedQuantity: diagnosticQuantity(entryExecution?.executedQty),
+    knownExitOrders: exitExecutions.map((item) => ({
+      orderId: String(item?.orderId || "") || null,
+      status: String(item?.status || "") || null,
+      originalQuantity: diagnosticQuantity(item?.origQty),
+      executedQuantity: diagnosticQuantity(item?.executedQty),
+    })),
+    matchingKnownExitFillCount: matchingKnownExitFills.length,
+    unmatchedSellFillCount,
+    evidenceMetrics: knownExitDiagnostic?.metrics || null,
+  });
+}
+
 async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, openOrders, exchangeInfoOverride = null, userId = null) {
   if (isTradingIsolationMode()) {
     return false;
@@ -3052,12 +3105,13 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
   const executions = await executionHistoryReader(account, trade.symbol, {
     startTime: Math.max(0, Number(entryExecution?.transactTime || 0) - 60_000),
   }).catch(() => null);
+  let knownExitDiagnostic = null;
   if (executions && !userId) {
     for (const exitOrder of trade.exitOrders || []) {
       const recoveredExecution = reconstructKnownExitExecution({ execution: exitOrder.adminExecution, executions });
       if (recoveredExecution) exitOrder.adminExecution = recoveredExecution;
     }
-    const closeEvidence = reconstructKnownExitClosure({
+    knownExitDiagnostic = diagnoseKnownExitClosure({
       tradeId: trade.id,
       entryExecution,
       exitExecutions: (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution),
@@ -3066,6 +3120,7 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
       currentBaseBalance: normalizedBalance,
       tolerance: Math.max(Number(minQty || 0), 1e-8),
     });
+    const closeEvidence = knownExitDiagnostic.evidence;
     if (closeEvidence) {
       trade.authoritativeCloseEvidence = closeEvidence;
       return true;
@@ -3081,6 +3136,16 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     tolerance: Math.max(Number(minQty || 0), 1e-8),
   });
   if (!authoritativeExecution) {
+    if (!userId) {
+      reportTradeExitReconciliationDiagnostic({
+        trade,
+        entryExecution,
+        exitExecutions: (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution),
+        executions,
+        knownExitDiagnostic,
+        historyUnavailable: !executions,
+      });
+    }
     console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "authoritative_exit_not_proven" });
     return false;
   }
