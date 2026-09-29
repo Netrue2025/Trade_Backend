@@ -3033,6 +3033,29 @@ function reportTradeExitReconciliationDiagnostic({ trade, entryExecution, exitEx
   });
 }
 
+async function supplementKnownOrderExecutionHistory(historyReader, account, symbol, entryExecution, exitExecutions, executions) {
+  if (!Array.isArray(executions) || typeof historyReader !== "function") return executions;
+  const entryOrderId = String(entryExecution?.orderId || "");
+  const exitOrderIds = exitExecutions.map((item) => String(item?.orderId || ""));
+  const relevantRows = executions.filter((item) => String(item.orderId || "") === entryOrderId || exitOrderIds.includes(String(item.orderId || "")));
+  const entryFills = relevantRows.filter((item) => String(item.orderId || "") === entryOrderId && String(item.side || "").toUpperCase() === "BUY");
+  const entryQuantity = entryFills.reduce((sum, item) => sum + Number(item.execQty || 0), 0);
+  const hasEntryMismatch = !entryFills.length || Math.abs(entryQuantity - Number(entryExecution?.executedQty || 0)) > 1e-8;
+  const hasMissingExitFills = !relevantRows.some((item) => exitOrderIds.includes(String(item.orderId || "")) && String(item.side || "").toUpperCase() === "SELL");
+  if (!entryOrderId || (!hasEntryMismatch && !hasMissingExitFills)) {
+    return executions;
+  }
+
+  const orderIds = [...new Set([entryOrderId, ...exitOrderIds].filter(Boolean))];
+  const targeted = await Promise.allSettled(orderIds.map((orderId) => historyReader(account, symbol, { orderId, limit: 100 })));
+  const merged = new Map();
+  for (const row of [...executions, ...targeted.flatMap((result) => result.status === "fulfilled" && Array.isArray(result.value) ? result.value : [])]) {
+    const identity = String(row.execId || `${row.orderId}:${row.execTime}:${row.execQty}:${row.execPrice}:${row.side}`);
+    merged.set(identity, row);
+  }
+  return [...merged.values()];
+}
+
 async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, openOrders, exchangeInfoOverride = null, userId = null) {
   if (isTradingIsolationMode()) {
     return false;
@@ -3102,9 +3125,19 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "execution_history_unavailable" });
     return false;
   }
-  const executions = await executionHistoryReader(account, trade.symbol, {
+  let executions = await executionHistoryReader(account, trade.symbol, {
     startTime: Math.max(0, Number(entryExecution?.transactTime || 0) - 60_000),
   }).catch(() => null);
+  if (executions && !userId) {
+    executions = await supplementKnownOrderExecutionHistory(
+      executionHistoryReader,
+      account,
+      trade.symbol,
+      entryExecution,
+      (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution),
+      executions
+    );
+  }
   let knownExitDiagnostic = null;
   if (executions && !userId) {
     for (const exitOrder of trade.exitOrders || []) {

@@ -118,6 +118,24 @@ test("close diagnostic reports the exact missing-evidence category and aggregate
   assert.equal(diagnosis.metrics.accountingDelta, 0.5);
 });
 
+test("entry mismatch diagnostics still report the independent exit quantity and fees", () => {
+  const diagnosis = diagnoseKnownExitClosure({
+    tradeId: "trade-1",
+    entryExecution: { orderId: "entry-order", transactTime: 10, executedQty: "10" },
+    exitExecutions: [{ orderId: "tp-order" }],
+    baseAsset: "FLOCK",
+    currentBaseBalance: "0",
+    executions: [
+      { orderId: "entry-order", side: "BUY", execQty: "9", execPrice: "2", execFee: "0.01", feeCurrency: "FLOCK", execTime: 11 },
+      { orderId: "tp-order", side: "SELL", execQty: "8.98", execPrice: "2.1", execFee: "0.01", feeCurrency: "FLOCK", execTime: 20 },
+    ],
+  });
+  assert.equal(diagnosis.reason, "ENTRY_FILL_QUANTITY_MISMATCH");
+  assert.equal(diagnosis.metrics.entryBaseFee, 0.01);
+  assert.equal(diagnosis.metrics.exitQuantity, 8.98);
+  assert.equal(diagnosis.metrics.exitBaseFee, 0.01);
+});
+
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const exitReconciler = server.slice(server.indexOf("async function reconcileExitExecution"), server.indexOf("function shouldReconcileTrade"));
@@ -136,6 +154,8 @@ test("validated Bybit close evidence runs before external-close synthesis and is
   const externalRecovery = server.slice(server.indexOf("async function reconcileExternalClosuresForOwner"), server.indexOf("function sameExecution"));
   const pnl = server.slice(server.indexOf("function getAuthoritativeClosedTradePnlPercent"), server.indexOf("async function buildUserTradeInvestmentSummary"));
   assert.match(externalRecovery, /diagnoseKnownExitClosure/);
+  assert.match(externalRecovery, /supplementKnownOrderExecutionHistory/);
+  assert.match(server, /historyReader\(account, symbol, \{ orderId, limit: 100 \}\)/);
   assert.match(externalRecovery, /trade\.authoritativeCloseEvidence = closeEvidence/);
   assert.ok(externalRecovery.indexOf("trade.authoritativeCloseEvidence = closeEvidence") < externalRecovery.indexOf("reconstructExternalClose"));
   assert.match(lifecycle, /hasVerifiedExchangeCloseEvidence\(trade\)/);
