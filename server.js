@@ -49,6 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
+const { reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
 const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
@@ -3110,6 +3111,37 @@ async function reconcileExecution(account, symbol, execution, exchange = getAcco
   }
 }
 
+const exitHistoryFallbackAttempts = new Map();
+const EXIT_HISTORY_FALLBACK_COOLDOWN_MS = 30_000;
+
+async function reconcileExitExecution(account, symbol, execution, exchange = getAccountExchange(account)) {
+  if (!account || !symbol || !isExecutionActive(execution)) return execution;
+  try {
+    const latest = await getOrder(account, symbol, execution.orderId, exchange);
+    if (latest) return sanitizeExecution(latest);
+  } catch {
+    // Some exchanges stop returning completed orders from their realtime order endpoint.
+  }
+
+  if (normalizeExchange(exchange) !== "bybit") return execution;
+  const recoveryKey = `${execution.orderId}:${Number(!!account.testnet)}`;
+  const previousAttempt = exitHistoryFallbackAttempts.get(recoveryKey);
+  if (previousAttempt && Date.now() - previousAttempt < EXIT_HISTORY_FALLBACK_COOLDOWN_MS) return execution;
+  exitHistoryFallbackAttempts.set(recoveryKey, Date.now());
+  if (exitHistoryFallbackAttempts.size > 2000) {
+    exitHistoryFallbackAttempts.delete(exitHistoryFallbackAttempts.keys().next().value);
+  }
+
+  const historyReader = getExchangeClient(exchange).getExecutionHistory;
+  if (typeof historyReader !== "function") return execution;
+  const executions = await historyReader(account, symbol, {
+    startTime: Math.max(0, Number(execution.transactTime || 0) - 60_000),
+    limit: 100,
+  }).catch(() => null);
+  if (!executions) return execution;
+  return reconstructKnownExitExecution({ execution, executions }) || execution;
+}
+
 function shouldReconcileTrade(trade) {
   if (!trade || !isCurrentGenerationTrade(trade)) {
     return false;
@@ -3202,7 +3234,7 @@ async function reconcileTradeStatuses() {
       }
 
       for (const exitOrder of trade.exitOrders || []) {
-        const nextExitAdminExecution = await reconcileExecution(adminAccount, trade.symbol, exitOrder.adminExecution, exchange);
+        const nextExitAdminExecution = await reconcileExitExecution(adminAccount, trade.symbol, exitOrder.adminExecution, exchange);
         if (!sameExecution(nextExitAdminExecution, exitOrder.adminExecution)) {
           exitOrder.adminExecution = nextExitAdminExecution;
           changed = true;
@@ -3211,7 +3243,7 @@ async function reconcileTradeStatuses() {
         for (const mirror of exitOrder.mirroredExecutions || []) {
           const user = db.users.find((item) => item.id === mirror.userId);
           const mirrorAccount = getExchangeAccount(user, normalizeExchange(mirror.exchange, exchange));
-          const nextMirrorExecution = await reconcileExecution(
+          const nextMirrorExecution = await reconcileExitExecution(
             mirrorAccount,
             trade.symbol,
             mirror.order,
