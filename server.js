@@ -49,7 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
-const { reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
+const { reconstructKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
 const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
@@ -58,7 +58,7 @@ const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
-const { deriveTradeLifecycle: classifyTradeLifecycle } = require("./lib/tradeLifecycle");
+const { deriveTradeLifecycle: classifyTradeLifecycle, hasVerifiedExchangeCloseEvidence } = require("./lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL, FIXED_ROUND_TRIP_FEE_RATE, calculateFixedRoundTripSettlement } = require("./lib/tradingFee");
 const {
   isCurrentGenerationTrade,
@@ -3052,6 +3052,25 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
   const executions = await executionHistoryReader(account, trade.symbol, {
     startTime: Math.max(0, Number(entryExecution?.transactTime || 0) - 60_000),
   }).catch(() => null);
+  if (executions && !userId) {
+    for (const exitOrder of trade.exitOrders || []) {
+      const recoveredExecution = reconstructKnownExitExecution({ execution: exitOrder.adminExecution, executions });
+      if (recoveredExecution) exitOrder.adminExecution = recoveredExecution;
+    }
+    const closeEvidence = reconstructKnownExitClosure({
+      tradeId: trade.id,
+      entryExecution,
+      exitExecutions: (trade.exitOrders || []).map((exitOrder) => exitOrder.adminExecution),
+      executions,
+      baseAsset,
+      currentBaseBalance: normalizedBalance,
+      tolerance: Math.max(Number(minQty || 0), 1e-8),
+    });
+    if (closeEvidence) {
+      trade.authoritativeCloseEvidence = closeEvidence;
+      return true;
+    }
+  }
   const authoritativeExecution = executions && reconstructExternalClose({
     entryExecution,
     knownExitOrderIds,
@@ -3115,12 +3134,18 @@ const exitHistoryFallbackAttempts = new Map();
 const EXIT_HISTORY_FALLBACK_COOLDOWN_MS = 30_000;
 
 async function reconcileExitExecution(account, symbol, execution, exchange = getAccountExchange(account)) {
-  if (!account || !symbol || !isExecutionActive(execution)) return execution;
-  try {
-    const latest = await getOrder(account, symbol, execution.orderId, exchange);
-    if (latest) return sanitizeExecution(latest);
-  } catch {
-    // Some exchanges stop returning completed orders from their realtime order endpoint.
+  if (!account || !symbol || !execution?.orderId) return execution;
+  let currentExecution = execution;
+  if (isExecutionActive(execution)) {
+    try {
+      const latest = await getOrder(account, symbol, execution.orderId, exchange);
+      if (latest) {
+        currentExecution = sanitizeExecution(latest);
+        if (isExecutionActive(currentExecution)) return currentExecution;
+      }
+    } catch {
+      // Some exchanges stop returning completed orders from their realtime order endpoint.
+    }
   }
 
   if (normalizeExchange(exchange) !== "bybit") return execution;
@@ -3135,11 +3160,11 @@ async function reconcileExitExecution(account, symbol, execution, exchange = get
   const historyReader = getExchangeClient(exchange).getExecutionHistory;
   if (typeof historyReader !== "function") return execution;
   const executions = await historyReader(account, symbol, {
-    startTime: Math.max(0, Number(execution.transactTime || 0) - 60_000),
+    startTime: Math.max(0, Number(currentExecution.transactTime || 0) - 60_000),
     limit: 100,
   }).catch(() => null);
   if (!executions) return execution;
-  return reconstructKnownExitExecution({ execution, executions }) || execution;
+  return reconstructKnownExitExecution({ execution: currentExecution, executions }) || currentExecution;
 }
 
 function shouldReconcileTrade(trade) {
@@ -4047,7 +4072,9 @@ function getAuthoritativeClosedTradePnlPercent(trade) {
   }
   const entryPrice = getTradeEntryPriceSnapshot(trade);
   const exitPrice = getWeightedAverageExecutionPrice(getFilledExitExecutions(trade));
-  if (entryPrice <= 0 || exitPrice <= 0 || getTradeFilledEntryQuantity(trade) <= 0 || getRemainingTradeQuantity(trade) > 1e-8) {
+  const closeEvidenceVerified = hasVerifiedExchangeCloseEvidence(trade);
+  if (entryPrice <= 0 || exitPrice <= 0 || getTradeFilledEntryQuantity(trade) <= 0
+    || (!closeEvidenceVerified && getRemainingTradeQuantity(trade) > 1e-8)) {
     return null;
   }
   const multiplier = trade.side === "SELL" ? -1 : 1;
