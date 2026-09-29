@@ -36,6 +36,7 @@ const VTU_LEDGER_TYPES = ["VTU_AIRTIME", "VTU_DATA", "VTU_REFUND"];
 const DIGITAL_SERVICE_FINAL_STATUSES = ["delivered", "failed", "refunded"];
 const DIGITAL_SERVICE_ACTIVE_STATUSES = ["created", "pending_payment", "payment_reserved", "paid", "submitted", "processing"];
 const DIGITAL_SERVICE_LEDGER_TYPES = ["DIGITAL_SERVICE", "DIGITAL_SERVICE_REFUND"];
+const DIGITAL_SERVICE_PERSISTENCE_FIELDS = ["meta", "wallets", "transactions", "digitalServiceOrders", "idempotencyKeys"];
 const DEFAULT_DIGITAL_SERVICE_MARKUP_PERCENT = "0";
 const DEFAULT_DIGITAL_SERVICE_FALLBACK_IMAGE = "/services/default-digital-service.png";
 const DISPOSABLE_HISTORY_RETENTION_MS = 48 * 60 * 60 * 1000;
@@ -6106,7 +6107,7 @@ class FinancialService {
     this.notifyAdmins({ type: "DIGITAL_SERVICE", category: "adminEvents", title: "OTP Requested", message: `A customer needs an OTP for ${order.productName}.`, entityType: "DIGITAL_SERVICE", entityId: order.id, route: `/?tab=store&order=${encodeURIComponent(order.id)}`, dedupeKey: `admin:otp-request:${order.id}:${requestedAt}`, metadata: { orderId: order.id, requestId: order.requestId, otpRequest: true } });
     if (this.emailPublisher) Promise.resolve().then(() => this.emailPublisher({ productName: order.productName, orderReference: order.requestId, customer: customer.email || customer.id, requestedAt })).catch((error) => console.warn("OTP admin email delivery failed:", error.message || error));
     this.audit(user, "DIGITAL_SERVICE_OTP_REQUESTED", "DigitalServiceOrder", order.id, { requestId: order.requestId }, requestMeta);
-    this.persist();
+    this.persist({ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS });
     return this.sanitizeDigitalServiceOrder(order, { admin: false });
   }
 
@@ -6330,7 +6331,7 @@ class FinancialService {
       amountCharged,
       requestId,
     }, requestMeta);
-    this.persist();
+    this.persist({ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS });
     return this.sanitizeDigitalServiceOrder(order, { admin: false });
   }
 
@@ -6434,7 +6435,7 @@ class FinancialService {
       paymentReference: order.paymentReference,
       amountCharged: order.amountCharged,
     }, requestMeta);
-    this.persist();
+    this.persist({ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS });
     return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
   }
 
@@ -6553,7 +6554,7 @@ class FinancialService {
       supplierStatus: order.supplierStatus,
       supplierOrderId: order.supplierOrderId,
     }, requestMeta);
-    this.persist();
+    this.persist({ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS });
     return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
   }
 
@@ -6579,7 +6580,7 @@ class FinancialService {
       this.audit(actor, "DIGITAL_SERVICE_MANUAL_ORDER_AWAITING", "DigitalServiceOrder", order.id, {
         requestId: order.requestId,
       }, requestMeta);
-      this.persist();
+      this.persist({ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS });
     }
     return this.sanitizeDigitalServiceOrder(order, { admin: actor?.role === "admin" });
   }

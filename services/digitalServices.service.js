@@ -829,12 +829,13 @@ function mergeSupplierPayloads(payloads = []) {
 }
 
 class DigitalServicesService {
-  constructor({ financialService, akundingService, emmaService = null, efemService = null, persistPaidOrder = null, clock = () => new Date().toISOString() } = {}) {
+  constructor({ financialService, akundingService, emmaService = null, efemService = null, persistPaidOrder = null, markFinancialMutation = null, clock = () => new Date().toISOString() } = {}) {
     this.financialService = financialService;
     this.akundingService = akundingService;
     this.emmaService = emmaService;
     this.efemService = efemService;
     this.persistPaidOrder = persistPaidOrder;
+    this.markFinancialMutation = markFinancialMutation;
     this.clock = clock;
     this.fulfillmentRequests = new Map();
   }
@@ -1211,23 +1212,47 @@ class DigitalServicesService {
       paymentMethod: input.paymentMethod || "wallet",
     }, requestMeta);
     this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order });
+    if (order.paymentMethod === "wallet") {
+      const wallet = this.financialService.ensureWallet(user.id, "NGN");
+      this.markFinancialMutation?.(wallet, "DIGITAL_SERVICE_PURCHASE", order.requestId);
+    }
+    await this.persistOrderState(order);
     if (order.paymentMethod === "paystack" || order.fulfillmentMode === "manual") {
       return order;
     }
-    if (typeof this.persistPaidOrder === "function") {
-      await this.persistPaidOrder();
-    }
     const fulfilled = await this.fulfillPaidOrder(order.id, user, requestMeta);
     this.financialService.saveIdempotent("digital-service:purchase", user.id, idempotencyKey, { order: fulfilled });
-    return fulfilled;
+    return this.persistOrderState(fulfilled);
+  }
+
+  async persistOrderState(value = null) {
+    if (typeof this.persistPaidOrder === "function") {
+      try {
+        await this.persistPaidOrder({ orderId: value?.id || value?.orderId || "" });
+      } catch (error) {
+        error.code = error.code || "DIGITAL_SERVICE_PERSISTENCE_FAILED";
+        throw error;
+      }
+    }
+    return value;
+  }
+
+  async applyOrderResult(orderId, payload, actor, requestMeta = {}) {
+    const order = this.financialService.db?.digitalServiceOrders?.find((item) => item.id === orderId || item.requestId === orderId || item.supplierOrderId === orderId);
+    const wallet = order ? this.financialService.ensureWallet(order.userId, "NGN") : null;
+    const before = wallet ? { availableBalance: wallet.availableBalance, lockedBalance: wallet.lockedBalance } : null;
+    const result = this.financialService.applyDigitalServiceOrderResult(orderId, payload, actor, requestMeta);
+    if (wallet && (wallet.availableBalance !== before.availableBalance || wallet.lockedBalance !== before.lockedBalance)) {
+      this.markFinancialMutation?.(wallet, "DIGITAL_SERVICE_RESULT", order?.requestId || orderId);
+    }
+    return this.persistOrderState(result);
   }
 
   async completeVerifiedPaystackOrder(reference, payment, actor, requestMeta = {}) {
     const paidOrder = this.financialService.confirmDigitalServicePaystackPayment(reference, payment, actor, requestMeta);
-    if (typeof this.persistPaidOrder === "function") {
-      await this.persistPaidOrder();
-    }
-    return this.fulfillPaidOrder(paidOrder.id, actor, requestMeta);
+    await this.persistOrderState(paidOrder);
+    const fulfilled = await this.fulfillPaidOrder(paidOrder.id, actor, requestMeta);
+    return this.persistOrderState(fulfilled);
   }
 
   async fulfillPaidOrder(orderId, actor, requestMeta = {}) {
@@ -1327,13 +1352,14 @@ class DigitalServicesService {
     }
     const orderProvider = normalizeProviderKey(order.provider);
     if (String(order.fulfillmentMode || "").toLowerCase() === "manual" || orderProvider === "manual") {
-      return this.financialService.markManualDigitalServiceOrderAwaiting?.(order.id, actor, requestMeta)
+      const manualOrder = this.financialService.markManualDigitalServiceOrderAwaiting?.(order.id, actor, requestMeta)
         || this.financialService.applyDigitalServiceOrderResult(order.id, {
           status: "paid",
           supplierStatus: "manual_fulfillment_required",
           fulfillmentStatus: "awaiting_manual_fulfillment",
           message: "Manual fulfillment is awaiting admin delivery.",
         }, actor, requestMeta);
+      return this.persistOrderState(manualOrder);
     }
     if (
       orderProvider === "efem" &&
@@ -1348,12 +1374,13 @@ class DigitalServicesService {
     order.fulfillmentAttemptedAt = order.fulfillmentAttemptedAt || order.lastFulfillmentAttemptAt;
     order.fulfillmentStatus = "processing";
     order.lastFulfillmentError = "";
+    await this.persistOrderState(order);
     const product = this.financialService.getDigitalServiceProduct(order.productId, { admin: true });
     const provider = normalizeProviderKey(order.provider || product.provider);
     const service = this.getProviderService(provider);
     const supplierConfig = this.financialService.getDigitalServiceSupplierRuntimeConfig?.(provider);
     if (supplierConfig?.enabled === false || supplierConfig?.capabilities?.automaticFulfillment === false) {
-      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+      return this.applyOrderResult(order.id, {
         status: "processing",
         supplierStatus: supplierConfig?.enabled === false ? "supplier_disabled" : "manual_fulfillment_required",
         fulfillmentStatus: "failed_retryable",
@@ -1361,7 +1388,7 @@ class DigitalServicesService {
       }, actor, requestMeta);
     }
     if (!service?.isConfigured?.()) {
-      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+      return this.applyOrderResult(order.id, {
         status: "processing",
         supplierStatus: "supplier_unconfigured",
         fulfillmentStatus: "failed_retryable",
@@ -1375,7 +1402,7 @@ class DigitalServicesService {
         return this.applySupplierResult(order.id, reconciled, actor, requestMeta);
       }
       if (typeof service.createOrder !== "function") {
-        return this.financialService.applyDigitalServiceOrderResult(order.id, {
+        return this.applyOrderResult(order.id, {
           status: "processing",
           supplierStatus: "manual_fulfillment_required",
           fulfillmentStatus: "failed_retryable",
@@ -1394,6 +1421,9 @@ class DigitalServicesService {
       }
       return this.applySupplierResult(order.id, mergeSupplierPayloads([providerResponse, ...supplementalPayloads]) || providerResponse, actor, requestMeta);
     } catch (error) {
+      if (error?.code === "DIGITAL_SERVICE_PERSISTENCE_FAILED") {
+        throw error;
+      }
       if (extractDeliveryPayload(error.payload)) {
         return this.applySupplierResult(order.id, error.payload, actor, requestMeta);
       }
@@ -1405,7 +1435,7 @@ class DigitalServicesService {
           payload
         );
       }
-      return this.financialService.applyDigitalServiceOrderResult(order.id, payload, actor, requestMeta);
+      return this.applyOrderResult(order.id, payload, actor, requestMeta);
     }
   }
 
@@ -1418,7 +1448,7 @@ class DigitalServicesService {
     }
     const payloads = await this.fetchSupplierOrderPayloads(order);
     if (!payloads.length) {
-      return this.financialService.applyDigitalServiceOrderResult(order.id, {
+      return this.applyOrderResult(order.id, {
         status: "processing",
         supplierStatus: "not_found",
         supplierOrderId: order.supplierOrderId,
@@ -1489,7 +1519,7 @@ class DigitalServicesService {
     return payloads;
   }
 
-  applySupplierResult(orderId, providerResponse, actor, requestMeta = {}) {
+  async applySupplierResult(orderId, providerResponse, actor, requestMeta = {}) {
     const delivery = extractDeliveryPayload(providerResponse);
     const supplierOrderId = extractSupplierOrderId(providerResponse);
     const mappedStatus = mapSupplierStatus(providerResponse);
@@ -1499,7 +1529,7 @@ class DigitalServicesService {
     const fulfillmentStatus = mappedStatus === "delivered" && !delivery && responseHasSupplierSuccess(providerResponse)
       ? "manual_review"
       : undefined;
-    return this.financialService.applyDigitalServiceOrderResult(orderId, {
+    return this.applyOrderResult(orderId, {
       status,
       supplierStatus: normalizeText(firstValue(providerResponse?.data && typeof providerResponse.data === "object" ? providerResponse.data : providerResponse, ["status", "order_status", "state"]), "processing"),
       supplierOrderId,

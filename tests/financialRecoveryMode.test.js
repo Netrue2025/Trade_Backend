@@ -137,6 +137,23 @@ test("unsafe VTU and wallet shop flows remain independently disabled after recov
   });
 });
 
+test("shop wallet checkout uses scoped required persistence before supplier fulfillment", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const digitalServices = fs.readFileSync(path.join(__dirname, "..", "services", "digitalServices.service.js"), "utf8");
+  const financial = fs.readFileSync(path.join(__dirname, "..", "services", "financialService.js"), "utf8");
+  const purchase = digitalServices.slice(digitalServices.indexOf("async purchase("), digitalServices.indexOf("async persistOrderState("));
+  const resultApplication = digitalServices.slice(digitalServices.indexOf("async applyOrderResult("), digitalServices.indexOf("async completeVerifiedPaystackOrder("));
+
+  assert.match(server, /persistPaidOrder: async \(\) => \{\s*await persist\(\{\s*required: true,\s*fields: \["meta", "wallets", "transactions", "digitalServiceOrders", "idempotencyKeys"\]/);
+  assert.ok(purchase.indexOf("await this.persistOrderState(order)") < purchase.indexOf("await this.fulfillPaidOrder(order.id"));
+  assert.match(purchase, /markFinancialMutation\?\.\(wallet, "DIGITAL_SERVICE_PURCHASE", order\.requestId\)/);
+  assert.match(resultApplication, /applyDigitalServiceOrderResult\(orderId, payload, actor, requestMeta\)/);
+  assert.match(resultApplication, /markFinancialMutation\?\.\(wallet, "DIGITAL_SERVICE_RESULT"/);
+  assert.match(resultApplication, /return this\.persistOrderState\(result\)/);
+  assert.match(financial, /const DIGITAL_SERVICE_PERSISTENCE_FIELDS = \["meta", "wallets", "transactions", "digitalServiceOrders", "idempotencyKeys"\]/);
+  assert.match(financial, /this\.persist\(\{ fields: DIGITAL_SERVICE_PERSISTENCE_FIELDS \}\)/);
+});
+
 test("server recovery gates cover trade creation, reconciliation, settlement, deposits, withdrawals, gift cards, and quest money", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   assert.match(server, /TRADE_RECONCILIATION_NOT_READY_OR_NOT_AUTHORIZED skipped/);

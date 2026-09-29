@@ -9788,8 +9788,14 @@ async function startServer() {
     emmaService: emmaResellerService,
     efemService: efemResellerService,
     persistPaidOrder: async () => {
-      await persist({ required: true });
+      await persist({
+        required: true,
+        fields: ["meta", "wallets", "transactions", "digitalServiceOrders", "idempotencyKeys"],
+        operation: { reason: "DIGITAL_SERVICE_ORDER" },
+      });
+      void persist({ bestEffort: true, fields: ["notifications", "auditLogs"] });
     },
+    markFinancialMutation,
   });
   questService = new QuestService({ db, financialService, persist, financialIntegrity });
   questService.ensureState();

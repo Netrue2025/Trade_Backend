@@ -2077,6 +2077,9 @@ test("digital service percentage markup supports values above 100 percent", () =
 });
 
 test("digital service API cost drives customer price and checkout ignores client price", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
   const { admin, db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "10000");
   service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
@@ -2118,6 +2121,13 @@ test("digital service API cost drives customer price and checkout ignores client
   const order = await digitalServices.purchase(user, { productId: "api-price", quantity: 1, price: "1", expectedAmount: "5000" }, { idempotencyKey: "price-ok" });
   assert.equal(order.amountCharged, "5000");
   assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "5000");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
 });
 
 test("digital service unavailable products remain visible but reject checkout before debit", async () => {
@@ -3393,13 +3403,26 @@ test("wallet digital service purchase uses authoritative server price and idempo
       stock: 10,
       available: true,
     }]);
+    const persistedStatuses = [];
+    let durableWriteCount = 0;
     const digitalServices = new DigitalServicesService({
       financialService: service,
+      persistPaidOrder: async () => {
+        durableWriteCount += 1;
+        persistedStatuses.push(db.digitalServiceOrders[0]?.status);
+      },
+      markFinancialMutation: (wallet, reason, reference) => {
+        wallet.revision = Number(wallet.revision || 0) + 1;
+        wallet.lastMutation = { reason, reference };
+      },
       akundingService: {
         baseUrl: "https://akunding.shop",
         getPublicStatus: () => ({ configured: true }),
         isConfigured: () => true,
-        createOrder: async () => ({ data: { id: "AK-price", status: "delivered", activation_link: "https://example.com/activate" } }),
+        createOrder: async () => {
+          assert.ok(durableWriteCount > 0, "payment state must be durable before supplier fulfillment");
+          return { data: { id: "AK-price", status: "delivered", activation_link: "https://example.com/activate" } };
+        },
       },
     });
 
@@ -3414,6 +3437,110 @@ test("wallet digital service purchase uses authoritative server price and idempo
     assert.equal(db.digitalServiceOrders.length, 1);
     assert.equal(duplicate.order.id, order.id);
     assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.ok(durableWriteCount >= 3, "payment reservation, fulfillment attempt, and result are durably checkpointed");
+    assert.ok(persistedStatuses.includes("payment_reserved"));
+    assert.ok(persistedStatuses.includes("delivered"));
+    assert.ok(service.ensureWallet(user.id, "NGN").revision >= 2);
+    assert.equal(service.ensureWallet(user.id, "NGN").lastMutation.reason, "DIGITAL_SERVICE_RESULT");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("wallet shop purchase never calls supplier when required order persistence fails", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "persist-fail-safe",
+      supplierProductId: "persist-fail-safe",
+      provider: "akunding",
+      name: "AI Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      persistPaidOrder: async () => { throw new Error("durability unavailable"); },
+      akundingService: {
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          return { status: "delivered" };
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => digitalServices.purchase(user, { productId: "persist-fail-safe" }, { idempotencyKey: "persist-fail" }),
+      /durability unavailable/
+    );
+    assert.equal(supplierCalls, 0);
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "4000");
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.SETTINGS_ENCRYPTION_KEY;
+    } else {
+      process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
+    }
+  }
+});
+
+test("wallet shop does not downgrade a supplier success when its result persistence fails", async () => {
+  const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
+  process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
+  try {
+    const { admin, db, service, user } = createHarness();
+    setWallet(service, user.id, "NGN", "10000");
+    service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
+    service.replaceDigitalServiceProducts([{
+      id: "result-persist-fail",
+      supplierProductId: "result-persist-fail",
+      provider: "akunding",
+      name: "AI Tool",
+      category: "AI",
+      currency: "NGN",
+      providerCost: "4000",
+      stock: 10,
+      available: true,
+    }]);
+    let supplierCalls = 0;
+    const digitalServices = new DigitalServicesService({
+      financialService: service,
+      persistPaidOrder: async () => {
+        if (db.digitalServiceOrders[0]?.status === "delivered") {
+          throw new Error("delivery durability unavailable");
+        }
+      },
+      akundingService: {
+        isConfigured: () => true,
+        createOrder: async () => {
+          supplierCalls += 1;
+          return { data: { id: "AK-result-fail", status: "delivered", activation_link: "https://example.com/activation" } };
+        },
+      },
+    });
+
+    await assert.rejects(
+      () => digitalServices.purchase(user, { productId: "result-persist-fail" }, { idempotencyKey: "result-persist-fail" }),
+      { code: "DIGITAL_SERVICE_PERSISTENCE_FAILED" }
+    );
+    assert.equal(supplierCalls, 1);
+    assert.equal(db.digitalServiceOrders[0].status, "delivered");
+    assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "6000");
+    assert.equal(service.ensureWallet(user.id, "NGN").lockedBalance, "0");
   } finally {
     if (previousKey === undefined) {
       delete process.env.SETTINGS_ENCRYPTION_KEY;
@@ -3579,7 +3706,7 @@ test("verified Paystack order is persisted as paid before supplier fulfillment",
   const previousKey = process.env.SETTINGS_ENCRYPTION_KEY;
   process.env.SETTINGS_ENCRYPTION_KEY = crypto.randomBytes(32).toString("hex");
   try {
-    const { admin, service, user } = createHarness();
+    const { admin, db, service, user } = createHarness();
     service.updateSettings(admin, { digitalServices: { enabled: true, globalMarkupPercent: "0" } });
     service.replaceDigitalServiceProducts([{
       id: "paystack-persist-first",
@@ -3596,9 +3723,10 @@ test("verified Paystack order is persisted as paid before supplier fulfillment",
     const digitalServices = new DigitalServicesService({
       financialService: service,
       persistPaidOrder: async () => {
-        const current = service.getDigitalServiceOrderByPaymentReference(pending.paymentReference);
-        assert.equal(current.paymentStatus, "paid");
-        sequence.push("persisted-paid");
+        const current = db.digitalServiceOrders.find((order) => order.paymentMethod === "paystack");
+        if (current?.paymentStatus === "paid") {
+          sequence.push("persisted-paid");
+        }
       },
       akundingService: {
         isConfigured: () => true,
@@ -3617,7 +3745,9 @@ test("verified Paystack order is persisted as paid before supplier fulfillment",
       amount: toKobo("4000"),
     }, user);
     assert.equal(delivered.fulfillmentStatus, "fulfilled");
-    assert.deepEqual(sequence, ["persisted-paid", "supplier"]);
+    const supplierIndex = sequence.indexOf("supplier");
+    assert.ok(supplierIndex > 0);
+    assert.equal(sequence[supplierIndex - 1], "persisted-paid");
   } finally {
     if (previousKey === undefined) delete process.env.SETTINGS_ENCRYPTION_KEY;
     else process.env.SETTINGS_ENCRYPTION_KEY = previousKey;
