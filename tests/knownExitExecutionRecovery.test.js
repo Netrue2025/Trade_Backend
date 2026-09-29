@@ -4,7 +4,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution } = require("../lib/knownExitExecutionRecovery");
+const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution } = require("../lib/knownExitExecutionRecovery");
+const { deriveTradeLifecycle, hasVerifiedExchangeCloseEvidence } = require("../lib/tradeLifecycle");
+const { CURRENT_TRADE_FEE_MODEL, calculateFixedRoundTripSettlement } = require("../lib/tradingFee");
 
 const exitOrder = { orderId: "tp-order", side: "SELL", status: "NEW", origQty: "10", executedQty: "0" };
 
@@ -134,6 +136,63 @@ test("entry mismatch diagnostics still report the independent exit quantity and 
   assert.equal(diagnosis.metrics.entryBaseFee, 0.01);
   assert.equal(diagnosis.metrics.exitQuantity, 8.98);
   assert.equal(diagnosis.metrics.exitBaseFee, 0.01);
+});
+
+test("a fully-filled registered TP provides auditable close evidence when only account dust differs", () => {
+  const executions = [
+    { orderId: "entry-order", side: "BUY", execQty: "16910.87", execPrice: "1", execFee: "16.91087", feeCurrency: "FLOCK", execTime: 11 },
+    { orderId: "tp-order", side: "SELL", execQty: "16893.97", execPrice: "1.01", execFee: "0", feeCurrency: "USDT", execTime: 20 },
+  ];
+  const entryExecution = { orderId: "entry-order", transactTime: 10, executedQty: "16910.87" };
+  const exitOrders = [{
+    kind: "TAKE_PROFIT",
+    adminExecution: { orderId: "tp-order", status: "FILLED", origQty: "16893.97", executedQty: "16893.97", authoritativeHistory: true },
+  }];
+  const diagnosis = diagnoseKnownExitClosure({
+    tradeId: "trade-1",
+    entryExecution,
+    exitExecutions: exitOrders.map((item) => item.adminExecution),
+    executions,
+    baseAsset: "FLOCK",
+    currentBaseBalance: 0,
+    tolerance: 0.01,
+  });
+  assert.equal(diagnosis.reason, "EXIT_QUANTITY_BALANCE_MISMATCH");
+  assert.ok(Math.abs(diagnosis.metrics.accountingDelta + 0.01087) < 1e-9);
+  const evidence = buildFilledTakeProfitCloseEvidence({ tradeId: "trade-1", entryExecution, exitOrders, diagnosis });
+  assert.equal(evidence.source, "BYBIT_KNOWN_FILLED_TAKE_PROFIT_EXECUTION_HISTORY");
+  assert.equal(evidence.balanceReconciled, false);
+  assert.ok(Math.abs(Number(evidence.accountingDelta) + 0.01087) < 1e-9);
+
+  const trade = {
+    id: "trade-1",
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    side: "BUY",
+    adminExecution: { ...entryExecution, status: "FILLED", price: "1" },
+    exitOrders,
+    authoritativeCloseEvidence: evidence,
+  };
+  assert.equal(hasVerifiedExchangeCloseEvidence(trade), true);
+  assert.equal(deriveTradeLifecycle(trade), "CLOSED");
+  const settlement = calculateFixedRoundTripSettlement("100000", "1");
+  assert.equal(settlement.tradingFee, "200");
+  assert.equal(settlement.netPnl, "800");
+  assert.equal(settlement.settlementAmount, "100800");
+  const losingSettlement = calculateFixedRoundTripSettlement("100000", "-1");
+  assert.equal(losingSettlement.tradingFee, "200");
+  assert.equal(losingSettlement.netPnl, "-1200");
+  assert.equal(losingSettlement.settlementAmount, "98800");
+});
+
+test("filled TP close evidence refuses manual exits, partial fills, and unrelated trades", () => {
+  const entryExecution = { orderId: "entry-order", executedQty: "10" };
+  const diagnosis = {
+    reason: "EXIT_QUANTITY_BALANCE_MISMATCH",
+    metrics: { tolerance: 0.01, entryFillCount: 1, entryQuantity: 10, entryBaseFee: 0, exitQuantity: 9.99, exitBaseFee: 0, remainingBaseBalance: 0, accountingDelta: 0.01 },
+  };
+  const baseExit = { adminExecution: { orderId: "tp-order", status: "FILLED", origQty: "9.99", executedQty: "9.99", authoritativeHistory: true } };
+  assert.equal(buildFilledTakeProfitCloseEvidence({ tradeId: "trade-1", entryExecution, exitOrders: [{ ...baseExit, kind: "MANUAL_SELL" }], diagnosis }), null);
+  assert.equal(buildFilledTakeProfitCloseEvidence({ tradeId: "trade-1", entryExecution, exitOrders: [{ ...baseExit, kind: "TAKE_PROFIT", adminExecution: { ...baseExit.adminExecution, status: "PARTIALLY_FILLED" } }], diagnosis }), null);
 });
 
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {

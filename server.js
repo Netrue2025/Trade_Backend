@@ -49,7 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
-const { diagnoseKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
+const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
 const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
@@ -3156,6 +3156,22 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     const closeEvidence = knownExitDiagnostic.evidence;
     if (closeEvidence) {
       trade.authoritativeCloseEvidence = closeEvidence;
+      return true;
+    }
+    const filledTakeProfitEvidence = buildFilledTakeProfitCloseEvidence({
+      tradeId: trade.id,
+      entryExecution,
+      exitOrders: trade.exitOrders || [],
+      diagnosis: knownExitDiagnostic,
+    });
+    if (filledTakeProfitEvidence) {
+      console.warn("TRADE_CLOSE_CONFIRMED_BY_FILLED_TAKE_PROFIT", {
+        tradeId: trade.id,
+        symbol: trade.symbol,
+        exitOrderIds: filledTakeProfitEvidence.exitOrderIds,
+        accountingDelta: filledTakeProfitEvidence.accountingDelta,
+      });
+      trade.authoritativeCloseEvidence = filledTakeProfitEvidence;
       return true;
     }
   }
