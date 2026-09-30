@@ -9423,7 +9423,7 @@ async function handleApi(req, res, url) {
                 if (investment) {
                   return true;
                 }
-                if (trade.mirroredExecutions.some((row) => row.userId === user.id)) {
+                if ((trade.mirroredExecutions || []).some((row) => row.userId === user.id)) {
                   return true;
                 }
                 return ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));

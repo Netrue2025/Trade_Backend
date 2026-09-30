@@ -126,3 +126,8 @@ test("new trades receive server-side marker and trade worker requires readiness,
   assert.match(worker, /financialIntegrity\.getStatus\(\)\.writable/);
   assert.match(worker, /isTradingIsolationMode\(\)/);
 });
+
+test("user trade listing tolerates historical trades without mirrored execution arrays", () => {
+  const listing = sourceBetween('if (req.method === "GET" && url.pathname === "/api/trades")', "const joinTradeMatch");
+  assert.match(listing, /\(trade\.mirroredExecutions \|\| \[\]\)\.some\(/);
+});
