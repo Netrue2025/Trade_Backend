@@ -1053,6 +1053,14 @@ test("admin can set a user balance", () => {
   assert.equal(result.transaction.amount, "27");
   assert.equal(result.transaction.metadata.overwriteSelectedCurrencyBalance, true);
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
+
+  service.setUserBalance(admin, user.id, {
+    currency: "NGN",
+    amount: "18000",
+    note: "Naira correction",
+  });
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "18000");
+  assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "42");
 });
 
 test("admin balance overwrite prevents stale legacy balance remigration", () => {
