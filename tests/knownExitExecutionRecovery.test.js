@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("../lib/knownExitExecutionRecovery");
-const { deriveTradeLifecycle, hasVerifiedExchangeCloseEvidence } = require("../lib/tradeLifecycle");
+const { deriveTradeLifecycle, hasOverlappingCurrentGenerationTrade, hasVerifiedExchangeCloseEvidence } = require("../lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL, calculateFixedRoundTripSettlement } = require("../lib/tradingFee");
 
 const exitOrder = { orderId: "tp-order", side: "SELL", status: "NEW", origQty: "10", executedQty: "0" };
@@ -278,12 +278,88 @@ test("trade-scoped closure rejects meaningful exposure, oversells, missing entry
   const partial = reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, sell], baseAsset: "FAST", tolerance: 0.01 });
   assert.equal(partial.evidence, null);
   assert.equal(partial.reason, "MEANINGFUL_TRADE_QUANTITY_REMAINS");
-  assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "101" }], baseAsset: "FAST", tolerance: 0.01 }).reason, "EXIT_QUANTITY_EXCEEDS_ENTRY");
+  assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "101" }], baseAsset: "FAST", tolerance: 0.01 }).reason, "NO_QUANTITY_MATCHING_EXIT_SUBSET");
   assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "100.005" }], baseAsset: "FAST", tolerance: 0.01 }).reason, "EXIT_QUANTITY_EXCEEDS_ENTRY");
   assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [sell], baseAsset: "FAST" }).reason, "ENTRY_FILLS_NOT_FOUND");
 
   const complete = reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "100" }, { ...sell, execQty: "100" }], baseAsset: "FAST", tolerance: 0.01 });
   assert.equal(complete.evidence.exitQuantity, "100");
+});
+
+test("missing exit reference recovery attributes only a unique quantity-bounded subset", () => {
+  const entryExecution = { orderId: "lit-entry", executedQty: "376.95" };
+  const executions = [
+    { execId: "entry", orderId: "lit-entry", side: "BUY", execQty: "376.95", execPrice: "0.8", execTime: 100 },
+    ...[100, 100, 100, 76.95, 3, 5, 7, 11].map((qty, index) => ({
+      execId: `sell-${index}`,
+      orderId: `sell-order-${index}`,
+      orderLinkId: `link-${index}`,
+      side: "SELL",
+      execQty: String(qty),
+      execPrice: "0.81",
+      execTime: 200 + index,
+    })),
+  ];
+  const recovered = reconstructTradeScopedClose({
+    tradeId: "lit-current",
+    entryExecution,
+    executions,
+    baseAsset: "LIT",
+    tolerance: 0.01,
+  });
+  assert.equal(recovered.reason, "VERIFIED_TRADE_SCOPED_EXIT");
+  assert.equal(recovered.metrics.candidateSellExecutionCount, 8);
+  assert.equal(recovered.metrics.attributableSellExecutionCount, 4);
+  assert.equal(recovered.evidence.exitQuantity, "376.95");
+  assert.equal(recovered.evidence.remainingTradeQuantity, "0");
+
+  const ambiguous = reconstructTradeScopedClose({
+    tradeId: "lit-current",
+    entryExecution,
+    executions: [executions[0],
+      { execId: "sell-a", orderId: "sell-a", side: "SELL", execQty: "376.95", execPrice: "0.81", execTime: 200 },
+      { execId: "sell-b", orderId: "sell-b", side: "SELL", execQty: "376.95", execPrice: "0.82", execTime: 201 }],
+    baseAsset: "LIT",
+    tolerance: 0.01,
+  });
+  assert.equal(ambiguous.evidence, null);
+  assert.equal(ambiguous.reason, "MULTIPLE_QUANTITY_MATCHING_EXIT_SUBSETS");
+
+  const incomplete = reconstructTradeScopedClose({
+    tradeId: "lit-current",
+    entryExecution,
+    executions: [executions[0], { execId: "sell-300", orderId: "sell-300", side: "SELL", execQty: "300", execPrice: "0.81", execTime: 200 }],
+    baseAsset: "LIT",
+    tolerance: 0.01,
+  });
+  assert.equal(incomplete.evidence, null);
+  assert.equal(incomplete.reason, "MEANINGFUL_TRADE_QUANTITY_REMAINS");
+});
+
+test("registered order IDs and orderLinkIds are mandatory; overlapping same-owner current trades block attribution", () => {
+  const entryExecution = { orderId: "entry", executedQty: "100" };
+  const executions = [
+    { execId: "e", orderId: "entry", side: "BUY", execQty: "100", execPrice: "1", execTime: 10 },
+    { execId: "tp", orderId: "real-tp", orderLinkId: "tp-link", side: "SELL", execQty: "60", execPrice: "1.1", execTime: 20 },
+    { execId: "other", orderId: "external", side: "SELL", execQty: "40", execPrice: "1.2", execTime: 30 },
+    { execId: "unrelated", orderId: "unrelated", side: "SELL", execQty: "7", execPrice: "1.2", execTime: 31 },
+  ];
+  const recovered = reconstructTradeScopedClose({
+    tradeId: "trade-a",
+    entryExecution,
+    exitOrders: [{ adminExecution: { clientOrderId: "tp-link" } }],
+    executions,
+    baseAsset: "FAST",
+    tolerance: 0.001,
+  });
+  assert.equal(recovered.evidence.exitQuantity, "100");
+  assert.equal(recovered.metrics.attributableSellExecutionCount, 2);
+
+  const currentTrade = { id: "a", createdByUserId: "admin", symbol: "LITUSDT", exchange: "bybit", side: "BUY", settlementFeeModel: CURRENT_TRADE_FEE_MODEL, adminExecution: { status: "FILLED", transactTime: 10, executedQty: "100" } };
+  const overlappingTrade = { id: "b", createdByUserId: "admin", symbol: "LITUSDT", exchange: "bybit", side: "BUY", settlementFeeModel: CURRENT_TRADE_FEE_MODEL, adminExecution: { status: "FILLED", transactTime: 15, executedQty: "25" } };
+  assert.equal(hasOverlappingCurrentGenerationTrade(currentTrade, [currentTrade, overlappingTrade], 30, (item) => item.exchange), true);
+  assert.equal(hasOverlappingCurrentGenerationTrade(currentTrade, [currentTrade, overlappingTrade], 14, (item) => item.exchange), false);
+  assert.equal(hasOverlappingCurrentGenerationTrade(currentTrade, [currentTrade, { ...overlappingTrade, settlementFeeModel: "historical" }], 30, (item) => item.exchange), false);
 });
 
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {

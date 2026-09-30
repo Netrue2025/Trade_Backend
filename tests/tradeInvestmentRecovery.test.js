@@ -157,6 +157,25 @@ test("monitor revisits fast exits every 15 seconds and admin market-sell follows
   assert.match(exit, /await settleClosedTradeInvestments\(trade/);
 });
 
+test("admin exits and TP order references are persisted before mirrored exit work", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const adminExit = server.slice(server.indexOf("async function executeTradeExit"), server.indexOf("async function autoPlaceTakeProfit"));
+  const takeProfit = server.slice(server.indexOf("async function autoPlaceTakeProfit"), server.indexOf("function isSecureRequest"));
+  const adminReferenceIndex = adminExit.indexOf("exitOrder.adminExecution = sanitizeExecution(adminOrder)");
+  const adminAppendIndex = adminExit.indexOf("trade.exitOrders.push(exitOrder)", adminReferenceIndex);
+  const adminPersistIndex = adminExit.indexOf('await persist({ required: true, fields: ["tradeIntents"] })', adminAppendIndex);
+  const adminMirrorsIndex = adminExit.indexOf("for (const child of trade.mirroredExecutions", adminPersistIndex);
+  assert.ok(adminReferenceIndex >= 0 && adminAppendIndex > adminReferenceIndex);
+  assert.ok(adminPersistIndex > adminAppendIndex && adminMirrorsIndex > adminPersistIndex);
+
+  const tpAppendIndex = takeProfit.indexOf("trade.exitOrders.push(exitOrder)");
+  const tpPersistIndex = takeProfit.indexOf('await persist({ required: true, fields: ["tradeIntents"] })', tpAppendIndex);
+  const tpMirrorsIndex = takeProfit.indexOf("for (const mirror of trade.mirroredExecutions", tpPersistIndex);
+  assert.ok(tpAppendIndex >= 0 && tpPersistIndex > tpAppendIndex && tpMirrorsIndex > tpPersistIndex);
+  assert.match(takeProfit, /trade\.exitOrders\s*=\s*Array\.isArray\(trade\.exitOrders\)/);
+  assert.match(takeProfit, /trade\.exitOrders\.push\(exitOrder\)/);
+});
+
 test("required persistence failure still freezes financial integrity", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const persistence = server.slice(server.indexOf("function persist("), server.indexOf("function markRequestDurableMutation"));

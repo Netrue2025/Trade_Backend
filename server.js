@@ -58,7 +58,7 @@ const { verifyGoogleCredential } = require("./lib/googleAuth");
 const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib/security");
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
-const { deriveTradeLifecycle: classifyTradeLifecycle, hasVerifiedExchangeCloseEvidence } = require("./lib/tradeLifecycle");
+const { deriveTradeLifecycle: classifyTradeLifecycle, hasOverlappingCurrentGenerationTrade, hasVerifiedExchangeCloseEvidence } = require("./lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL, FIXED_ROUND_TRIP_FEE_RATE, calculateFixedRoundTripSettlement } = require("./lib/tradingFee");
 const {
   isCurrentGenerationTrade,
@@ -3023,6 +3023,7 @@ function reportTradeExitReconciliationDiagnostic({ trade, entryExecution, exitEx
     entryExecutedQuantity: diagnosticQuantity(entryExecution?.executedQty),
     knownExitOrders: exitExecutions.map((item) => ({
       orderId: String(item?.orderId || "") || null,
+      clientOrderId: String(item?.clientOrderId || "") || null,
       status: String(item?.status || "") || null,
       originalQuantity: diagnosticQuantity(item?.origQty),
       executedQuantity: diagnosticQuantity(item?.executedQty),
@@ -3133,6 +3134,7 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     );
   }
   let knownExitDiagnostic = null;
+  let closeAttributionReason = null;
   if (executions && !userId) {
     for (const exitOrder of trade.exitOrders || []) {
       const recoveredExecution = reconstructKnownExitExecution({ execution: exitOrder.adminExecution, executions });
@@ -3172,25 +3174,20 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     const scopedClose = reconstructTradeScopedClose({
       tradeId: trade.id,
       entryExecution,
+      exitOrders: trade.exitOrders || [],
       executions,
       baseAsset,
       tolerance: Math.max(Number(minQty || 0), 1e-8),
     });
+    closeAttributionReason = scopedClose.reason;
     if (!userId && Array.isArray(executions)) {
-      const latestExitTime = Math.max(0, ...executions
-        .filter((item) => String(item?.side || "").toUpperCase() === "SELL"
-          && Number(item?.execTime || 0) >= Number(entryExecution?.transactTime || 0))
-        .map((item) => Number(item?.execTime || 0)));
-      const hasOverlappingTrade = (db.tradeIntents || []).some((other) => {
-        if (other.id === trade.id || !isCurrentGenerationTrade(other)
-          || other.createdByUserId !== trade.createdByUserId
-          || String(other.symbol || "").toUpperCase() !== String(trade.symbol || "").toUpperCase()
-          || getTradeExchange(other) !== exchange
-          || other.side !== "BUY"
-          || String(other.adminExecution?.status || "").toUpperCase() !== "FILLED") return false;
-        const otherEntryTime = Number(other.adminExecution?.transactTime || 0);
-        return otherEntryTime > 0 && otherEntryTime <= latestExitTime && deriveTradeLifecycle(other) !== "CLOSED";
-      });
+      const latestExitTime = scopedClose.evidence
+        ? Math.max(...scopedClose.externalExits.map((item) => Number(item.transactTime || 0)))
+        : Math.max(0, ...executions
+          .filter((item) => String(item?.side || "").toUpperCase() === "SELL"
+            && Number(item?.execTime || 0) >= Number(entryExecution?.transactTime || 0))
+          .map((item) => Number(item?.execTime || 0)));
+      const hasOverlappingTrade = hasOverlappingCurrentGenerationTrade(trade, db.tradeIntents, latestExitTime, getTradeExchange);
       if (hasOverlappingTrade) {
         console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", {
           tradeId: trade.id,
@@ -3229,6 +3226,8 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
         tradeId: trade.id,
         symbol: trade.symbol,
         exitOrderIds: scopedClose.evidence.exitOrderIds,
+        attributableSellExecutions: scopedClose.metrics.attributableSellExecutionCount,
+        candidateSellExecutions: scopedClose.metrics.candidateSellExecutionCount,
         remainingTradeQuantity: scopedClose.evidence.remainingTradeQuantity,
         unrelatedAccountBaseBalance: diagnosticQuantity(normalizedBalance),
       });
@@ -3255,7 +3254,10 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
         historyUnavailable: !executions,
       });
     }
-    console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "authoritative_exit_not_proven" });
+    console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", {
+      tradeId: trade.id,
+      reason: closeAttributionReason || knownExitDiagnostic?.reason || "authoritative_exit_not_proven",
+    });
     return false;
   }
 
@@ -5448,8 +5450,11 @@ async function executeTradeExit(trade, admin, options = {}) {
   const normalizedExitInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, exitInput, exchangeInfo);
   exitOrder.quantity = normalizedExitInput.quantity || exitOrder.quantity;
   await validateNotionalRule({ ...adminAccount, exchange }, normalizedExitInput, exchangeInfo);
+  trade.exitOrders = Array.isArray(trade.exitOrders) ? trade.exitOrders : [];
   const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, normalizedExitInput, exchange);
   exitOrder.adminExecution = sanitizeExecution(adminOrder);
+  trade.exitOrders.push(exitOrder);
+  await persist({ required: true, fields: ["tradeIntents"] });
 
   for (const child of trade.mirroredExecutions || []) {
     const user = db.users.find((item) => item.id === child.userId);
@@ -5509,9 +5514,9 @@ async function executeTradeExit(trade, admin, options = {}) {
       childExchange
     );
     exitOrder.mirroredExecutions.push(childExecution);
+    await persist({ required: true, fields: ["tradeIntents"] });
   }
 
-  trade.exitOrders.push(exitOrder);
   if (deriveTradeLifecycle(trade) === "CLOSED") {
     await recordTradeForLearning(trade);
     await settleClosedTradeInvestments(trade, {
@@ -5571,6 +5576,8 @@ async function autoPlaceTakeProfit(trade, options = {}) {
     mirroredExecutions: [],
   };
 
+  trade.exitOrders = Array.isArray(trade.exitOrders) ? trade.exitOrders : [];
+  trade.exitOrders.push(exitOrder);
   try {
     const tpQuantity = await getMaxSellQuantityForAccount(
       { ...adminAccount, exchange },
@@ -5596,6 +5603,7 @@ async function autoPlaceTakeProfit(trade, options = {}) {
   } catch (error) {
     exitOrder.adminExecution = sanitizeExecution(null, error.message);
   }
+  await persist({ required: true, fields: ["tradeIntents"] });
 
   for (const mirror of trade.mirroredExecutions || []) {
     const user = db.users.find((item) => item.id === mirror.userId);
@@ -5632,9 +5640,9 @@ async function autoPlaceTakeProfit(trade, options = {}) {
       exchange
     );
     exitOrder.mirroredExecutions.push(childOrder);
+    await persist({ required: true, fields: ["tradeIntents"] });
   }
 
-  trade.exitOrders.push(exitOrder);
   await persist({ required: true, fields: ["tradeIntents"] });
   return exitOrder;
 }
