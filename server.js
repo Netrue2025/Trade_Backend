@@ -9630,6 +9630,21 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/user/wallet-history") {
+    const user = requireAuth(req, res, "user");
+    if (!user) {
+      return true;
+    }
+    const requestedLimit = Number(url.searchParams.get("limit") || 80);
+    const requestedOffset = Number(url.searchParams.get("offset") || 0);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.floor(requestedLimit), 1), 100) : 80;
+    const offset = Number.isFinite(requestedOffset) ? Math.max(Math.floor(requestedOffset), 0) : 0;
+    const records = financialService.getWalletHistory(user, { limit: limit + 1, offset });
+    const hasMore = records.length > limit;
+    sendJson(res, 200, { walletHistory: hasMore ? records.slice(0, limit) : records, hasMore, nextOffset: offset + Math.min(records.length, limit) });
+    return true;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/admin/recovery/lit-stranded-trade-cancellation") {
     const admin = requireAuth(req, res, "admin");
     if (!admin) return true;

@@ -287,6 +287,20 @@ test("wallet history includes deposit and withdrawal request statuses", () => {
   assert.ok(history.some((item) => item.id === pendingWithdrawal.id && item.kind === "WITHDRAWAL" && item.status === "PENDING"));
 });
 
+test("wallet history supports stable offset paging across ledger transactions", () => {
+  const { db, service, user } = createHarness();
+  db.transactions = [
+    { id: "trade-3", userId: user.id, type: "TRADING_PROFIT", currency: "USDT", amount: "3", createdAt: "2026-08-30T12:00:00.000Z" },
+    { id: "trade-2", userId: user.id, type: "TRADING_LOSS", currency: "USDT", amount: "-2", createdAt: "2026-08-30T11:00:00.000Z" },
+    { id: "trade-1", userId: user.id, type: "TRADE_SETTLEMENT", currency: "USDT", amount: "1", createdAt: "2026-08-30T10:00:00.000Z" },
+  ];
+
+  const firstPage = service.getWalletHistory(user, { limit: 2, offset: 0 });
+  const secondPage = service.getWalletHistory(user, { limit: 2, offset: 2 });
+  assert.deepEqual(firstPage.map((item) => item.id), ["trade-3", "trade-2"]);
+  assert.deepEqual(secondPage.map((item) => item.id), ["trade-1"]);
+});
+
 test("mixed-currency ARX recovery history stays display-only without weakening currency validation", () => {
   const { db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "1250");

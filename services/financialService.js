@@ -2140,7 +2140,7 @@ class FinancialService {
     };
   }
 
-  getWalletHistory(user, { limit = 80 } = {}) {
+  getWalletHistory(user, { limit = 80, offset = 0 } = {}) {
     this.ensureState();
     const canSee = (record) => user.role === "admin" || record.userId === user.id;
     const deposits = this.db.deposits
@@ -2235,7 +2235,7 @@ class FinancialService {
 
     return [...deposits, ...withdrawals, ...vtuPurchases, ...digitalPurchases, ...ledgerTransactions]
       .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0))
-      .slice(0, limit)
+      .slice(offset, offset + limit)
       .map((item) => this.enrichUserRecord(item));
   }
 
