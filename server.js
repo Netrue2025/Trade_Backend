@@ -49,7 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
-const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution } = require("./lib/knownExitExecutionRecovery");
+const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
 const { buildTradeReconciliationDryRun } = require("./lib/tradeReconciliationDryRun");
 const { isFinancialRecoveryMode, isTradingIsolationMode, assertRecoveryOperationAllowed, assertTradingOperationAllowed, assertVtuOperationAllowed, assertShopWalletPaymentAllowed } = require("./lib/financialRecoveryMode");
@@ -3057,7 +3057,7 @@ async function supplementKnownOrderExecutionHistory(historyReader, account, symb
 }
 
 async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, openOrders, exchangeInfoOverride = null, userId = null) {
-  if (isTradingIsolationMode()) {
+  if (isTradingIsolationMode() || !isCurrentGenerationTrade(trade)) {
     return false;
   }
   const exchange = getTradeExchange(trade);
@@ -3105,12 +3105,6 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
   if (!exchangeInfo) {
     const balance = (accountInfo.balances || []).find((item) => item.asset === baseAsset);
     normalizedBalance = Number(balance?.free || 0) + Number(balance?.locked || 0);
-  }
-
-  // Strict rule: if the connected exchange no longer shows a live order for the symbol and no
-  // remaining base-asset balance is left in the account, the app must not continue showing the trade as open.
-  if ((normalizedBalance || 0) > 0 && (!minQty || normalizedBalance >= minQty)) {
-    return false;
   }
 
   const entryExecution = userId
@@ -3172,6 +3166,72 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
         accountingDelta: filledTakeProfitEvidence.accountingDelta,
       });
       trade.authoritativeCloseEvidence = filledTakeProfitEvidence;
+      return true;
+    }
+
+    const scopedClose = reconstructTradeScopedClose({
+      tradeId: trade.id,
+      entryExecution,
+      executions,
+      baseAsset,
+      tolerance: Math.max(Number(minQty || 0), 1e-8),
+    });
+    if (!userId && Array.isArray(executions)) {
+      const latestExitTime = Math.max(0, ...executions
+        .filter((item) => String(item?.side || "").toUpperCase() === "SELL"
+          && Number(item?.execTime || 0) >= Number(entryExecution?.transactTime || 0))
+        .map((item) => Number(item?.execTime || 0)));
+      const hasOverlappingTrade = (db.tradeIntents || []).some((other) => {
+        if (other.id === trade.id || !isCurrentGenerationTrade(other)
+          || other.createdByUserId !== trade.createdByUserId
+          || String(other.symbol || "").toUpperCase() !== String(trade.symbol || "").toUpperCase()
+          || getTradeExchange(other) !== exchange
+          || other.side !== "BUY"
+          || String(other.adminExecution?.status || "").toUpperCase() !== "FILLED") return false;
+        const otherEntryTime = Number(other.adminExecution?.transactTime || 0);
+        return otherEntryTime > 0 && otherEntryTime <= latestExitTime && deriveTradeLifecycle(other) !== "CLOSED";
+      });
+      if (hasOverlappingTrade) {
+        console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", {
+          tradeId: trade.id,
+          reason: "overlapping_current_generation_trade_prevents_exit_attribution",
+        });
+        return false;
+      }
+    }
+
+    if (scopedClose.evidence && !userId) {
+      const knownOrderIds = new Set((trade.exitOrders || []).map((item) => String(item.adminExecution?.orderId || "")).filter(Boolean));
+      trade.exitOrders = Array.isArray(trade.exitOrders) ? trade.exitOrders : [];
+      for (const execution of scopedClose.externalExits) {
+        if (knownOrderIds.has(String(execution.orderId))) continue;
+        trade.exitOrders.push({
+          id: randomId(10),
+          kind: "EXTERNAL_CLOSE",
+          createdAt: nowIso(),
+          side: "SELL",
+          type: "MARKET",
+          price: execution.price,
+          quantity: execution.executedQty,
+          adminExecution: userId ? null : execution,
+          mirroredExecutions: userId ? [{
+            userId,
+            userName: ownerUser.name,
+            purpose: "EXTERNAL_CLOSE",
+            status: "FILLED",
+            error: null,
+            order: execution,
+          }] : [],
+        });
+      }
+      trade.authoritativeCloseEvidence = scopedClose.evidence;
+      console.warn("TRADE_CLOSE_CONFIRMED_BY_TRADE_SCOPED_EXECUTIONS", {
+        tradeId: trade.id,
+        symbol: trade.symbol,
+        exitOrderIds: scopedClose.evidence.exitOrderIds,
+        remainingTradeQuantity: scopedClose.evidence.remainingTradeQuantity,
+        unrelatedAccountBaseBalance: diagnosticQuantity(normalizedBalance),
+      });
       return true;
     }
   }

@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution } = require("../lib/knownExitExecutionRecovery");
+const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("../lib/knownExitExecutionRecovery");
 const { deriveTradeLifecycle, hasVerifiedExchangeCloseEvidence } = require("../lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL, calculateFixedRoundTripSettlement } = require("../lib/tradingFee");
 
@@ -233,6 +233,59 @@ test("a fully-filled TP cannot close the trade while meaningful base quantity re
   assert.equal(deriveTradeLifecycle(trade, () => 40), "OPEN");
 });
 
+test("current trade-scoped evidence aggregates a partial TP and manual/replacement exits despite unrelated account holdings", () => {
+  const entryExecution = { orderId: "entry", status: "FILLED", executedQty: "100", transactTime: 10 };
+  const executions = [
+    { execId: "e1", orderId: "entry", side: "BUY", execQty: "100", execPrice: "10", execTime: 11, feeCurrency: "USDT", execFee: "1" },
+    { execId: "tp1", orderId: "tp", side: "SELL", execQty: "60", execPrice: "11", execTime: 20, feeCurrency: "USDT", execFee: "0.66" },
+    { execId: "manual1", orderId: "manual", side: "SELL", execQty: "40", execPrice: "9", execTime: 30, feeCurrency: "USDT", execFee: "0.36" },
+  ];
+  const recovered = reconstructTradeScopedClose({
+    tradeId: "current-trade",
+    entryExecution,
+    executions,
+    baseAsset: "FAST",
+    tolerance: 0.001,
+  });
+  assert.equal(recovered.reason, "VERIFIED_TRADE_SCOPED_EXIT");
+  assert.deepEqual(recovered.evidence.exitOrderIds.sort(), ["manual", "tp"]);
+  assert.equal(recovered.evidence.remainingTradeQuantity, "0");
+  assert.equal(recovered.externalExits.find((item) => item.orderId === "manual").price, "9");
+
+  const trade = {
+    id: "current-trade",
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    side: "BUY",
+    adminExecution: { ...entryExecution, price: "10" },
+    exitOrders: [
+      { kind: "TAKE_PROFIT", adminExecution: { orderId: "tp", status: "PARTIALLY_FILLED", executedQty: "60", origQty: "100", authoritativeHistory: true } },
+      { kind: "EXTERNAL_CLOSE", adminExecution: { orderId: "manual", status: "FILLED", executedQty: "40", origQty: "40", authoritativeHistory: true } },
+    ],
+    authoritativeCloseEvidence: recovered.evidence,
+  };
+  assert.equal(hasVerifiedExchangeCloseEvidence(trade), true);
+  assert.equal(deriveTradeLifecycle(trade), "CLOSED");
+  assert.equal((60 * 11 + 40 * 9) / 100, 10.2);
+  const settlement = calculateFixedRoundTripSettlement("10000", "2");
+  assert.equal(settlement.tradingFee, "20");
+  assert.equal(settlement.netPnl, "180");
+});
+
+test("trade-scoped closure rejects meaningful exposure, oversells, missing entry, and deduplicates repeated execution rows", () => {
+  const entryExecution = { orderId: "entry", executedQty: "100" };
+  const entry = { execId: "entry-fill", orderId: "entry", side: "BUY", execQty: "100", execPrice: "10", execTime: 10 };
+  const sell = { execId: "exit-fill", orderId: "exit", side: "SELL", execQty: "99", execPrice: "11", execTime: 20 };
+  const partial = reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, sell], baseAsset: "FAST", tolerance: 0.01 });
+  assert.equal(partial.evidence, null);
+  assert.equal(partial.reason, "MEANINGFUL_TRADE_QUANTITY_REMAINS");
+  assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "101" }], baseAsset: "FAST", tolerance: 0.01 }).reason, "EXIT_QUANTITY_EXCEEDS_ENTRY");
+  assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "100.005" }], baseAsset: "FAST", tolerance: 0.01 }).reason, "EXIT_QUANTITY_EXCEEDS_ENTRY");
+  assert.equal(reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [sell], baseAsset: "FAST" }).reason, "ENTRY_FILLS_NOT_FOUND");
+
+  const complete = reconstructTradeScopedClose({ tradeId: "current", entryExecution, executions: [entry, { ...sell, execQty: "100" }, { ...sell, execQty: "100" }], baseAsset: "FAST", tolerance: 0.01 });
+  assert.equal(complete.evidence.exitQuantity, "100");
+});
+
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const exitReconciler = server.slice(server.indexOf("async function reconcileExitExecution"), server.indexOf("function shouldReconcileTrade"));
@@ -254,6 +307,10 @@ test("validated Bybit close evidence runs before external-close synthesis and is
   assert.match(externalRecovery, /supplementKnownOrderExecutionHistory/);
   assert.match(server, /historyReader\(account, symbol, \{ orderId, limit: 100 \}\)/);
   assert.match(externalRecovery, /trade\.authoritativeCloseEvidence = closeEvidence/);
+  assert.match(externalRecovery, /reconstructTradeScopedClose/);
+  assert.match(externalRecovery, /overlapping_current_generation_trade_prevents_exit_attribution/);
+  assert.match(externalRecovery, /!isCurrentGenerationTrade\(trade\)/);
+  assert.doesNotMatch(externalRecovery, /normalizedBalance\s*>\s*0\s*&&\s*\(!minQty/);
   assert.ok(externalRecovery.indexOf("trade.authoritativeCloseEvidence = closeEvidence") < externalRecovery.indexOf("reconstructExternalClose"));
   assert.match(lifecycle, /hasVerifiedExchangeCloseEvidence\(trade\)/);
   assert.match(pnl, /closeEvidenceVerified/);
