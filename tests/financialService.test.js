@@ -1048,10 +1048,10 @@ test("admin can set a user balance", () => {
   });
 
   assert.equal(service.ensureWallet(user.id, "USDT").availableBalance, "42");
-  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "0");
+  assert.equal(service.ensureWallet(user.id, "NGN").availableBalance, "16000");
   assert.equal(result.transaction.type, "BALANCE_ADJUSTMENT");
   assert.equal(result.transaction.amount, "27");
-  assert.equal(result.transaction.metadata.clearedCurrency, "NGN");
+  assert.equal(result.transaction.metadata.overwriteSelectedCurrencyBalance, true);
   assert.equal(service.listNotifications(user)[0].type, "BALANCE");
 });
 

@@ -3793,15 +3793,10 @@ class FinancialService {
     const amount = normalizeNonNegativeAmount(input.amount, "Balance");
     const note = String(input.note || "Balance updated").trim();
     const wallet = this.ensureWallet(targetUser.id, currency);
-    const alternateCurrency = currency === "USDT" ? "NGN" : "USDT";
-    const alternateWallet = this.ensureWallet(targetUser.id, alternateCurrency);
     const balanceBefore = wallet.availableBalance;
-    const alternateBalanceBefore = alternateWallet.availableBalance;
     const clearedInvestments = this.clearUserActiveTradeInvestmentsForBalanceOverwrite(targetUser.id, admin.id);
     wallet.availableBalance = amount;
-    alternateWallet.availableBalance = "0";
     wallet.updatedAt = this.clock();
-    alternateWallet.updatedAt = this.clock();
     this.clearUserPnlLots(targetUser.id);
     targetUser.legacyBalanceMigratedAt = targetUser.legacyBalanceMigratedAt || this.clock();
     targetUser.balanceOverrideAt = this.clock();
@@ -3821,9 +3816,7 @@ class FinancialService {
       createdBy: admin.id,
       createdAt: this.clock(),
       metadata: {
-        overwriteUnifiedBalance: true,
-        clearedCurrency: alternateCurrency,
-        clearedBalanceBefore: alternateBalanceBefore,
+        overwriteSelectedCurrencyBalance: true,
         clearedActiveInvestments: clearedInvestments.clearedCount,
         releasedInvestmentLocks: clearedInvestments.releasedSources,
       },
