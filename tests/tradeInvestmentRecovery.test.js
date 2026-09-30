@@ -232,7 +232,7 @@ test("trade joins, creation, exits, and reconciliation use scoped required persi
   assert.doesNotMatch(userJoin, /await persist\(\{ required: true \}\)/);
 });
 
-test("settlement requires a complete filled exit and never uses a ticker snapshot", () => {
+test("closed settlements require filled exits while individual user stops use a live mark snapshot", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const lifecycle = fs.readFileSync(path.join(__dirname, "..", "lib", "tradeLifecycle.js"), "utf8");
   const settlement = server.slice(
@@ -248,6 +248,10 @@ test("settlement requires a complete filled exit and never uses a ticker snapsho
   assert.match(settlement, /getAuthoritativeClosedTradePnlPercent\(trade\)/);
   assert.match(settlement, /TRADE_SETTLEMENT_EVIDENCE_INCOMPLETE/);
   assert.doesNotMatch(settlement, /getTradePnlPercentSnapshot/);
-  assert.doesNotMatch(settlement, /getTickerPrice/);
+  assert.match(settlement, /options\.reason === "USER_STOPPED"/);
+  assert.match(settlement, /getTickerPrice\(trade\.symbol, adminAccount\?\.testnet, exchange\)/);
+  assert.match(settlement, /TRADE_STOP_PRICE_UNAVAILABLE/);
+  assert.match(settlement, /USER_STOP_MARKET_SNAPSHOT/);
+  assert.match(settlement, /trade-settlement:\$\{currentInvestment\.id\}/);
   assert.match(settlement, /void persist\(\{ bestEffort: true, fields: \["notifications", "auditLogs"\] \}\)/);
 });

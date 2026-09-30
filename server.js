@@ -60,6 +60,7 @@ const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/e
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { deriveTradeLifecycle: classifyTradeLifecycle, hasOverlappingCurrentGenerationTrade, hasVerifiedExchangeCloseEvidence } = require("./lib/tradeLifecycle");
 const { CURRENT_TRADE_FEE_MODEL } = require("./lib/tradingFee");
+const { calculateTradePnlPercent } = require("./lib/tradePnl");
 const {
   isCurrentGenerationTrade,
   requireCurrentGenerationTrade,
@@ -4317,22 +4318,57 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
   if (trade && isTradeQuarantined(db, trade)) {
     return investment;
   }
-  const pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
-  if (pnlPercent === null) {
-    const error = new Error("Trade settlement requires a complete authoritative filled exit.");
-    error.code = "TRADE_SETTLEMENT_EVIDENCE_INCOMPLETE";
-    error.statusCode = 409;
-    throw error;
-  }
-  const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
-  const grossPnlPercent = toMoneyDecimal(pnlDeltaPercent);
-  const grossPnlUsdt = multiplyRatio(investment.amountUsdt || "0", grossPnlPercent, "100");
   return withUserFinancialLock(user.id, async () => {
     const currentInvestment = ensureTradeInvestmentsState().find((item) => item.id === investment.id);
     if (!currentInvestment || currentInvestment.status !== "ACTIVE") return currentInvestment || investment;
     const settlementReference = `trade-settlement:${currentInvestment.id}`;
     const existingTransaction = db.transactions.find((item) => item.reference === settlementReference);
     if (existingTransaction) return currentInvestment;
+
+    const userStop = options.reason === "USER_STOPPED";
+    const lifecycle = deriveTradeLifecycle(trade);
+    if (userStop && !["OPEN", "CLOSED"].includes(lifecycle)) {
+      const error = new Error("This trade is changing state. Please retry after it finishes opening or closing.");
+      error.code = "TRADE_STOP_STATE_UNAVAILABLE";
+      error.statusCode = 409;
+      throw error;
+    }
+    let pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
+    let stopMarkPrice = null;
+    if (userStop && lifecycle === "OPEN") {
+      const admin = db.users.find((item) => item.id === trade.createdByUserId) || db.users.find((item) => item.role === "admin");
+      const exchange = getTradeExchange(trade);
+      const adminAccount = getExchangeAccount(admin, exchange);
+      const ticker = await getTickerPrice(trade.symbol, adminAccount?.testnet, exchange).catch(() => null);
+      stopMarkPrice = Number(ticker?.price || 0);
+      if (!Number.isFinite(stopMarkPrice) || stopMarkPrice <= 0) {
+        const error = new Error("A live market price is unavailable. Your trade was not stopped; please retry shortly.");
+        error.code = "TRADE_STOP_PRICE_UNAVAILABLE";
+        error.statusCode = 503;
+        throw error;
+      }
+      if (deriveTradeLifecycle(trade) === "OPEN") {
+        pnlPercent = calculateTradePnlPercent(getTradeEntryPriceSnapshot(trade), stopMarkPrice, trade.side);
+      } else {
+        stopMarkPrice = null;
+        pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
+      }
+    }
+    if (userStop && !stopMarkPrice && deriveTradeLifecycle(trade) !== "CLOSED") {
+      const error = new Error("This trade is changing state. Please retry after it finishes closing.");
+      error.code = "TRADE_STOP_STATE_UNAVAILABLE";
+      error.statusCode = 409;
+      throw error;
+    }
+    if (pnlPercent === null) {
+      const error = new Error("Trade settlement requires a complete authoritative filled exit.");
+      error.code = "TRADE_SETTLEMENT_EVIDENCE_INCOMPLETE";
+      error.statusCode = 409;
+      throw error;
+    }
+    const pnlDeltaPercent = pnlPercent - Number(currentInvestment.baselinePnlPercent || 0);
+    const grossPnlPercent = toMoneyDecimal(pnlDeltaPercent);
+    const grossPnlUsdt = multiplyRatio(currentInvestment.amountUsdt || "0", grossPnlPercent, "100");
 
     const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
     const settlement = releaseTradeInvestmentFunds(user, currentInvestment, grossPnlUsdt);
@@ -4356,7 +4392,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       reference: settlementReference, status: "APPROVED",
       description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
       createdBy: options.createdBy || "system", createdAt: nowIso(),
-      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, grossPnlPercent, pnlPercent: grossPnlPercent, grossPnlUsdt: settlement.grossPnlUsdt || grossPnlUsdt, tradingFeeUsdt: "0", netPnlUsdt: settledPnlUsdt, lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
+      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, grossPnlPercent, pnlPercent: grossPnlPercent, grossPnlUsdt: settlement.grossPnlUsdt || grossPnlUsdt, tradingFeeUsdt: "0", netPnlUsdt: settledPnlUsdt, lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", settlementBasis: stopMarkPrice ? "USER_STOP_MARKET_SNAPSHOT" : "AUTHORITATIVE_FILLED_EXIT", ...(stopMarkPrice ? { marketPriceAtStop: String(stopMarkPrice) } : {}), releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
     });
     await persist({
       required: true,
@@ -9535,6 +9571,10 @@ async function handleApi(req, res, url) {
       }
       const marketCache = new Map();
       const settledInvestment = await settleTradeInvestment(user, investment, trade, marketCache, { reason: "USER_STOPPED", description: `Stopped ${trade.symbol} investment.`, createdBy: user.id });
+      if (settledInvestment?.status !== "STOPPED" || settledInvestment.stopReason !== "USER_STOPPED") {
+        sendJson(res, 409, { error: "This investment has already been settled.", code: "INVESTMENT_ALREADY_SETTLED" });
+        return true;
+      }
       financialService.createNotification({
         userId: user.id,
         type: "TRADE_CANCELED",
@@ -9547,7 +9587,7 @@ async function handleApi(req, res, url) {
       });
       sendJson(res, 200, { investment: serializeTradeInvestment(settledInvestment), trade: serializeTradeForUser(trade, user.id) });
     } catch (error) {
-      sendJson(res, 400, { error: error.message });
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
     }
     return true;
   }
