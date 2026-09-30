@@ -3075,14 +3075,15 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
   }
 
   const remainingQty = getRemainingTradeQuantity(trade, userId);
-  if (!remainingQty) {
+  const hasRegisteredFilledExit = (trade.exitOrders || []).some((exitOrder) => {
+    const execution = getExitExecutionForTrade(trade, exitOrder, userId);
+    return !!execution?.orderId && String(execution.status || "").toUpperCase() === "FILLED";
+  });
+  if (!remainingQty && !hasRegisteredFilledExit) {
     return false;
   }
 
   const hasOpenOrderForSymbol = getActiveOpenOrdersForSymbol(openOrders, trade.symbol).length > 0;
-  if (hasOpenOrderForSymbol) {
-    return false;
-  }
 
   let baseAsset = inferBaseAssetFromSymbol(trade.symbol);
   let normalizedBalance = 0;
@@ -3172,7 +3173,8 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
         tradeId: trade.id,
         symbol: trade.symbol,
         exitOrderIds: filledTakeProfitEvidence.exitOrderIds,
-        accountingDelta: filledTakeProfitEvidence.accountingDelta,
+        remainingTradeQuantity: filledTakeProfitEvidence.remainingTradeQuantity,
+        accountBaseBalance: diagnosticQuantity(normalizedBalance),
       });
       trade.authoritativeCloseEvidence = filledTakeProfitEvidence;
       return true;
@@ -3264,6 +3266,14 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", {
       tradeId: trade.id,
       reason: closeAttributionReason || knownExitDiagnostic?.reason || "authoritative_exit_not_proven",
+    });
+    return false;
+  }
+
+  if (hasOpenOrderForSymbol) {
+    console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", {
+      tradeId: trade.id,
+      reason: "open_same_symbol_order_prevents_external_exit_attribution",
     });
     return false;
   }
@@ -3371,9 +3381,14 @@ function shouldReconcileTrade(trade) {
     return true;
   }
 
+  const lifecycle = deriveTradeLifecycle(trade);
+  const hasUnsettledInvestment = (db.tradeInvestments || []).some((investment) => (
+    investment.tradeId === trade.id && investment.status === "ACTIVE"
+  ));
   return trade.side === "BUY" && trade.adminExecution?.status === "FILLED"
-    && (deriveTradeLifecycle(trade) === "OPEN"
-      || (deriveTradeLifecycle(trade) === "UNVERIFIED" && !!trade.takeProfitTargetPrice && !hasAnyTakeProfitHistory(trade)));
+    && (lifecycle === "OPEN"
+      || (lifecycle === "UNVERIFIED" && !!trade.takeProfitTargetPrice && !hasAnyTakeProfitHistory(trade))
+      || (lifecycle === "CLOSED" && hasUnsettledInvestment && !hasVerifiedExchangeCloseEvidence(trade)));
 }
 
 async function reconcileTradeStatuses() {
@@ -3476,9 +3491,14 @@ async function reconcileTradeStatuses() {
       }
 
       const adminSnapshot = await getOwnerSnapshot(admin, exchange);
+      const tradeLifecycle = deriveTradeLifecycle(trade);
+      const needsCloseEvidence = tradeLifecycle === "OPEN"
+        || (tradeLifecycle === "CLOSED"
+          && (db.tradeInvestments || []).some((investment) => investment.tradeId === trade.id && investment.status === "ACTIVE")
+          && !hasVerifiedExchangeCloseEvidence(trade));
       if (
         trade.adminExecution?.status === "FILLED" &&
-        deriveTradeLifecycle(trade) === "OPEN" &&
+        needsCloseEvidence &&
         adminSnapshot
       ) {
         const exchangeInfo = await getExchangeInfo(trade.symbol, adminAccount?.testnet, exchange).catch(() => null);

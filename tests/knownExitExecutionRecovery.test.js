@@ -184,6 +184,54 @@ test("a fully-filled registered TP provides auditable close evidence when only a
   assert.equal(losingSettlement.settlementAmount, "98800");
 });
 
+test("a registered filled TP closes only its trade when another same-symbol trade remains in the account balance", () => {
+  const tradeOneEntry = { orderId: "avax-entry-one", transactTime: 10, executedQty: "100" };
+  const tradeOneExitOrders = [{
+    kind: "TAKE_PROFIT",
+    adminExecution: { orderId: "avax-tp-one", status: "FILLED", origQty: "100", executedQty: "100", authoritativeHistory: true },
+  }];
+  const diagnosis = diagnoseKnownExitClosure({
+    tradeId: "avax-trade-one",
+    entryExecution: tradeOneEntry,
+    exitExecutions: tradeOneExitOrders.map((item) => item.adminExecution),
+    executions: [
+      { orderId: "avax-entry-one", side: "BUY", execQty: "100", execPrice: "30", execTime: 10, feeCurrency: "USDT", execFee: "0.03" },
+      { orderId: "avax-tp-one", side: "SELL", execQty: "100", execPrice: "33", execTime: 20, feeCurrency: "USDT", execFee: "0.033" },
+      { orderId: "avax-entry-two", side: "BUY", execQty: "40", execPrice: "31", execTime: 15, feeCurrency: "USDT", execFee: "0.012" },
+    ],
+    baseAsset: "AVAX",
+    currentBaseBalance: "39.988",
+    tolerance: 0.001,
+  });
+  assert.equal(diagnosis.reason, "EXIT_QUANTITY_BALANCE_MISMATCH");
+  const evidence = buildFilledTakeProfitCloseEvidence({
+    tradeId: "avax-trade-one",
+    entryExecution: tradeOneEntry,
+    exitOrders: tradeOneExitOrders,
+    diagnosis,
+  });
+  assert.equal(evidence.source, "BYBIT_TRADE_SCOPED_FILLED_TAKE_PROFIT_EXECUTION_HISTORY");
+
+  const closedTrade = {
+    id: "avax-trade-one",
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    side: "BUY",
+    adminExecution: { ...tradeOneEntry, status: "FILLED" },
+    exitOrders: tradeOneExitOrders,
+    authoritativeCloseEvidence: evidence,
+  };
+  assert.equal(deriveTradeLifecycle(closedTrade), "CLOSED");
+
+  const otherTrade = {
+    id: "avax-trade-two",
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    side: "BUY",
+    adminExecution: { orderId: "avax-entry-two", status: "FILLED", executedQty: "40" },
+    exitOrders: [],
+  };
+  assert.equal(deriveTradeLifecycle(otherTrade, () => 40), "OPEN");
+});
+
 test("filled TP close evidence refuses manual exits, partial fills, and unrelated trades", () => {
   const entryExecution = { orderId: "entry-order", executedQty: "10" };
   const diagnosis = {
@@ -390,4 +438,14 @@ test("validated Bybit close evidence runs before external-close synthesis and is
   assert.ok(externalRecovery.indexOf("trade.authoritativeCloseEvidence = closeEvidence") < externalRecovery.indexOf("reconstructExternalClose"));
   assert.match(lifecycle, /hasVerifiedExchangeCloseEvidence\(trade\)/);
   assert.match(pnl, /closeEvidenceVerified/);
+});
+
+test("filled exit evidence continues reconciling while same-symbol trades remain open", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const reconciliation = server.slice(server.indexOf("async function reconcileTradeStatuses"), server.indexOf("function startTradeReconciliation"));
+  const ownerClose = server.slice(server.indexOf("async function reconcileExternalClosuresForOwner"), server.indexOf("function sameExecution"));
+  assert.match(server.slice(server.indexOf("function shouldReconcileTrade"), server.indexOf("async function reconcileTradeStatuses")), /lifecycle === "CLOSED" && hasUnsettledInvestment && !hasVerifiedExchangeCloseEvidence\(trade\)/);
+  assert.match(reconciliation, /const needsCloseEvidence = tradeLifecycle === "OPEN"[\s\S]*?tradeLifecycle === "CLOSED"[\s\S]*?hasVerifiedExchangeCloseEvidence\(trade\)/);
+  assert.ok(ownerClose.indexOf("const filledTakeProfitEvidence = buildFilledTakeProfitCloseEvidence") < ownerClose.indexOf("if (hasOpenOrderForSymbol)"));
+  assert.match(ownerClose, /if \(!remainingQty && !hasRegisteredFilledExit\)/);
 });
