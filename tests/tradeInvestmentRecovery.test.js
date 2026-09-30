@@ -136,6 +136,27 @@ test("canonical settlement remains atomic scoped idempotent and notification-aft
   assert.ok(settlement.indexOf("await persist({") < settlement.indexOf("financialService.createNotification"));
 });
 
+test("one closed current-generation trade settles every active joined investment independently", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const settlement = server.slice(server.indexOf("async function settleClosedTradeInvestments"), server.indexOf("const loggedInvestmentRecoveryReviews"));
+  assert.match(settlement, /investment\.status === "ACTIVE" && investment\.tradeId === trade\.id/);
+  assert.match(settlement, /for \(const investment of activeInvestments\)/);
+  assert.match(settlement, /await settleTradeInvestment\(user, investment, trade/);
+  assert.match(settlement, /if \(!isCurrentGenerationTrade\(trade\).*deriveTradeLifecycle\(trade\) !== "CLOSED"\)/s);
+  const tradeCreation = server.slice(server.indexOf("async function createTradeIntent"), server.indexOf("async function executeSignalAutoTrade"));
+  assert.match(tradeCreation, /settlementFeeModel: CURRENT_TRADE_FEE_MODEL/);
+});
+
+test("monitor revisits fast exits every 15 seconds and admin market-sell follows close settlement", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.match(server, /const TRADE_RECONCILE_BACKGROUND_INTERVAL_MS = 15_000/);
+  const adminSell = server.slice(server.indexOf('const sellMatch = url.pathname.match'), server.indexOf("return false;", server.indexOf('const sellMatch = url.pathname.match')));
+  assert.match(adminSell, /await executeTradeExit\(trade, admin/);
+  const exit = server.slice(server.indexOf("async function executeTradeExit"), server.indexOf("async function autoPlaceTakeProfit"));
+  assert.match(exit, /if \(deriveTradeLifecycle\(trade\) === "CLOSED"\)/);
+  assert.match(exit, /await settleClosedTradeInvestments\(trade/);
+});
+
 test("required persistence failure still freezes financial integrity", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const persistence = server.slice(server.indexOf("function persist("), server.indexOf("function markRequestDurableMutation"));

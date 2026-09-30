@@ -195,6 +195,44 @@ test("filled TP close evidence refuses manual exits, partial fills, and unrelate
   assert.equal(buildFilledTakeProfitCloseEvidence({ tradeId: "trade-1", entryExecution, exitOrders: [{ ...baseExit, kind: "TAKE_PROFIT", adminExecution: { ...baseExit.adminExecution, status: "PARTIALLY_FILLED" } }], diagnosis }), null);
 });
 
+test("a fully-filled TP cannot close the trade while meaningful base quantity remains exposed", () => {
+  const entryExecution = { orderId: "entry-order", status: "FILLED", executedQty: "100" };
+  const exitOrders = [{
+    kind: "TAKE_PROFIT",
+    adminExecution: { orderId: "tp-order", status: "FILLED", origQty: "60", executedQty: "60", authoritativeHistory: true },
+  }];
+  const diagnosis = {
+    reason: "EXIT_QUANTITY_BALANCE_MISMATCH",
+    metrics: { tolerance: 0.01, entryFillCount: 1, entryQuantity: 100, entryBaseFee: 0, exitQuantity: 60, exitBaseFee: 0, remainingBaseBalance: 40, accountingDelta: 40 },
+  };
+  const evidence = buildFilledTakeProfitCloseEvidence({ tradeId: "trade-1", entryExecution, exitOrders, diagnosis });
+  assert.equal(evidence, null);
+
+  const trade = {
+    id: "trade-1",
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    side: "BUY",
+    adminExecution: entryExecution,
+    exitOrders,
+    authoritativeCloseEvidence: {
+      source: "BYBIT_KNOWN_FILLED_TAKE_PROFIT_EXECUTION_HISTORY",
+      tradeId: "trade-1",
+      entryOrderId: "entry-order",
+      exitOrderIds: ["tp-order"],
+      entryQuantity: "100",
+      entryBaseFee: "0",
+      exitQuantity: "60",
+      exitBaseFee: "0",
+      remainingBaseBalance: "40",
+      accountingDelta: "40",
+      tolerance: "0.01",
+      balanceReconciled: false,
+    },
+  };
+  assert.equal(hasVerifiedExchangeCloseEvidence(trade), false);
+  assert.equal(deriveTradeLifecycle(trade, () => 40), "OPEN");
+});
+
 test("trade reconciliation consults exact Bybit execution history for unresolved exits", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const exitReconciler = server.slice(server.indexOf("async function reconcileExitExecution"), server.indexOf("function shouldReconcileTrade"));
