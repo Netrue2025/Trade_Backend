@@ -19,6 +19,16 @@ test("filled entry with positive remaining quantity remains open and joinable", 
   assert.equal(deriveTradeLifecycle(trade, remaining), "OPEN");
 });
 
+test("current-generation trade in persisted stop flow is not joinable", () => {
+  const trade = {
+    settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
+    closingAt: "2026-09-30T12:00:00.000Z",
+    side: "BUY",
+    adminExecution: { status: "FILLED", executedQty: "2" },
+  };
+  assert.equal(deriveTradeLifecycle(trade, remaining), "CLOSING");
+});
+
 test("fee-adjusted close evidence closes only the matching current trade and entry order", () => {
   const trade = {
     id: "trade-1",

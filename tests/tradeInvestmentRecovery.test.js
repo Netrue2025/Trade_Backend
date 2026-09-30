@@ -176,6 +176,33 @@ test("admin exits and TP order references are persisted before mirrored exit wor
   assert.match(takeProfit, /trade\.exitOrders\.push\(exitOrder\)/);
 });
 
+test("new settlement path has no fixed product fee and stop is persisted, bounded, and duplicate guarded", () => {
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const settlement = server.slice(server.indexOf("async function settleTradeInvestment"), server.indexOf("async function settleInactiveTradeInvestmentsForUsers"));
+  const release = server.slice(server.indexOf("function releaseTradeInvestmentFunds"), server.indexOf("function getTradeEntryPriceSnapshot"));
+  const creation = server.slice(server.indexOf("async function createTradeIntent"), server.indexOf("async function executeSignalAutoTrade"));
+  const stop = server.slice(server.indexOf("async function executeTradeExitLocked"), server.indexOf("async function autoPlaceTakeProfit"));
+  const takeProfit = server.slice(server.indexOf("async function autoPlaceTakeProfit"), server.indexOf("function isSecureRequest"));
+
+  assert.doesNotMatch(settlement, /applyFixedRoundTripFee|calculateFixedRoundTripSettlement/);
+  assert.doesNotMatch(release, /calculateFixedRoundTripSettlement|tradingFee/);
+  assert.match(settlement, /const settledPnlUsdt = grossPnlUsdt/);
+  assert.match(settlement, /tradingFeeUsdt: "0"/);
+
+  const entryIntentPersist = creation.indexOf('await persist({ required: true, fields: ["tradeIntents"] })');
+  const entrySubmit = creation.indexOf("placeSpotOrder({ ...adminAccount, exchange }, balanceSafeOrderInput, exchange)");
+  const entryFilledPersist = creation.indexOf("trade.adminExecution = sanitizeExecution(adminOrder)");
+  assert.ok(entryIntentPersist >= 0 && entryIntentPersist < entrySubmit && entryFilledPersist > entrySubmit);
+  assert.ok(takeProfit.indexOf('await persist({ required: true, fields: ["tradeIntents"] })') < takeProfit.indexOf("placeSpotOrder({ ...adminAccount, exchange }, normalizedExitInput, exchange)"));
+
+  assert.match(stop, /trade\.closingAt = nowIso\(\)/);
+  assert.match(stop, /getActiveTakeProfitOrders\(trade\)\.length/);
+  assert.match(stop, /getRemainingTradeQuantity\(trade\)/);
+  assert.match(stop, /requestedQuantity/);
+  assert.match(server.slice(server.indexOf("async function executeTradeExit("), server.indexOf("async function executeTradeExitLocked")), /tradeExitOperations\.has\(trade\.id\)/);
+  assert.match(server.slice(server.indexOf("const joinTradeMatch"), server.indexOf("const stopTradeMatch")), /lifecycleStatus !== "OPEN"/);
+});
+
 test("required persistence failure still freezes financial integrity", () => {
   const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const persistence = server.slice(server.indexOf("function persist("), server.indexOf("function markRequestDurableMutation"));

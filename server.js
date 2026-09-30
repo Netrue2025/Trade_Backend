@@ -59,7 +59,7 @@ const { encryptSecret, randomId, hashPassword, verifyPassword } = require("./lib
 const { getExchangeClient, listExchanges, normalizeExchange } = require("./lib/exchanges");
 const { add, compare, multiplyRatio, subtract } = require("./lib/money");
 const { deriveTradeLifecycle: classifyTradeLifecycle, hasOverlappingCurrentGenerationTrade, hasVerifiedExchangeCloseEvidence } = require("./lib/tradeLifecycle");
-const { CURRENT_TRADE_FEE_MODEL, FIXED_ROUND_TRIP_FEE_RATE, calculateFixedRoundTripSettlement } = require("./lib/tradingFee");
+const { CURRENT_TRADE_FEE_MODEL } = require("./lib/tradingFee");
 const {
   isCurrentGenerationTrade,
   requireCurrentGenerationTrade,
@@ -187,6 +187,7 @@ const loginAttemptBuckets = new Map();
 const digitalServiceOrderRequests = new Map();
 const membershipPurchaseRequests = new Map();
 const tradeJoinRequests = new Set();
+const tradeExitOperations = new Set();
 const runWithUserFinancialLock = createUserFinancialLock();
 const financialRequestState = new AsyncLocalStorage();
 const paymentAttemptBuckets = new Map();
@@ -2819,9 +2820,12 @@ function getActiveTakeProfitOrders(trade) {
 
 function hasAnyTakeProfitHistory(trade) {
   return (trade.exitOrders || []).some(
-    (exitOrder) =>
-      exitOrder.kind === "TAKE_PROFIT"
-      && !["ERROR", "CANCELED"].includes(String(exitOrder.adminExecution?.status || "").toUpperCase())
+    (exitOrder) => {
+      const execution = exitOrder.adminExecution || {};
+      const status = String(execution.status || "").toUpperCase();
+      return exitOrder.kind === "TAKE_PROFIT"
+        && (!!execution.orderId || ["NEW", "PENDING_NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED"].includes(status));
+    }
   );
 }
 
@@ -2878,7 +2882,7 @@ async function cancelActiveTakeProfitOrders(trade) {
   }
 
   if (changed) {
-    persist();
+    await persist({ required: true, fields: ["tradeIntents"] });
   }
 }
 
@@ -3364,7 +3368,9 @@ function shouldReconcileTrade(trade) {
     return true;
   }
 
-  return trade.side === "BUY" && trade.adminExecution?.status === "FILLED" && deriveTradeLifecycle(trade) === "OPEN";
+  return trade.side === "BUY" && trade.adminExecution?.status === "FILLED"
+    && (deriveTradeLifecycle(trade) === "OPEN"
+      || (deriveTradeLifecycle(trade) === "UNVERIFIED" && !!trade.takeProfitTargetPrice && !hasAnyTakeProfitHistory(trade)));
 }
 
 async function reconcileTradeStatuses() {
@@ -3457,6 +3463,13 @@ async function reconcileTradeStatuses() {
             changed = true;
           }
         }
+      }
+
+      if (trade.closingAt && !tradeExitOperations.has(trade.id) && !(trade.exitOrders || []).some((item) => (
+        item.kind !== "TAKE_PROFIT" && isExecutionActive(item.adminExecution)
+      ))) {
+        trade.closingAt = null;
+        changed = true;
       }
 
       const adminSnapshot = await getOwnerSnapshot(admin, exchange);
@@ -3601,7 +3614,14 @@ async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS, {
 }
 
 function deriveTradeLifecycle(trade) {
-  return classifyTradeLifecycle(trade, getRemainingTradeQuantity);
+  if (trade?.closingAt && !trade?.closedAt) return "CLOSING";
+  const lifecycle = classifyTradeLifecycle(trade, getRemainingTradeQuantity);
+  const hasRegisteredTakeProfit = (trade?.exitOrders || []).some((item) => (
+    String(item?.kind || "").toUpperCase() === "TAKE_PROFIT"
+    && String(item?.adminExecution?.orderId || "").trim()
+  ));
+  if (lifecycle === "OPEN" && trade?.takeProfitTargetPrice && !hasRegisteredTakeProfit) return "UNVERIFIED";
+  return lifecycle;
 }
 
 function getStrategyReason(trade) {
@@ -4105,56 +4125,8 @@ function reserveTradeInvestmentFunds(user, amountUsdt, reference, actorId = user
   }));
 }
 
-function releaseCurrentGenerationTradeInvestmentFunds(user, investment, grossPnlPercent) {
-  const fundingSources = getInvestmentFundingSources(investment);
-  const rate = db.systemSettings.exchangeRate.usdtToNgn;
-  const releasedSources = fundingSources.map((source) => {
-    const wallet = financialService.ensureWallet(user.id, source.currency);
-    if (compare(wallet.lockedBalance, source.amount) < 0) {
-      throw new Error("Investment locked balance is out of sync.");
-    }
-    const calculation = calculateFixedRoundTripSettlement(source.amount, grossPnlPercent);
-    const balanceBefore = wallet.availableBalance;
-    const lockedBefore = wallet.lockedBalance;
-    wallet.lockedBalance = subtract(wallet.lockedBalance, source.amount);
-    wallet.availableBalance = add(wallet.availableBalance, calculation.settlementAmount);
-    wallet.updatedAt = nowIso();
-    return {
-      currency: source.currency,
-      lockedAmount: source.amount,
-      releasedAmount: calculation.settlementAmount,
-      balanceBefore,
-      balanceAfter: wallet.availableBalance,
-      lockedBalanceBefore: lockedBefore,
-      lockedBalanceAfter: wallet.lockedBalance,
-      grossPnl: calculation.grossPnl,
-      tradingFee: calculation.tradingFee,
-      netPnl: calculation.netPnl,
-      netPnlPercent: calculation.netPnlPercent,
-    };
-  });
-
-  const toUsdt = (amount, currency) => currency === "USDT"
-    ? amount
-    : financialService.convertAmount(amount, currency, "USDT", rate);
-  return {
-    releasedPrincipalUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.lockedAmount, source.currency)), "0"),
-    grossPnlUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.grossPnl, source.currency)), "0"),
-    tradingFeeUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.tradingFee, source.currency)), "0"),
-    netPnlUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.netPnl, source.currency)), "0"),
-    netPnlPercent: subtract(grossPnlPercent, "0.2"),
-    netSettlementUsdt: releasedSources.reduce((sum, source) => add(sum, toUsdt(source.releasedAmount, source.currency)), "0"),
-    releasedSources,
-    tradingFeeModel: CURRENT_TRADE_FEE_MODEL,
-    tradingFeeRate: FIXED_ROUND_TRIP_FEE_RATE,
-  };
-}
-
 function releaseTradeInvestmentFunds(user, investment, settledPnlUsdt, options = {}) {
   const fundingSources = getInvestmentFundingSources(investment);
-  if (options.applyFixedRoundTripFee && fundingSources.length) {
-    return releaseCurrentGenerationTradeInvestmentFunds(user, investment, options.grossPnlPercent);
-  }
   if (!fundingSources.length) {
     const wallet = financialService.ensureWallet(user.id, "USDT");
     wallet.availableBalance = add(wallet.availableBalance, settledPnlUsdt);
@@ -4351,7 +4323,6 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
   const pnlDeltaPercent = pnlPercent - Number(investment.baselinePnlPercent || 0);
   const grossPnlPercent = toMoneyDecimal(pnlDeltaPercent);
   const grossPnlUsdt = multiplyRatio(investment.amountUsdt || "0", grossPnlPercent, "100");
-  const applyFixedRoundTripFee = trade?.settlementFeeModel === CURRENT_TRADE_FEE_MODEL;
   return withUserFinancialLock(user.id, async () => {
     const currentInvestment = ensureTradeInvestmentsState().find((item) => item.id === investment.id);
     if (!currentInvestment || currentInvestment.status !== "ACTIVE") return currentInvestment || investment;
@@ -4360,11 +4331,8 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     if (existingTransaction) return currentInvestment;
 
     const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
-    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, grossPnlUsdt, {
-      applyFixedRoundTripFee,
-      grossPnlPercent,
-    });
-    const settledPnlUsdt = applyFixedRoundTripFee ? settlement.netPnlUsdt : grossPnlUsdt;
+    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, grossPnlUsdt);
+    const settledPnlUsdt = grossPnlUsdt;
     const touchedWallets = settlement.releasedSources.map((source) => financialService.ensureWallet(user.id, source.currency));
     if (!touchedWallets.length) touchedWallets.push(financialService.ensureWallet(user.id, "USDT"));
     markFinancialMutation(touchedWallets, "TRADE_SETTLEMENT", settlementReference);
@@ -4372,7 +4340,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     currentInvestment.status = "STOPPED";
     currentInvestment.stoppedAt = nowIso();
     currentInvestment.updatedAt = currentInvestment.stoppedAt;
-    currentInvestment.stopPnlPercent = applyFixedRoundTripFee ? settlement.netPnlPercent : String(Number(pnlPercent.toFixed(8)));
+    currentInvestment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
     currentInvestment.settledPnlUsdt = settledPnlUsdt;
     currentInvestment.netSettlementUsdt = settlement.netSettlementUsdt;
     currentInvestment.stopReason = options.reason || (trade ? "TRADE_INACTIVE" : "TRADE_NOT_FOUND");
@@ -4384,7 +4352,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
       reference: settlementReference, status: "APPROVED",
       description: options.description || `${trade?.symbol || "Trade"} investment settled.`,
       createdBy: options.createdBy || "system", createdAt: nowIso(),
-      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, grossPnlPercent, pnlPercent: applyFixedRoundTripFee ? settlement.netPnlPercent : grossPnlPercent, grossPnlUsdt: settlement.grossPnlUsdt || grossPnlUsdt, tradingFeeModel: settlement.tradingFeeModel || null, tradingFeeRate: settlement.tradingFeeRate || null, tradingFeeUsdt: settlement.tradingFeeUsdt || "0", netPnlUsdt: settledPnlUsdt, lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
+      metadata: { tradeId: currentInvestment.tradeId, investmentId: currentInvestment.id, grossPnlPercent, pnlPercent: grossPnlPercent, grossPnlUsdt: settlement.grossPnlUsdt || grossPnlUsdt, tradingFeeUsdt: "0", netPnlUsdt: settledPnlUsdt, lifecycleStatus: trade ? deriveTradeLifecycle(trade) : "MISSING", releasedPrincipalUsdt: settlement.releasedPrincipalUsdt, netSettlementUsdt: settlement.netSettlementUsdt, releasedSources: settlement.releasedSources },
     });
     await persist({
       required: true,
@@ -5222,7 +5190,6 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
   const normalizedOrderInput = await normalizeOrderForExchange({ ...adminAccount, exchange }, resolvedOrderInput, exchangeInfo);
   const balanceSafeOrderInput = await constrainBuyQuantityToAvailableBalance({ ...adminAccount, exchange }, normalizedOrderInput, exchangeInfo);
   await validateNotionalRule({ ...adminAccount, exchange }, balanceSafeOrderInput, exchangeInfo);
-  const adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, balanceSafeOrderInput, exchange);
   const trade = {
     id: randomId(12),
     createdAt: nowIso(),
@@ -5238,12 +5205,25 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     timeInForce: balanceSafeOrderInput.timeInForce || null,
     takeProfitTargetPrice: options.takeProfitTargetPrice || balanceSafeOrderInput.takeProfitPrice || null,
     stopLossTargetPrice: options.stopLossTargetPrice || null,
-    adminExecution: sanitizeExecution(adminOrder),
+    adminExecution: { status: "CREATING", orderId: "", executedQty: "0" },
     mirroredExecutions: [],
     exitOrders: [],
     settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
     strategyContext: options.strategyContext || null,
   };
+
+  db.tradeIntents.unshift(trade);
+  await persist({ required: true, fields: ["tradeIntents"] });
+  let adminOrder;
+  try {
+    adminOrder = await placeSpotOrder({ ...adminAccount, exchange }, balanceSafeOrderInput, exchange);
+  } catch (error) {
+    trade.adminExecution = sanitizeExecution(null, error.message);
+    await persist({ required: true, fields: ["tradeIntents"] });
+    throw error;
+  }
+  trade.adminExecution = sanitizeExecution(adminOrder);
+  await persist({ required: true, fields: ["tradeIntents"] });
 
   if (options.autoMirrorUsers === true) {
     for (const follower of getMirroringUsers(exchange)) {
@@ -5266,13 +5246,10 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     }
   }
 
-  db.tradeIntents.unshift(trade);
   await persist({ required: true, fields: ["tradeIntents"] });
   await tradeListener.handleTradeCreated(trade).catch((error) => {
     console.error(`Trade listener create event failed for trade ${trade.id}:`, error.message);
   });
-  await publishTradeOpenNotifications(trade, exchange);
-
   let tpOrder = null;
   if (trade.takeProfitTargetPrice && trade.side === "BUY") {
     tpOrder = await autoPlaceTakeProfit(trade, { force: true });
@@ -5285,6 +5262,8 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
       });
     }
   }
+
+  await publishTradeOpenNotifications(trade, exchange);
 
   return {
     trade,
@@ -5397,6 +5376,34 @@ autoTradeService.setExecutor(executeSignalAutoTrade);
 async function executeTradeExit(trade, admin, options = {}) {
   assertTradingOperationAllowed();
   requireCurrentGenerationTrade(trade);
+  const closeOrderInFlight = (trade.exitOrders || []).some((item) => (
+    item.kind !== "TAKE_PROFIT" && isExecutionActive(item.adminExecution)
+  ));
+  if (tradeExitOperations.has(trade.id) || closeOrderInFlight || deriveTradeLifecycle(trade) === "CLOSING" || deriveTradeLifecycle(trade) === "CLOSED") {
+    throw Object.assign(new Error("This trade is already closing or closed."), { code: "TRADE_CLOSE_IN_PROGRESS", statusCode: 409 });
+  }
+  tradeExitOperations.add(trade.id);
+  try {
+    return await executeTradeExitLocked(trade, admin, options);
+  } catch (error) {
+    const hasTrackedExit = (trade.exitOrders || []).some((item) => (
+      item.kind !== "TAKE_PROFIT" && item.createdAt >= trade.closingAt
+    ));
+    if (!hasTrackedExit && trade.closingAt) {
+      trade.closingAt = null;
+      await persist({ required: true, fields: ["tradeIntents"] }).catch((persistError) => {
+        console.error("Failed to clear unsubmitted trade close intent:", persistError.message);
+      });
+    }
+    throw error;
+  } finally {
+    tradeExitOperations.delete(trade.id);
+  }
+}
+
+async function executeTradeExitLocked(trade, admin, options = {}) {
+  trade.closingAt = nowIso();
+  await persist({ required: true, fields: ["tradeIntents"] });
   const exchange = getTradeExchange(trade);
   const adminAccount = getExchangeAccount(admin, exchange);
   if (!adminAccount) {
@@ -5413,14 +5420,29 @@ async function executeTradeExit(trade, admin, options = {}) {
   const exchangeInfo = await getExchangeInfo(trade.symbol, adminAccount.testnet, exchange);
   if (options.cancelTakeProfits !== false) {
     await cancelActiveTakeProfitOrders(trade);
+    await persist({ required: true, fields: ["tradeIntents"] });
+    if (getActiveTakeProfitOrders(trade).length) {
+      throw new Error("Take-profit cancellation is not confirmed; no additional sell was submitted.");
+    }
   }
 
-  const quantity =
+  const remainingTradeQuantity = getRemainingTradeQuantity(trade);
+  const requestedQuantity = options.quantity && compare(options.quantity, remainingTradeQuantity) < 0
+    ? String(options.quantity)
+    : String(remainingTradeQuantity);
+  const quantity = remainingTradeQuantity > 0 ?
     type === "MARKET"
-      ? await getMaxSellQuantityForAccount({ ...adminAccount, exchange }, trade.symbol, exchangeInfo, type, options.quantity)
-      : String(options.quantity || getRemainingTradeQuantity(trade) || "").trim() || undefined;
+      ? await getMaxSellQuantityForAccount({ ...adminAccount, exchange }, trade.symbol, exchangeInfo, type, requestedQuantity)
+      : requestedQuantity : null;
 
   if (!quantity) {
+    if (getRemainingTradeQuantity(trade) <= 1e-8) {
+      trade.closingAt = null;
+      trade.closedAt = nowIso();
+      await persist({ required: true, fields: ["tradeIntents"] });
+      await settleClosedTradeInvestments(trade, { reason: "TAKE_PROFIT_OR_CLOSE", createdBy: admin.id });
+      return null;
+    }
     throw new Error("No remaining quantity is available to close this trade.");
   }
 
@@ -5455,6 +5477,14 @@ async function executeTradeExit(trade, admin, options = {}) {
   exitOrder.adminExecution = sanitizeExecution(adminOrder);
   trade.exitOrders.push(exitOrder);
   await persist({ required: true, fields: ["tradeIntents"] });
+  if (!isExecutionActive(exitOrder.adminExecution)) {
+    trade.closingAt = null;
+    await persist({ required: true, fields: ["tradeIntents"] });
+  }
+  if (["FILLED", "PARTIALLY_FILLED"].includes(String(exitOrder.adminExecution?.status || "").toUpperCase())) {
+    if (deriveTradeLifecycle(trade) === "CLOSED") trade.closedAt = nowIso();
+    await persist({ required: true, fields: ["tradeIntents"] });
+  }
 
   for (const child of trade.mirroredExecutions || []) {
     const user = db.users.find((item) => item.id === child.userId);
@@ -5578,6 +5608,7 @@ async function autoPlaceTakeProfit(trade, options = {}) {
 
   trade.exitOrders = Array.isArray(trade.exitOrders) ? trade.exitOrders : [];
   trade.exitOrders.push(exitOrder);
+  await persist({ required: true, fields: ["tradeIntents"] });
   try {
     const tpQuantity = await getMaxSellQuantityForAccount(
       { ...adminAccount, exchange },
