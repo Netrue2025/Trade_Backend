@@ -332,6 +332,45 @@ test("mixed-currency ARX recovery history stays display-only without weakening c
   assert.throws(() => service.getDashboard(user), /Unsupported currency: INVALID/);
 });
 
+test("mixed-currency LIT cancellation history is display-only and never creates a MIXED wallet", () => {
+  const { admin, db, service, user } = createHarness();
+  setWallet(service, user.id, "NGN", "1250");
+  setWallet(service, user.id, "USDT", "2.5");
+  db.transactions.unshift({
+    id: "lit-cancellation-1",
+    userId: user.id,
+    type: "TRADE_CANCELLATION",
+    currency: "MIXED",
+    amount: "0",
+    reference: "trade-cancellation:trade-1:investment-1",
+    status: "APPROVED",
+    metadata: {
+      releasedSources: [
+        { currency: "NGN", amount: "1250" },
+        { currency: "USDT", amount: "2.5" },
+      ],
+    },
+  });
+  const before = JSON.stringify(db);
+
+  const profile = service.getUserFinanceProfile(user.id);
+  const transaction = profile.recentTransactions.find((item) => item.id === "lit-cancellation-1");
+  assert.deepEqual(transaction.mixedCurrencyBreakdown, [
+    { currency: "NGN", amount: "1250" },
+    { currency: "USDT", amount: "2.5" },
+  ]);
+  assert.equal(transaction.displayAmounts, null);
+  assert.deepEqual(profile.wallets.map((wallet) => wallet.currency), ["USDT", "NGN"]);
+  assert.equal(JSON.stringify(db), before);
+
+  assert.throws(() => service.setUserBalance(admin, user.id, {
+    currency: "MIXED",
+    amount: "100",
+    note: "Must remain unsupported",
+  }), /Unsupported currency: MIXED/);
+  assert.equal(JSON.stringify(db), before);
+});
+
 test("withdrawal completion reserves funds and clears locked balance", () => {
   const { admin, service, user } = createHarness();
   setWallet(service, user.id, "USDT", "100");

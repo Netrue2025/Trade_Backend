@@ -2094,9 +2094,13 @@ class FinancialService {
       return record;
     }
 
-    // MIXED is an audit-only aggregate used by the ARX principal release. It is
-    // not a monetary currency and must never be converted as one.
-    if (record.type !== "ABANDONED_TRADE_PRINCIPAL_RELEASE" || !Array.isArray(record.metadata?.releasedSources)) {
+    // MIXED is an audit-only aggregate for recovery records. It is not a
+    // monetary currency and must never be converted or used as a wallet.
+    const mixedDisplayTypes = new Set([
+      "ABANDONED_TRADE_PRINCIPAL_RELEASE",
+      "TRADE_CANCELLATION",
+    ]);
+    if (!mixedDisplayTypes.has(record.type) || !Array.isArray(record.metadata?.releasedSources)) {
       throw new Error("Unsupported currency: MIXED");
     }
 
