@@ -2406,6 +2406,7 @@ async function buildManagedUserSummary(user, usdtNgnRate, { refreshWallets = fal
   const financeSummary = await buildUserTradeInvestmentSummary(user);
   return {
     ...sanitizeUser(user),
+    membership: financialService.getMembershipSummary(user),
     mirrorStatus: user.mirrorEnabled ? "ACTIVE" : "OFF",
     connectedExchanges: listExchanges().filter((exchange) => !!user[exchange.id]),
     passwordStoredSecurely: true,
@@ -9085,6 +9086,25 @@ async function handleApi(req, res, url) {
         .map((user) => buildManagedUserSummary(user, usdtNgnRate))
     );
     sendJson(res, 200, { users, page, limit, total, hasMore: offset + users.length < total });
+    return true;
+  }
+
+  const adminUserMembershipMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/membership$/);
+  if (req.method === "POST" && adminUserMembershipMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const userId = decodeURIComponent(adminUserMembershipMatch[1] || "").trim();
+      const body = await readBody(req);
+      const result = await financialService.setUserMembership(admin, userId, body.plan);
+      scheduleSettingsUsersBroadcast("admin_membership_changed");
+      sendJson(res, 200, {
+        membership: result.membership,
+        user: await buildManagedUserSummary(result.user, await getUsdtToNgnRateFromBybitPage().catch(() => null)),
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
     return true;
   }
 

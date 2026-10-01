@@ -4820,6 +4820,55 @@ test("active Pro bypasses only membership join limits and expired Pro resolves t
   assert.throws(() => service.assertMembershipTradeJoinAllowed(user), (error) => error.code === "PLAN_TRADE_LIMIT_REACHED");
 });
 
+test("Plus allows four joins per Lagos day and then enforces its plan-specific limit", () => {
+  const { db, service, user } = createHarness();
+  user.membership = {
+    plan: "PLUS", status: "ACTIVE", startedAt: "2026-08-01T00:00:00.000Z",
+    expiresAt: "2026-09-30T00:00:00.000Z",
+  };
+  assert.equal(service.getMembershipSummary(user).plan, "PLUS");
+  assert.equal(service.getMembershipSummary(user).dailyTradeLimit, 4);
+  for (let index = 0; index < 4; index += 1) {
+    db.tradeInvestments.push({ id: `plus-${index}`, userId: user.id, tradeId: `trade-${index}`, status: "ACTIVE", joinedAt: "2026-08-30T10:00:00.000Z" });
+  }
+  assert.throws(() => service.assertMembershipTradeJoinAllowed(user), (error) =>
+    error.code === "PLAN_TRADE_LIMIT_REACHED"
+      && error.membership.plan === "PLUS"
+      && error.membership.dailyLimit === 4
+      && error.membership.usedToday === 4
+  );
+  db.tradeInvestments[0].joinedAt = "2026-08-29T22:59:59.000Z";
+  assert.doesNotThrow(() => service.assertMembershipTradeJoinAllowed(user));
+  user.membership.expiresAt = "2026-08-29T00:00:00.000Z";
+  assert.equal(service.getMembershipSummary(user).plan, "BASIC");
+});
+
+test("admin can activate or switch a user's plan with scoped durable persistence and no wallet transactions", async () => {
+  const calls = [];
+  const { admin, db, service, user } = createHarness({ persist: (options) => { calls.push(options); } });
+  const plus = await service.setUserMembership(admin, user.id, "PLUS");
+  assert.equal(plus.membership.plan, "PLUS");
+  assert.equal(plus.membership.dailyTradeLimit, 4);
+  assert.equal(plus.membership.expiresAt, "2026-09-29T10:00:00.000Z");
+  assert.deepEqual(calls[0].fields, ["users", "auditLogs"]);
+  assert.equal(calls[0].required, true);
+  assert.equal(db.transactions.length, 0);
+
+  const pro = await service.setUserMembership(admin, user.id, "PRO");
+  assert.equal(pro.membership.plan, "PRO");
+  assert.equal(pro.membership.dailyTradeLimit, null);
+  assert.equal(user.membership.assignedBy, admin.id);
+
+  const basic = await service.setUserMembership(admin, user.id, "BASIC");
+  assert.equal(basic.membership.plan, "BASIC");
+  assert.equal(basic.membership.expiresAt, null);
+  assert.equal(db.transactions.length, 0);
+  assert.equal(db.auditLogs.filter((item) => item.action === "USER_MEMBERSHIP_CHANGED").length, 3);
+
+  await assert.rejects(service.setUserMembership(user, user.id, "PRO"), /Administrator access is required/);
+  await assert.rejects(service.setUserMembership(admin, user.id, "GOLD"), /Choose Basic, Plus, or Pro/);
+});
+
 test("wallet Pro upgrade is authoritative idempotent and extends active membership", () => {
   const { admin, db, service, user } = createHarness();
   setWallet(service, user.id, "NGN", "50000");

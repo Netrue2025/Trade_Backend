@@ -360,13 +360,19 @@ function defaultSettings() {
     },
     membership: {
       basic: { name: "Basic", dailyTradeLimit: DEFAULT_BASIC_TRADE_LIMIT, targetLabel: "Trade target up to 1.5%" },
+      plus: {
+        name: "Plus",
+        dailyTradeLimit: 4,
+        durationDays: 30,
+        benefits: ["Join up to 4 trades per day", "Daily P&L target 1.5%, with up to 10% daily", "All Basic features"],
+      },
       pro: {
         name: "Pro",
         price: getEnvValue("PRO_MEMBERSHIP_PRICE_NGN") || "10000",
         currency: "NGN",
         durationDays: 30,
         enabled: true,
-        benefits: ["Unlimited eligible trade joins", "Participate in multiple available trades", "Premium PRO badge", "All Basic features"],
+        benefits: ["Unlimited eligible trade joins", "Unlimited daily P&L", "Participate in multiple available trades", "Premium PRO badge", "All Basic features"],
       },
       timeZone: MEMBERSHIP_TIME_ZONE,
       updatedAt: nowIso(),
@@ -543,12 +549,20 @@ class FinancialService {
   normalizeMembershipSettings(settings = {}) {
     const defaults = defaultSettings().membership;
     const basic = { ...defaults.basic, ...(settings.basic || {}) };
+    const plus = { ...defaults.plus, ...(settings.plus || {}) };
     const pro = { ...defaults.pro, ...(settings.pro || {}) };
     return {
       basic: {
         name: String(basic.name || "Basic").trim().slice(0, 40) || "Basic",
         dailyTradeLimit: Math.max(1, normalizeWholeNumber(basic.dailyTradeLimit, DEFAULT_BASIC_TRADE_LIMIT, "Basic daily trade limit")),
         targetLabel: String(basic.targetLabel || defaults.basic.targetLabel).trim().slice(0, 100),
+      },
+      plus: {
+        name: String(plus.name || "Plus").trim().slice(0, 40) || "Plus",
+        dailyTradeLimit: Math.max(1, normalizeWholeNumber(plus.dailyTradeLimit, defaults.plus.dailyTradeLimit, "Plus daily trade limit")),
+        durationDays: Math.max(1, normalizeWholeNumber(plus.durationDays, defaults.plus.durationDays, "Plus duration")),
+        benefits: (Array.isArray(plus.benefits) ? plus.benefits : defaults.plus.benefits)
+          .map((item) => String(item || "").trim().slice(0, 120)).filter(Boolean).slice(0, 12),
       },
       pro: {
         name: String(pro.name || "Pro").trim().slice(0, 40) || "Pro",
@@ -587,21 +601,26 @@ class FinancialService {
     this.ensureState();
     const raw = user?.membership || {};
     const expiresAtMs = Date.parse(raw.expiresAt || "");
-    const activePro = String(raw.plan || "").toUpperCase() === "PRO"
+    const rawPlan = String(raw.plan || "BASIC").toUpperCase();
+    const activeMembership = ["PLUS", "PRO"].includes(rawPlan)
       && String(raw.status || "ACTIVE").toUpperCase() === "ACTIVE"
       && Number.isFinite(expiresAtMs) && expiresAtMs > Date.parse(at);
+    const plan = activeMembership ? rawPlan : "BASIC";
     const day = this.getMembershipTradingDay(at);
     const usedToday = (this.db.tradeInvestments || []).filter((item) => item.userId === user?.id
       && item.joinedAt && this.getMembershipTradingDay(item.joinedAt) === day).length;
     const settings = this.db.systemSettings.membership;
+    const dailyTradeLimit = plan === "PRO" ? null
+      : plan === "PLUS" ? settings.plus.dailyTradeLimit
+        : settings.basic.dailyTradeLimit;
     return {
-      plan: activePro ? "PRO" : "BASIC",
-      status: activePro ? "ACTIVE" : (raw.plan === "PRO" && raw.expiresAt ? "EXPIRED" : "ACTIVE"),
-      active: activePro,
+      plan,
+      status: activeMembership ? "ACTIVE" : (["PLUS", "PRO"].includes(rawPlan) && raw.expiresAt ? "EXPIRED" : "ACTIVE"),
+      active: plan !== "BASIC",
       startedAt: raw.startedAt || null,
       expiresAt: raw.expiresAt || null,
       purchaseReference: raw.purchaseReference || "",
-      dailyTradeLimit: activePro ? null : settings.basic.dailyTradeLimit,
+      dailyTradeLimit,
       tradesUsedToday: usedToday,
       tradingDay: day,
       timeZone: MEMBERSHIP_TIME_ZONE,
@@ -612,13 +631,43 @@ class FinancialService {
     const membership = this.getMembershipSummary(user);
     if (membership.plan === "PRO") return membership;
     if (membership.tradesUsedToday >= membership.dailyTradeLimit) {
-      const error = new Error("Your Basic plan daily trade join limit has been reached.");
+      const planName = membership.plan === "PLUS" ? "Plus" : "Basic";
+      const error = new Error(`Your ${planName} plan daily trade join limit has been reached.`);
       error.statusCode = 403;
       error.code = "PLAN_TRADE_LIMIT_REACHED";
-      error.membership = { plan: "BASIC", dailyLimit: membership.dailyTradeLimit, usedToday: membership.tradesUsedToday };
+      error.membership = { plan: membership.plan, dailyLimit: membership.dailyTradeLimit, usedToday: membership.tradesUsedToday };
       throw error;
     }
     return membership;
+  }
+
+  async setUserMembership(admin, userId, requestedPlan) {
+    this.ensureState();
+    if (admin?.role !== "admin") throw Object.assign(new Error("Administrator access is required."), { statusCode: 403 });
+    const user = this.db.users.find((item) => item.id === String(userId) && item.role === "user");
+    if (!user) throw Object.assign(new Error("User not found."), { statusCode: 404 });
+    const plan = String(requestedPlan || "").trim().toUpperCase();
+    if (!["BASIC", "PLUS", "PRO"].includes(plan)) {
+      throw Object.assign(new Error("Choose Basic, Plus, or Pro."), { statusCode: 400 });
+    }
+
+    const changedAt = this.clock();
+    if (plan === "BASIC") {
+      user.membership = { plan: "BASIC", status: "ACTIVE", startedAt: changedAt, expiresAt: null, assignedBy: admin.id };
+    } else {
+      const durationDays = this.db.systemSettings.membership[plan.toLowerCase()].durationDays;
+      user.membership = {
+        plan,
+        status: "ACTIVE",
+        startedAt: changedAt,
+        expiresAt: new Date(Date.parse(changedAt) + durationDays * 86400000).toISOString(),
+        purchaseReference: "",
+        assignedBy: admin.id,
+      };
+    }
+    this.audit(admin, "USER_MEMBERSHIP_CHANGED", "User", user.id, { plan, assignedAt: changedAt });
+    await this.persist({ required: true, fields: ["users", "auditLogs"], operation: { reason: "ADMIN_MEMBERSHIP_CHANGED", userId: user.id } });
+    return { user, membership: this.getMembershipSummary(user, changedAt) };
   }
 
   activateProMembership(user, transaction, purchasedAt = this.clock()) {
@@ -1594,6 +1643,7 @@ class FinancialService {
         ...before.membership,
         ...(patch.membership || {}),
         basic: { ...before.membership.basic, ...(patch.membership?.basic || {}) },
+        plus: { ...before.membership.plus, ...(patch.membership?.plus || {}) },
         pro: { ...before.membership.pro, ...(patch.membership?.pro || {}) },
       },
     };
