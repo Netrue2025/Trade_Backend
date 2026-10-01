@@ -4843,6 +4843,22 @@ test("Plus allows four joins per Lagos day and then enforces its plan-specific l
   assert.equal(service.getMembershipSummary(user).plan, "BASIC");
 });
 
+test("admin can edit Plus price, description, duration, availability, and benefits", () => {
+  const { admin, service } = createHarness();
+  const settings = service.updateSettings(admin, { membership: { plus: {
+    name: "Plus Max", price: "6500", durationDays: 45, enabled: true,
+    description: "Configured Plus description.", benefits: ["Four joins", "Configured daily P&L information"],
+  } } }).membership.plus;
+  assert.equal(settings.name, "Plus Max");
+  assert.equal(settings.price, "6500");
+  assert.equal(settings.currency, "NGN");
+  assert.equal(settings.dailyTradeLimit, 4);
+  assert.equal(settings.durationDays, 45);
+  assert.equal(settings.enabled, true);
+  assert.equal(settings.description, "Configured Plus description.");
+  assert.deepEqual(settings.benefits, ["Four joins", "Configured daily P&L information"]);
+});
+
 test("admin can activate or switch a user's plan with scoped durable persistence and no wallet transactions", async () => {
   const calls = [];
   const { admin, db, service, user } = createHarness({ persist: (options) => { calls.push(options); } });

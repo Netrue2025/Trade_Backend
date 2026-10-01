@@ -362,8 +362,12 @@ function defaultSettings() {
       basic: { name: "Basic", dailyTradeLimit: DEFAULT_BASIC_TRADE_LIMIT, targetLabel: "Trade target up to 1.5%" },
       plus: {
         name: "Plus",
+        price: getEnvValue("PLUS_MEMBERSHIP_PRICE_NGN") || "0",
+        currency: "NGN",
         dailyTradeLimit: 4,
         durationDays: 30,
+        enabled: false,
+        description: "Up to four trade joins per day with Plus membership access.",
         benefits: ["Join up to 4 trades per day", "Daily P&L target 1.5%, with up to 10% daily", "All Basic features"],
       },
       pro: {
@@ -559,8 +563,12 @@ class FinancialService {
       },
       plus: {
         name: String(plus.name || "Plus").trim().slice(0, 40) || "Plus",
+        price: normalizeNonNegativeAmount(plus.price ?? defaults.plus.price, "Plus price"),
+        currency: "NGN",
         dailyTradeLimit: Math.max(1, normalizeWholeNumber(plus.dailyTradeLimit, defaults.plus.dailyTradeLimit, "Plus daily trade limit")),
         durationDays: Math.max(1, normalizeWholeNumber(plus.durationDays, defaults.plus.durationDays, "Plus duration")),
+        enabled: plus.enabled === true || plus.enabled === "true",
+        description: String(plus.description ?? defaults.plus.description).trim().slice(0, 240),
         benefits: (Array.isArray(plus.benefits) ? plus.benefits : defaults.plus.benefits)
           .map((item) => String(item || "").trim().slice(0, 120)).filter(Boolean).slice(0, 12),
       },
