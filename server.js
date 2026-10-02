@@ -73,6 +73,7 @@ const { FinancialService } = require("./services/financialService");
 const { AdminBonusReversalService, EXECUTION_ACTION: BONUS_REVERSAL_EXECUTION_ACTION } = require("./services/adminBonusReversalService");
 const { ArxAbandonedPrincipalReleaseService, EXECUTION_ACTION: ARX_PRINCIPAL_RELEASE_EXECUTION_ACTION } = require("./services/arxAbandonedPrincipalReleaseService");
 const { LitStrandedTradeCancellationService, TARGET_TRADE_ID: LIT_RECOVERY_TRADE_ID, TRADE_CANCELLATION_REASON: LIT_RECOVERY_CANCELLATION_REASON } = require("./services/litStrandedTradeCancellationService");
+const { AuroraStrandedTradeRecoveryService, TARGET_TRADE_ID: AURORA_RECOVERY_TRADE_ID, RECOVERY_REASON: AURORA_RECOVERY_REASON } = require("./services/auroraStrandedTradeRecoveryService");
 const { DepositApprovalService } = require("./services/depositApprovalService");
 const { QuestService } = require("./services/questService");
 const { PaystackService, maskAccountNumber, toKobo } = require("./services/paystackService");
@@ -160,6 +161,7 @@ let financialService = null;
 let adminBonusReversalService = null;
 let arxAbandonedPrincipalReleaseService = null;
 let litStrandedTradeCancellationService = null;
+let auroraStrandedTradeRecoveryService = null;
 let depositApprovalService = null;
 let questService = null;
 let vtuService = null;
@@ -3640,6 +3642,8 @@ async function waitForTradeReconciliation(timeoutMs = TRADE_RECONCILE_WAIT_MS, {
 function deriveTradeLifecycle(trade) {
   if (String(trade?.id || "") === LIT_RECOVERY_TRADE_ID
     && trade?.strandedCancellation?.reason === LIT_RECOVERY_CANCELLATION_REASON) return "CANCELED";
+  if (String(trade?.id || "") === AURORA_RECOVERY_TRADE_ID
+    && trade?.strandedRecovery?.reason === AURORA_RECOVERY_REASON) return "CANCELED";
   if (trade?.closingAt && !trade?.closedAt) return "CLOSING";
   const lifecycle = classifyTradeLifecycle(trade, getRemainingTradeQuantity);
   const hasRegisteredTakeProfit = (trade?.exitOrders || []).some((item) => (
@@ -9705,6 +9709,29 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/admin/recovery/aurora-stranded-trade") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const body = await readBody(req);
+      const mode = String(body.mode || "dry-run").trim().toLowerCase();
+      if (mode === "execute") {
+        const result = await auroraStrandedTradeRecoveryService.execute(admin, {
+          action: body.action,
+          confirmExchangeClosed: body.confirmExchangeClosed === true,
+        });
+        sendJson(res, result.status === "RECOVERED" ? 201 : 200, result);
+      } else if (mode === "dry-run") {
+        sendJson(res, 200, auroraStrandedTradeRecoveryService.inspect());
+      } else {
+        sendJson(res, 400, { error: "Mode must be dry-run or execute." });
+      }
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
+    return true;
+  }
+
   const hideTradeMatch = url.pathname.match(/^\/api\/trades\/([^/]+)\/hide$/);
   if (req.method === "POST" && hideTradeMatch) {
     const user = requireAuth(req, res, "user");
@@ -10167,6 +10194,12 @@ async function startServer() {
     markFinancialMutation,
   });
   litStrandedTradeCancellationService = new LitStrandedTradeCancellationService({
+    db,
+    withUserFinancialLock,
+    persist,
+    markFinancialMutation,
+  });
+  auroraStrandedTradeRecoveryService = new AuroraStrandedTradeRecoveryService({
     db,
     withUserFinancialLock,
     persist,
