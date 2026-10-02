@@ -56,7 +56,6 @@ class AuroraStrandedTradeRecoveryService {
     }
 
     const active = investments.filter((item) => ["ACTIVE", "JOINED"].includes(String(item.status || "").toUpperCase()));
-    if (!report.blocker && investments.length !== 1) report.blocker = "EXPECTED_EXACTLY_ONE_INVESTMENT";
     if (!report.blocker && active.length !== 1) report.blocker = "EXPECTED_EXACTLY_ONE_ACTIVE_INVESTMENT";
     const exitProof = (trade?.exitOrders || []).some((item) => (
       String(item?.adminExecution?.status || "").toUpperCase() === "FILLED"
@@ -94,9 +93,10 @@ class AuroraStrandedTradeRecoveryService {
       row.reversible = !row.blocker && ["ACTIVE", "JOINED"].includes(String(investment.status || "").toUpperCase());
       report.investments.push(row);
     }
-    const blocked = report.investments.some((item) => !item.reversible);
-    report.safeToExecute = !report.blocker && !blocked;
-    if (!report.blocker && blocked) report.blocker = report.investments.find((item) => !item.reversible)?.blocker || "INVESTMENT_NOT_REVERSIBLE";
+    const activeRows = report.investments.filter((item) => ["ACTIVE", "JOINED"].includes(String(item.status || "").toUpperCase()));
+    const blockedActive = activeRows.some((item) => !item.reversible);
+    report.safeToExecute = !report.blocker && activeRows.length === 1 && !blockedActive;
+    if (!report.blocker && blockedActive) report.blocker = activeRows.find((item) => !item.reversible)?.blocker || "INVESTMENT_NOT_REVERSIBLE";
     report.operatorConfirmationRequired = "Confirm Bybit AURORAUSDT exposure and open orders are closed before execution.";
     return report;
   }
@@ -107,14 +107,18 @@ class AuroraStrandedTradeRecoveryService {
     const first = this.inspect();
     if (first.status === "ALREADY_RECOVERED") return { status: first.status, report: first };
     if (!first.safeToExecute) return { status: "BLOCKED", report: first };
-    const userId = String(this.db.tradeInvestments.find((item) => item.id === first.investments[0].investmentId).userId || "");
+    const targetRow = first.investments.find((item) => item.reversible);
+    if (!targetRow) return { status: "BLOCKED", report: { ...first, safeToExecute: false, blocker: "ACTIVE_INVESTMENT_NOT_REVERSIBLE" } };
+    const userId = String(this.db.tradeInvestments.find((item) => item.id === targetRow.investmentId).userId || "");
     if (!userId) return { status: "BLOCKED", report: { ...first, safeToExecute: false, blocker: "INVESTMENT_USER_MISSING" } };
 
     return this.withUserFinancialLock(userId, async () => {
       const report = this.inspect();
       if (report.status === "ALREADY_RECOVERED") return { status: report.status, report };
       if (!report.safeToExecute) return { status: "BLOCKED", report };
-      const investment = this.db.tradeInvestments.find((item) => item.id === report.investments[0].investmentId);
+      const currentTargetRow = report.investments.find((item) => item.reversible);
+      if (!currentTargetRow) return { status: "BLOCKED", report: { ...report, safeToExecute: false, blocker: "ACTIVE_INVESTMENT_NOT_REVERSIBLE" } };
+      const investment = this.db.tradeInvestments.find((item) => item.id === currentTargetRow.investmentId);
       const trade = this.db.tradeIntents.find((item) => String(item.id) === TARGET_TRADE_ID);
       const now = this.clock();
       const reference = recoveryReference(investment.id);

@@ -10,15 +10,22 @@ const {
   EXECUTION_ACTION,
 } = require("../services/auroraStrandedTradeRecoveryService");
 
-function fixture({ settlement = false, secondInvestment = false } = {}) {
+function fixture({ settlement = false, secondInvestment = false, settledHistory = false } = {}) {
   const db = {
     tradeIntents: [{ id: TARGET_TRADE_ID, symbol: "AURORAUSDT", status: "OPEN", side: "BUY", adminExecution: { status: "FILLED" }, exitOrders: [{ adminExecution: { status: "FILLED", executedQty: "19412.59" } }] }],
     tradeInvestments: [{ id: "aurora-investment", tradeId: TARGET_TRADE_ID, userId: "user-1", status: "ACTIVE", fundingSources: [{ currency: "USDT", amount: "25" }], settledPnlUsdt: "0" },
-      ...(secondInvestment ? [{ id: "other-investment", tradeId: TARGET_TRADE_ID, userId: "user-2", status: "ACTIVE", fundingSources: [{ currency: "USDT", amount: "5" }] }] : [])],
+      ...(secondInvestment ? [{ id: "other-investment", tradeId: TARGET_TRADE_ID, userId: "user-2", status: "ACTIVE", fundingSources: [{ currency: "USDT", amount: "5" }] }] : []),
+      ...(settledHistory ? [{ id: "old-settled-one", tradeId: TARGET_TRADE_ID, userId: "old-user", status: "STOPPED", fundingSources: [{ currency: "NGN", amount: "1000" }] }, { id: "old-settled-two", tradeId: TARGET_TRADE_ID, userId: "old-user-2", status: "STOPPED", fundingSources: [{ currency: "NGN", amount: "2000" }] }] : [])],
     wallets: [{ userId: "user-1", currency: "USDT", availableBalance: "75", lockedBalance: "25" },
       ...(secondInvestment ? [{ userId: "user-2", currency: "USDT", availableBalance: "5", lockedBalance: "5" }] : [])],
     transactions: [{ id: "join-1", userId: "user-1", type: "TRADE_INVESTMENT_LOCK", currency: "USDT", amount: "-25", reference: "aurora-investment", status: "APPROVED" },
       ...(secondInvestment ? [{ id: "join-2", userId: "user-2", type: "TRADE_INVESTMENT_LOCK", currency: "USDT", amount: "-5", reference: "other-investment", status: "APPROVED" }] : []),
+      ...(settledHistory ? [
+        { id: "old-join-1", type: "TRADE_INVESTMENT_LOCK", currency: "NGN", amount: "-1000", reference: "old-settled-one", status: "APPROVED" },
+        { id: "old-settlement-1", type: "TRADE_SETTLEMENT", reference: "trade-settlement:old-settled-one", status: "APPROVED" },
+        { id: "old-join-2", type: "TRADE_INVESTMENT_LOCK", currency: "NGN", amount: "-2000", reference: "old-settled-two", status: "APPROVED" },
+        { id: "old-settlement-2", type: "TRADE_SETTLEMENT", reference: "trade-settlement:old-settled-two", status: "APPROVED" },
+      ] : []),
       ...(settlement ? [{ id: "settlement-1", type: "TRADE_SETTLEMENT", reference: "trade-settlement:aurora-investment", status: "APPROVED" }] : [])],
     systemSettings: { trading: { quarantinedTradeIds: [] } },
   };
@@ -75,8 +82,22 @@ test("execution restores original principal exactly once and quarantines the tar
   assert.deepEqual(db, beforeRepeat);
 });
 
+test("settled historical investments do not block or change the sole active principal recovery", async () => {
+  const { db, service } = fixture({ settledHistory: true });
+  const historicalBefore = structuredClone(db.tradeInvestments.slice(1));
+  const historyTransactionsBefore = structuredClone(db.transactions.filter((item) => item.id.startsWith("old-")));
+  const report = service.inspect();
+  assert.equal(report.safeToExecute, true);
+  assert.equal(report.investments.length, 3);
+  assert.equal(report.investments.filter((item) => item.reversible).length, 1);
+  assert.equal((await service.execute({ id: "admin", role: "admin" }, { action: EXECUTION_ACTION, confirmExchangeClosed: true })).status, "RECOVERED");
+  assert.deepEqual(db.tradeInvestments.slice(1), historicalBefore);
+  assert.deepEqual(db.transactions.filter((item) => item.id.startsWith("old-")), historyTransactionsBefore);
+  assert.equal(db.transactions.filter((item) => item.type === "TRADE_CANCELLATION").length, 1);
+});
+
 test("recovery blocks multiple joiners, prior settlement, missing exit, and insufficient locks", () => {
-  assert.equal(fixture({ secondInvestment: true }).service.inspect().blocker, "EXPECTED_EXACTLY_ONE_INVESTMENT");
+  assert.equal(fixture({ secondInvestment: true }).service.inspect().blocker, "EXPECTED_EXACTLY_ONE_ACTIVE_INVESTMENT");
   assert.equal(fixture({ settlement: true }).service.inspect().investments[0].blocker, "SETTLEMENT_ALREADY_EXISTS");
   const missingExit = fixture();
   missingExit.db.tradeIntents[0].exitOrders = [];
