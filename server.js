@@ -48,7 +48,7 @@ loadEnvFile();
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo, isMongoAppStatePersistenceReady } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
-const { buildPartialTradeExitEvidence } = require("./lib/partialTradeExitClosure");
+const { buildPartialTradeExitEvidence, isManualStopExitOrder } = require("./lib/partialTradeExitClosure");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
@@ -3675,9 +3675,7 @@ async function closeTradeAtPartialExitSnapshot(trade) {
   if (!entryQuantity || !Array.isArray(trade?.exitOrders) || !trade.exitOrders.length) return false;
 
   const manualStopRequested = trade.exitOrders.some((item) => (
-    ["MANUAL_SELL", "MANUAL_STOP", "ADMIN_STOP"].includes(String(item?.kind || "").toUpperCase())
-    && item?.closeTradeOnFill === true
-    && getExecutionFilledQty(item?.adminExecution) > 0
+    isManualStopExitOrder(item, entryQuantity) && getExecutionFilledQty(item?.adminExecution) > 0
   ));
   const observedExitQuantity = trade.exitOrders.reduce((sum, item) => sum + getExecutionFilledQty(item?.adminExecution), 0);
   if (!manualStopRequested && observedExitQuantity / entryQuantity < 0.8) return false;

@@ -50,6 +50,15 @@ test("manual stop may close below 80 percent only after a terminal positive fill
   assert.equal(hasVerifiedPartialTradeExitEvidence({ ...trade, authoritativeCloseEvidence: result.evidence }), true);
 });
 
+test("legacy full-size manual stop orders without close metadata remain recognizable", () => {
+  const trade = tradeWithExit({ quantity: "2", kind: "MANUAL_SELL" });
+  delete trade.exitOrders[0].closeTradeOnFill;
+  trade.exitOrders[0].quantity = "10";
+  const result = buildPartialTradeExitEvidence({ trade, markPrice: "90", reason: "MANUAL_STOP" });
+  assert.ok(result.evidence);
+  assert.equal(result.evidence.closeReason, "MANUAL_STOP");
+});
+
 test("partial active exit cannot be treated as a completed close", () => {
   const trade = tradeWithExit({ status: "PARTIALLY_FILLED", quantity: "8" });
   const result = buildPartialTradeExitEvidence({ trade, markPrice: "105", reason: "AUTO_FILL_THRESHOLD" });
