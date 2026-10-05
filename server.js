@@ -48,6 +48,7 @@ loadEnvFile();
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo, isMongoAppStatePersistenceReady } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
+const { buildPartialTradeExitEvidence } = require("./lib/partialTradeExitClosure");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
@@ -2808,7 +2809,8 @@ function getTradeFilledEntryQuantity(trade, userId = null) {
 function getTradeExitedQuantity(trade, userId = null) {
   return (trade.exitOrders || []).reduce((sum, exitOrder) => {
     const execution = getExitExecutionForTrade(trade, exitOrder, userId);
-    if (!execution || !FILLED_OR_PARTIAL_ORDER_STATUSES.has(execution.status)) {
+    const status = String(execution?.status || "").toUpperCase();
+    if (!execution || (!FILLED_OR_PARTIAL_ORDER_STATUSES.has(status) && status !== "CANCELED")) {
       return sum;
     }
     return sum + getExecutionFilledQty(execution);
@@ -3551,6 +3553,10 @@ async function reconcileTradeStatuses() {
         changed = true;
       }
 
+      if (await closeTradeAtPartialExitSnapshot(trade)) {
+        changed = true;
+      }
+
       if (
         String(previousTrade?.adminExecution?.status || "").trim().toUpperCase() !== "FILLED"
         && String(trade?.adminExecution?.status || "").trim().toUpperCase() === "FILLED"
@@ -3661,7 +3667,67 @@ function getStrategyReason(trade) {
 function getFilledExitExecutions(trade) {
   return (trade?.exitOrders || [])
     .map((exitOrder) => exitOrder?.adminExecution || null)
-    .filter((execution) => execution && ["FILLED", "PARTIALLY_FILLED"].includes(String(execution.status || "").toUpperCase()));
+    .filter((execution) => execution && ["FILLED", "PARTIALLY_FILLED", "CANCELED"].includes(String(execution.status || "").toUpperCase()) && getExecutionFilledQty(execution) > 0);
+}
+
+async function closeTradeAtPartialExitSnapshot(trade) {
+  const entryQuantity = getTradeFilledEntryQuantity(trade);
+  if (!entryQuantity || !Array.isArray(trade?.exitOrders) || !trade.exitOrders.length) return false;
+
+  const manualStopRequested = trade.exitOrders.some((item) => (
+    ["MANUAL_SELL", "MANUAL_STOP", "ADMIN_STOP"].includes(String(item?.kind || "").toUpperCase())
+    && item?.closeTradeOnFill === true
+    && getExecutionFilledQty(item?.adminExecution) > 0
+  ));
+  const observedExitQuantity = trade.exitOrders.reduce((sum, item) => sum + getExecutionFilledQty(item?.adminExecution), 0);
+  if (!manualStopRequested && observedExitQuantity / entryQuantity < 0.8) return false;
+
+  const admin = db.users.find((user) => user.id === trade.createdByUserId);
+  const exchange = getTradeExchange(trade);
+  let executionsChanged = false;
+  for (const exitOrder of trade.exitOrders) {
+    if (isExecutionActive(exitOrder.adminExecution)) {
+      const next = await cancelTradeExitOrder(admin, trade.symbol, exitOrder.adminExecution, exchange);
+      if (!sameExecution(next, exitOrder.adminExecution)) {
+        exitOrder.adminExecution = next;
+        executionsChanged = true;
+      }
+    }
+    for (const mirror of exitOrder.mirroredExecutions || []) {
+      if (!isExecutionActive(mirror.order)) continue;
+      const owner = db.users.find((user) => user.id === mirror.userId);
+      const mirrorExchange = normalizeExchange(mirror.exchange, exchange);
+      const next = await cancelTradeExitOrder(owner, trade.symbol, mirror.order, mirrorExchange);
+      if (!sameExecution(next, mirror.order)) {
+        mirror.order = next;
+        mirror.status = next?.status || mirror.status;
+        mirror.error = next?.cancelError || null;
+        executionsChanged = true;
+      }
+    }
+  }
+  if (executionsChanged) await persist({ required: true, fields: ["tradeIntents"] });
+  if (hasActiveExitExecution(trade.exitOrders)) return false;
+
+  const finalExitQuantity = getTradeExitedQuantity(trade);
+  if (!finalExitQuantity || finalExitQuantity >= entryQuantity) return false;
+  if (!manualStopRequested && finalExitQuantity / entryQuantity < 0.8) return false;
+
+  const adminAccount = getExchangeAccount(admin, exchange);
+  if (!adminAccount) return false;
+  const ticker = await getTickerPrice(trade.symbol, adminAccount.testnet, exchange).catch(() => null);
+  const snapshot = buildPartialTradeExitEvidence({
+    trade,
+    markPrice: ticker?.price,
+    reason: manualStopRequested ? "MANUAL_STOP" : "AUTO_FILL_THRESHOLD",
+    verifiedAt: nowIso(),
+  });
+  if (!snapshot.evidence) return false;
+
+  trade.authoritativeCloseEvidence = snapshot.evidence;
+  trade.closingAt = null;
+  trade.closedAt = snapshot.evidence.verifiedAt;
+  return true;
 }
 
 function getWeightedAverageExecutionPrice(executions = []) {
@@ -3693,8 +3759,14 @@ function buildClosedTradeLearningRecord(trade) {
 
   const entryPrice = getExecutionAveragePrice(trade.adminExecution) || Number(trade.price || 0);
   const exitExecutions = getFilledExitExecutions(trade);
-  const exitPrice = getWeightedAverageExecutionPrice(exitExecutions);
-  const quantity = Math.min(getTradeFilledEntryQuantity(trade), getTradeExitedQuantity(trade));
+  const partialCloseEvidence = trade.authoritativeCloseEvidence?.source === "BYBIT_PARTIAL_EXIT_MARK_TO_MARKET"
+    ? trade.authoritativeCloseEvidence
+    : null;
+  const exitPrice = Number(partialCloseEvidence?.effectiveExitPrice)
+    || getWeightedAverageExecutionPrice(exitExecutions);
+  const quantity = partialCloseEvidence
+    ? getTradeFilledEntryQuantity(trade)
+    : Math.min(getTradeFilledEntryQuantity(trade), getTradeExitedQuantity(trade));
   if (entryPrice <= 0 || exitPrice <= 0 || quantity <= 0) {
     return null;
   }
@@ -4249,7 +4321,9 @@ function getAuthoritativeClosedTradePnlPercent(trade) {
     return null;
   }
   const entryPrice = getTradeEntryPriceSnapshot(trade);
-  const exitPrice = getWeightedAverageExecutionPrice(getFilledExitExecutions(trade));
+  const exitPrice = trade.authoritativeCloseEvidence?.source === "BYBIT_PARTIAL_EXIT_MARK_TO_MARKET"
+    ? Number(trade.authoritativeCloseEvidence.effectiveExitPrice)
+    : getWeightedAverageExecutionPrice(getFilledExitExecutions(trade));
   const closeEvidenceVerified = hasVerifiedExchangeCloseEvidence(trade);
   if (entryPrice <= 0 || exitPrice <= 0 || getTradeFilledEntryQuantity(trade) <= 0
     || (!closeEvidenceVerified && getRemainingTradeQuantity(trade) > 1e-8)) {
@@ -5521,6 +5595,7 @@ async function executeTradeExitLocked(trade, admin, options = {}) {
     quantity,
     exchange,
     reason: options.reason || null,
+    closeTradeOnFill: !options.quantity || compare(options.quantity, remainingTradeQuantity) >= 0,
     triggerPrice: options.triggerPrice ? String(options.triggerPrice) : null,
     adminExecution: null,
     mirroredExecutions: [],
@@ -5609,6 +5684,10 @@ async function executeTradeExitLocked(trade, admin, options = {}) {
       childExchange
     );
     exitOrder.mirroredExecutions.push(childExecution);
+    await persist({ required: true, fields: ["tradeIntents"] });
+  }
+
+  if (await closeTradeAtPartialExitSnapshot(trade)) {
     await persist({ required: true, fields: ["tradeIntents"] });
   }
 
