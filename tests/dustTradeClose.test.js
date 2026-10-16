@@ -77,6 +77,7 @@ test("the MINA recovery route is admin-only, exact-trade scoped, and execution-c
   assert.match(route, /25d85206cb7b1c8f87268fbc/);
   assert.match(route, /mode === "dry-run" \|\| blocker/);
   assert.match(route, /CLOSE_MINA_DUST_TRADE_25d85206cb7b1c8f87268fbc/);
+  assert.doesNotMatch(route, /No active user investments remain/);
   assert.match(route, /persist\(\{ required: true, fields: \["tradeIntents"\] \}\)/);
   assert.match(route, /settleClosedTradeInvestments\(trade/);
 });

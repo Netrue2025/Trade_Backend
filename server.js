@@ -9862,10 +9862,6 @@ async function handleApi(req, res, url) {
         const activeInvestments = ensureTradeInvestmentsState().filter((investment) => (
           investment.tradeId === trade.id && investment.status === "ACTIVE"
         ));
-        if (!activeInvestments.length) {
-          sendJson(res, 409, { error: "No active user investments remain on this trade." });
-          return true;
-        }
         const accountInfo = await getAccountInfo({ ...adminAccount, exchange }, exchange);
         const exchangeInfo = await getExchangeInfo(trade.symbol, adminAccount.testnet, exchange);
         const openOrders = await getOpenOrders({ ...adminAccount, exchange }, exchange);
