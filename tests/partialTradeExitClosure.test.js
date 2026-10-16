@@ -7,6 +7,7 @@ const { CURRENT_TRADE_FEE_MODEL } = require("../lib/tradingFee");
 const {
   AUTO_CLOSE_FILL_RATIO,
   buildPartialTradeExitEvidence,
+  hasKnownOpenExitOrder,
   hasVerifiedPartialTradeExitEvidence,
 } = require("../lib/partialTradeExitClosure");
 
@@ -64,6 +65,13 @@ test("partial active exit cannot be treated as a completed close", () => {
   const result = buildPartialTradeExitEvidence({ trade, markPrice: "105", reason: "AUTO_FILL_THRESHOLD" });
   assert.equal(result.evidence, null);
   assert.equal(result.reason, "EXIT_ORDER_STILL_ACTIVE");
+});
+
+test("external-close reconciliation skips a known exit order Bybit still reports open", () => {
+  const trade = tradeWithExit({ status: "NEW", quantity: "0" });
+  assert.equal(hasKnownOpenExitOrder(trade.exitOrders, [{ orderId: "exit-1", status: "NEW" }]), true);
+  assert.equal(hasKnownOpenExitOrder(trade.exitOrders, [{ orderId: "other-order", status: "NEW" }]), false);
+  assert.equal(hasKnownOpenExitOrder(trade.exitOrders, [{ orderId: "exit-1", status: "CANCELED" }]), false);
 });
 
 test("canceled exit with zero or missing execution price cannot prove closure", () => {

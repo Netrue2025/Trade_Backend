@@ -48,7 +48,7 @@ loadEnvFile();
 const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUser, shouldUseMongo, isMongoAppStatePersistenceReady } = require("./lib/db");
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
-const { buildPartialTradeExitEvidence, isManualStopExitOrder } = require("./lib/partialTradeExitClosure");
+const { buildPartialTradeExitEvidence, isManualStopExitOrder, hasKnownOpenExitOrder } = require("./lib/partialTradeExitClosure");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
@@ -3128,6 +3128,9 @@ async function reconcileExternalClosuresForOwner(trade, ownerUser, accountInfo, 
     if (!userId) return [exitOrder.adminExecution?.orderId];
     return [(exitOrder.mirroredExecutions || []).find((mirror) => mirror.userId === userId)?.order?.orderId];
   }).filter(Boolean);
+  if (hasKnownOpenExitOrder(trade.exitOrders, openOrders, userId)) {
+    return false;
+  }
   const executionHistoryReader = getExchangeClient(exchange).getExecutionHistory;
   if (typeof executionHistoryReader !== "function") {
     console.error("EXTERNAL_CLOSE_RECONCILIATION_REVIEW_REQUIRED", { tradeId: trade.id, reason: "execution_history_unavailable" });
