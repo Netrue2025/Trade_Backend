@@ -49,6 +49,7 @@ const { loadDb, saveDb, setAuthoritativeDbProvider, ensureAdminUser, sanitizeUse
 const { financialIntegrity, createUserFinancialLock } = require("./lib/financialIntegrity");
 const { assessClosedTradeInvestmentRecovery } = require("./lib/tradeInvestmentRecovery");
 const { buildPartialTradeExitEvidence, isManualStopExitOrder, hasKnownOpenExitOrder } = require("./lib/partialTradeExitClosure");
+const { DUST_TRADE_CLOSE_SOURCE, buildDustTradeCloseEvidence } = require("./lib/dustTradeClose");
 const { reconstructExternalClose } = require("./lib/externalCloseRecovery");
 const { buildFilledTakeProfitCloseEvidence, diagnoseKnownExitClosure, reconstructKnownExitExecution, reconstructTradeScopedClose } = require("./lib/knownExitExecutionRecovery");
 const { isTradeQuarantined, isHistoricalTradeExcluded } = require("./lib/tradeQuarantine");
@@ -3760,7 +3761,7 @@ function buildClosedTradeLearningRecord(trade) {
 
   const entryPrice = getExecutionAveragePrice(trade.adminExecution) || Number(trade.price || 0);
   const exitExecutions = getFilledExitExecutions(trade);
-  const partialCloseEvidence = trade.authoritativeCloseEvidence?.source === "BYBIT_PARTIAL_EXIT_MARK_TO_MARKET"
+  const partialCloseEvidence = ["BYBIT_PARTIAL_EXIT_MARK_TO_MARKET", DUST_TRADE_CLOSE_SOURCE].includes(trade.authoritativeCloseEvidence?.source)
     ? trade.authoritativeCloseEvidence
     : null;
   const exitPrice = Number(partialCloseEvidence?.effectiveExitPrice)
@@ -4322,7 +4323,7 @@ function getAuthoritativeClosedTradePnlPercent(trade) {
     return null;
   }
   const entryPrice = getTradeEntryPriceSnapshot(trade);
-  const exitPrice = trade.authoritativeCloseEvidence?.source === "BYBIT_PARTIAL_EXIT_MARK_TO_MARKET"
+  const exitPrice = ["BYBIT_PARTIAL_EXIT_MARK_TO_MARKET", DUST_TRADE_CLOSE_SOURCE].includes(trade.authoritativeCloseEvidence?.source)
     ? Number(trade.authoritativeCloseEvidence.effectiveExitPrice)
     : getWeightedAverageExecutionPrice(getFilledExitExecutions(trade));
   const closeEvidenceVerified = hasVerifiedExchangeCloseEvidence(trade);
@@ -9808,6 +9809,142 @@ async function handleApi(req, res, url) {
       }
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "" });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/recovery/mina-dust-trade") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const body = await readBody(req);
+      const tradeId = "25d85206cb7b1c8f87268fbc";
+      const trade = db.tradeIntents.find((item) => item.id === tradeId);
+      if (!trade || String(trade.symbol || "").toUpperCase() !== "MINAUSDT") {
+        sendJson(res, 404, { error: "The specifically approved MINA trade was not found." });
+        return true;
+      }
+      if (!isCurrentGenerationTrade(trade) || getTradeExchange(trade) !== "bybit") {
+        sendJson(res, 409, { error: "This recovery only supports the current-generation Bybit MINAUSDT trade." });
+        return true;
+      }
+      const mode = String(body.mode || "dry-run").trim().toLowerCase();
+      if (!new Set(["dry-run", "execute"]).has(mode)) {
+        sendJson(res, 400, { error: "Mode must be dry-run or execute." });
+        return true;
+      }
+      if (mode === "execute" && body.confirmation !== "CLOSE_MINA_DUST_TRADE_25d85206cb7b1c8f87268fbc") {
+        sendJson(res, 400, { error: "Exact trade confirmation is required for execution." });
+        return true;
+      }
+      if (mode === "execute") assertTradingOperationAllowed();
+      if (tradeExitOperations.has(trade.id)) {
+        sendJson(res, 409, { error: "A close/reconciliation operation is already running for this trade." });
+        return true;
+      }
+
+      tradeExitOperations.add(trade.id);
+      try {
+        const exchange = getTradeExchange(trade);
+        const adminAccount = getExchangeAccount(admin, exchange);
+        if (!adminAccount || adminAccount.testnet) {
+          sendJson(res, 409, { error: "A connected Bybit mainnet admin account is required." });
+          return true;
+        }
+        const otherOpenTrade = db.tradeIntents.some((candidate) => (
+          candidate.id !== trade.id
+          && isCurrentGenerationTrade(candidate)
+          && getTradeExchange(candidate) === exchange
+          && String(candidate.symbol || "").toUpperCase() === "MINAUSDT"
+          && ["OPEN", "PENDING", "CLOSING"].includes(deriveTradeLifecycle(candidate))
+        ));
+        const activeMirroredPosition = hasActiveMirroredExecution(trade.mirroredExecutions);
+        const activeInvestments = ensureTradeInvestmentsState().filter((investment) => (
+          investment.tradeId === trade.id && investment.status === "ACTIVE"
+        ));
+        if (!activeInvestments.length) {
+          sendJson(res, 409, { error: "No active user investments remain on this trade." });
+          return true;
+        }
+        const accountInfo = await getAccountInfo({ ...adminAccount, exchange }, exchange);
+        const exchangeInfo = await getExchangeInfo(trade.symbol, adminAccount.testnet, exchange);
+        const openOrders = await getOpenOrders({ ...adminAccount, exchange }, exchange);
+        const ticker = await getTickerPrice(trade.symbol, adminAccount.testnet, exchange);
+        const baseAsset = getBaseAssetForSymbol(exchangeInfo, trade.symbol);
+        const quoteAsset = getQuoteAssetForSymbol(exchangeInfo, trade.symbol);
+        if (quoteAsset !== "USDT") {
+          sendJson(res, 409, { error: "Dust recovery requires a USDT-quoted market." });
+          return true;
+        }
+        const balance = (accountInfo.balances || []).find((item) => String(item.asset || "").toUpperCase() === baseAsset) || {};
+        const freeBalance = Number(balance.free || 0);
+        const lockedBalance = Number(balance.locked || 0);
+        if (lockedBalance > 0) {
+          sendJson(res, 409, { error: "MINA remains locked on Bybit; cancel/resolve the open order before retrying.", freeBalance, lockedBalance });
+          return true;
+        }
+        const price = Number(ticker.price || 0);
+        const snapshot = buildDustTradeCloseEvidence({
+          trade,
+          balanceQuantity: freeBalance,
+          markPrice: price,
+          thresholdUsd: 10,
+          openOrders,
+          hasOtherOpenTrade: otherOpenTrade,
+        });
+        const lifecycle = deriveTradeLifecycle(trade);
+        const blocker = snapshot.reason
+          || (activeMirroredPosition ? "MIRRORED_EXCHANGE_POSITIONS_REQUIRE_SEPARATE_CLOSE" : null)
+          || (lifecycle !== "OPEN" ? `TRADE_NOT_OPEN:${lifecycle}` : null);
+        if (mode === "dry-run" || blocker) {
+          sendJson(res, blocker ? 409 : 200, {
+            mode,
+            tradeId: trade.id,
+            symbol: trade.symbol,
+            status: lifecycle,
+            baseAsset,
+            freeBalance,
+            lockedBalance,
+            markPrice: price,
+            balanceValueUsd: freeBalance * price,
+            activeInvestmentCount: activeInvestments.length,
+            safeToExecute: !blocker && !!snapshot.evidence,
+            blocker,
+            financialWrites: 0,
+          });
+          return true;
+        }
+        if (body.confirmation !== "CLOSE_MINA_DUST_TRADE_25d85206cb7b1c8f87268fbc") {
+          sendJson(res, 400, { error: "Exact trade confirmation is required for execution." });
+          return true;
+        }
+        trade.authoritativeCloseEvidence = { ...snapshot.evidence, source: DUST_TRADE_CLOSE_SOURCE };
+        trade.closedAt = nowIso();
+        trade.closeReason = "BYBIT_DUST_BALANCE_MARK_TO_MARKET";
+        await persist({ required: true, fields: ["tradeIntents"] });
+        const settled = await settleClosedTradeInvestments(trade, {
+          reason: "BYBIT_DUST_BALANCE_MARK_TO_MARKET",
+          description: "MINAUSDT closed at verified market value; remaining Bybit balance was below the $10 dust threshold.",
+          createdBy: admin.id,
+        });
+        sendJson(res, 200, {
+          mode,
+          status: "CLOSED",
+          tradeId: trade.id,
+          symbol: trade.symbol,
+          activeInvestmentCount: activeInvestments.length,
+          settledInvestmentCount: settled.filter((investment) => investment?.status === "STOPPED").length,
+          settlementReferences: activeInvestments.map((investment) => `trade-settlement:${investment.id}`),
+          markPrice: price,
+          exchangeDustQuantity: freeBalance,
+          exchangeDustValueUsd: freeBalance * price,
+          closeEvidence: DUST_TRADE_CLOSE_SOURCE,
+        });
+      } finally {
+        tradeExitOperations.delete(trade.id);
+      }
+    } catch (error) {
+      sendJson(res, error.statusCode || 409, { error: error.message, code: error.code || "MINA_DUST_RECOVERY_BLOCKED" });
     }
     return true;
   }
