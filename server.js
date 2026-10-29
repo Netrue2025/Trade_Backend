@@ -2807,6 +2807,17 @@ function getTradeFilledEntryQuantity(trade, userId = null) {
   return getExecutionFilledQty(entryExecution);
 }
 
+function getTradeAdminUsdtAmount(trade) {
+  const execution = trade?.adminExecution || {};
+  const amount = String(trade?.quoteOrderQty || execution.cummulativeQuoteQty || "").trim();
+  if (amount && compare(amount, "0") > 0) {
+    return amount;
+  }
+  const quantity = String(execution.executedQty || "0");
+  const price = String(getExecutionAveragePrice(execution) || trade?.price || "0");
+  return multiplyRatio(quantity, price, "1");
+}
+
 function getTradeExitedQuantity(trade, userId = null) {
   return (trade.exitOrders || []).reduce((sum, exitOrder) => {
     const execution = getExitExecutionForTrade(trade, exitOrder, userId);
@@ -4091,9 +4102,10 @@ function getFreeTradeJoinBalanceUsdt(userId) {
   return compare(freeUsdt, "0") > 0 ? freeUsdt : "0";
 }
 
-function resolveTradeInvestmentAmount(userId) {
+function resolveTradeInvestmentAmount(userId, body = {}) {
   const freeUsdt = getFreeTradeJoinBalanceUsdt(userId);
-  return { amountUsdt: freeUsdt, freeUsdt };
+  const rawAmount = String(body.amountUsdt ?? body.amount ?? "").replace(/,/g, "").trim();
+  return { amountUsdt: rawAmount || freeUsdt, freeUsdt };
 }
 
 function getMinimumTradeJoinUsdt() {
@@ -9613,6 +9625,7 @@ async function handleApi(req, res, url) {
     }
     tradeJoinRequests.add(user.id);
     try {
+      const body = await readBody(req);
       const trade = db.tradeIntents.find((item) => item.id === decodeURIComponent(joinTradeMatch[1] || ""));
       if (!trade) {
         sendJson(res, 404, { error: "Trade not found." });
@@ -9639,7 +9652,14 @@ async function handleApi(req, res, url) {
         if (getUserTradeInvestmentRecord(trade.id, user.id)) {
           throw new Error("You already joined this trade and cannot join it again.");
         }
-        const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id);
+        const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id, body);
+        const maxJoinAmountUsdt = getTradeAdminUsdtAmount(trade);
+        if (compare(amountUsdt, maxJoinAmountUsdt) > 0) {
+          const error = new Error("Sorry, you cannot join this trade with an amount higher than the admin's trade amount. Please reduce your amount to join.");
+          error.code = "TRADE_JOIN_AMOUNT_EXCEEDS_ADMIN_TRADE";
+          error.maxJoinAmountUsdt = maxJoinAmountUsdt;
+          throw error;
+        }
         validateTradeJoinAmount(amountUsdt, freeUsdt);
         const membershipAtJoin = financialService.assertMembershipTradeJoinAllowed(user);
         const investmentId = randomId(12);
@@ -9665,7 +9685,12 @@ async function handleApi(req, res, url) {
       });
       sendJson(res, 201, { investment: serializeTradeInvestment(investment), trade: serializeTradeForUser(trade, user.id), membership: financialService.getMembershipSummary(user) });
     } catch (error) {
-      sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "", ...(error.membership || {}) });
+      sendJson(res, error.statusCode || 400, {
+        error: error.message,
+        code: error.code || "",
+        ...(error.maxJoinAmountUsdt ? { maxJoinAmountUsdt: error.maxJoinAmountUsdt } : {}),
+        ...(error.membership || {}),
+      });
     } finally {
       tradeJoinRequests.delete(user.id);
     }
