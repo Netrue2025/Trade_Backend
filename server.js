@@ -9735,9 +9735,6 @@ async function handleApi(req, res, url) {
                 if (investment) {
                   return true;
                 }
-                if ((trade.mirroredExecutions || []).some((row) => row.userId === user.id)) {
-                  return true;
-                }
                 return !!trade.copyPlan;
               }
             )
