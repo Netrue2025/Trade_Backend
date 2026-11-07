@@ -19,7 +19,7 @@ const DEFAULT_SYMBOLS = [
   "TONUSDT",
   "LINKUSDT",
   "AVAXUSDT",
-  "SHIBUSDT",
+  "ARBUSDT",
   "DOTUSDT",
   "LTCUSDT",
   "BCHUSDT",
@@ -27,7 +27,7 @@ const DEFAULT_SYMBOLS = [
   "ATOMUSDT",
   "NEARUSDT",
   "APTUSDT",
-  "PEPEUSDT",
+  "ETCUSDT",
 ];
 
 const STRATEGY_EVALUATORS = [

@@ -4520,7 +4520,12 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     const grossPnlUsdt = multiplyRatio(currentInvestment.amountUsdt || "0", grossPnlPercent, "100");
 
     const balanceBefore = financialService.getAvailableUsdtEquivalent(user.id);
-    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, grossPnlUsdt);
+    const settlement = releaseTradeInvestmentFunds(user, currentInvestment, configuredPlan ? "0" : grossPnlUsdt);
+    if (configuredPlan && !userStop) {
+      user.earningsBalances = user.earningsBalances || { tradingInterest: { NGN: "0", USDT: "0" }, referral: { NGN: "0", USDT: "0" } };
+      user.earningsBalances.tradingInterest = user.earningsBalances.tradingInterest || { NGN: "0", USDT: "0" };
+      user.earningsBalances.tradingInterest.USDT = add(user.earningsBalances.tradingInterest.USDT || "0", grossPnlUsdt);
+    }
     const settledPnlUsdt = grossPnlUsdt;
     const touchedWallets = settlement.releasedSources.map((source) => financialService.ensureWallet(user.id, source.currency));
     if (!touchedWallets.length) touchedWallets.push(financialService.ensureWallet(user.id, "USDT"));
@@ -4545,7 +4550,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     });
     await persist({
       required: true,
-      fields: ["meta", "tradeInvestments", "wallets", "transactions"],
+      fields: ["meta", "tradeInvestments", "wallets", "transactions", "users"],
       operation: { reason: "TRADE_SETTLEMENT", reference: settlementReference, userId: user.id },
     });
     financialService.createNotification({ userId: user.id, type: "TRADE", title: "Trade settled", message: `${trade?.symbol || "Trade"} settled: ${compare(settledPnlUsdt, "0") >= 0 ? "+" : "-"}${toMoneyDecimal(Math.abs(Number(settledPnlUsdt || 0)))} USDT.`, entityType: "Trade", entityId: currentInvestment.tradeId });
@@ -10095,19 +10100,8 @@ async function handleApi(req, res, url) {
 
     try {
       const body = await readBody(req);
-      const profitPercent = Number(body.copyProfitPercent);
-      const durationHours = Number(body.copyDurationHours);
-      if (!Number.isFinite(profitPercent) || profitPercent < 0.01 || profitPercent > 1000) {
-        throw new Error("Set a copied trade profit between 0.01% and 1000%.");
-      }
-      if (!Number.isFinite(durationHours) || durationHours < 1 / 60 || durationHours > 8760) {
-        throw new Error("Set a copied trade duration between 1 minute and 365 days.");
-      }
       const orderInput = normalizeOrderInput(body);
-      const { trade } = await createTradeIntent(admin, exchange, orderInput, {
-        throwOnTpFailure: true,
-        copyPlan: { profitPercent, durationHours },
-      });
+      const { trade } = await createTradeIntent(admin, exchange, orderInput, { throwOnTpFailure: true });
       sendJson(res, 201, { trade: serializeTradeForAdmin(trade) });
     } catch (error) {
       sendJson(res, 400, { error: error.message });

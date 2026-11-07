@@ -1294,10 +1294,11 @@ class FinancialService {
       return false;
     }
     const rewardAmount = compare(maxEarnings, "0") > 0 ? minAmount(settings.bonusAmountNgn, remainingCap) : settings.bonusAmountNgn;
-    const wallet = this.ensureWallet(referral.referrerUserId, "NGN");
-    const balanceBefore = wallet.availableBalance;
-    wallet.availableBalance = add(wallet.availableBalance, rewardAmount);
-    wallet.updatedAt = this.clock();
+    const referrer = this.db.users.find((item) => item.id === referral.referrerUserId);
+    referrer.earningsBalances = referrer.earningsBalances || { tradingInterest: { NGN: "0", USDT: "0" }, referral: { NGN: "0", USDT: "0" } };
+    referrer.earningsBalances.referral = referrer.earningsBalances.referral || { NGN: "0", USDT: "0" };
+    const balanceBefore = referrer.earningsBalances.referral.NGN || "0";
+    referrer.earningsBalances.referral.NGN = add(balanceBefore, rewardAmount);
     this.clearUserPnlLots(referral.referrerUserId);
 
     const transaction = {
@@ -1307,7 +1308,7 @@ class FinancialService {
       currency: "NGN",
       amount: rewardAmount,
       balanceBefore,
-      balanceAfter: wallet.availableBalance,
+      balanceAfter: referrer.earningsBalances.referral.NGN,
       reference: referral.rewardReference,
       status: "SUCCESSFUL",
       description: "Referral Bonus",
@@ -3017,6 +3018,7 @@ class FinancialService {
       bankAccount: this.enrichBankAccountForUser(user, user.bankAccount || null),
       bankAccounts: clone(user.bankAccounts || []).map((account) => this.enrichBankAccountForUser(user, account)),
       wallets,
+      earningsBalances: clone(user.earningsBalances || { tradingInterest: { NGN: "0", USDT: "0" }, referral: { NGN: "0", USDT: "0" } }),
       totalBalance: {
         usdt: availableUsdtEquivalent,
         ngnEquivalent: totalNgnEquivalent,
