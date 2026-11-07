@@ -1334,7 +1334,7 @@ class FinancialService {
       userId: referral.referrerUserId,
       type: "REFERRAL",
       title: "Referral Bonus",
-      message: `${rewardAmount} NGN has been added to your wallet.`,
+      message: `${rewardAmount} NGN has been added to your referral earnings balance.`,
       entityType: "Referral",
       entityId: referral.id,
       route: "/?tab=referral",
@@ -3193,58 +3193,12 @@ class FinancialService {
   }
 
   settleCurrentUserPnl(userId, mirror = {}) {
-    const rate = this.db.systemSettings.exchangeRate.usdtToNgn;
-    const baseUsdt = this.getAvailableUsdtEquivalent(userId, rate);
-    const baselineCreated = this.ensurePnlBaselineForBalance(userId, baseUsdt, rate, mirror);
-    const daySettlement = this.settleUserPnlLotsForMirror(userId, mirror);
-    const pnlUsdt = this.calculatePnlLotsAtMirror(userId, mirror);
-    if (compare(pnlUsdt, "0") !== 0) {
-      const wallet = this.ensureWallet(userId, "USDT");
-      wallet.availableBalance = add(wallet.availableBalance, pnlUsdt);
-      wallet.updatedAt = this.clock();
-    }
-    this.resetPnlLotsToCurrentBalance(userId, mirror, { source: "PNL_SETTLED" });
-    return {
-      pnlUsdt,
-      changed: baselineCreated || daySettlement.changed || compare(pnlUsdt, "0") !== 0,
-    };
+    return { pnlUsdt: "0", changed: false };
   }
 
   settleUserPnlLotsForMirror(userId, mirror = {}) {
     const lots = this.getUserPnlLots(userId);
-    const percentage = this.getMirrorPnlPercentage(mirror);
-    const dayKey = this.getMirrorDayKey(mirror);
-    let settledUsdt = "0";
-    let changed = false;
-
-    for (const lot of lots) {
-      lot.principalUsdt = toDecimalText(lot.principalUsdt || "0");
-      lot.baselinePercent = toDecimalText(lot.baselinePercent ?? percentage);
-      lot.lastMirrorPercent = toDecimalText(lot.lastMirrorPercent ?? lot.baselinePercent);
-      lot.dayKey = String(lot.dayKey || dayKey).slice(0, 10);
-
-      if (lot.dayKey !== dayKey) {
-        const previousDelta = subtract(lot.lastMirrorPercent, lot.baselinePercent);
-        const lotPnlUsdt = multiplyRatio(lot.principalUsdt, previousDelta, "100");
-        if (compare(lotPnlUsdt, "0") !== 0) {
-          settledUsdt = add(settledUsdt, lotPnlUsdt);
-          lot.principalUsdt = add(lot.principalUsdt, lotPnlUsdt);
-        }
-        lot.baselinePercent = percentage;
-        lot.lastMirrorPercent = percentage;
-        lot.dayKey = dayKey;
-        changed = true;
-      }
-    }
-
-    if (compare(settledUsdt, "0") !== 0) {
-      const wallet = this.ensureWallet(userId, "USDT");
-      wallet.availableBalance = add(wallet.availableBalance, settledUsdt);
-      wallet.updatedAt = this.clock();
-      changed = true;
-    }
-
-    return { lots, changed, settledUsdt };
+    return { lots, changed: false, settledUsdt: "0" };
   }
 
   calculateUserMirroredPnl(userId, baseUsdt, rate, mirror = {}) {

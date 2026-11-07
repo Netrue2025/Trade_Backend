@@ -4439,6 +4439,40 @@ async function settleExpiredConfiguredTradeInvestments() {
       console.error(`Configured trade settlement failed for ${investment.id}:`, error.message || error);
     }
   }
+  await settleExpiredCopyPlanInvestments(now);
+}
+
+function serializeCopyPlan(plan, userId = "") {
+  const investment = userId ? (db.tradeInvestments || []).find((item) => item.copyPlanId === plan.id && item.userId === userId) : null;
+  const scheduledAtMs = Date.parse(plan.scheduledAt || "");
+  const endsAtMs = Date.parse(plan.endsAt || "");
+  const status = plan.status === "CANCELED" ? "CANCELED" : Date.now() < scheduledAtMs ? "SCHEDULED" : Date.now() >= endsAtMs ? "COMPLETED" : "OPEN";
+  return { ...plan, status, userInvestment: investment ? serializeTradeInvestment(investment) : null };
+}
+
+async function settleExpiredCopyPlanInvestments(now = Date.now()) {
+  for (const investment of (db.tradeInvestments || []).filter((item) => item.status === "ACTIVE" && item.copyPlanId && Date.parse(item.expiresAt || "") <= now)) {
+    const plan = (db.copyPlans || []).find((item) => item.id === investment.copyPlanId);
+    const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
+    if (!plan || !user || plan.status === "CANCELED") continue;
+    await withUserFinancialLock(user.id, async () => {
+      if (investment.status !== "ACTIVE") return;
+      const ref = `copy-plan-settlement:${investment.id}`;
+      if (db.transactions.some((item) => item.reference === ref)) return;
+      const pnlUsdt = multiplyRatio(investment.amountUsdt || "0", String(Number(plan.profitPercent)), "100");
+      const released = releaseTradeInvestmentFunds(user, investment, "0");
+      user.earningsBalances = user.earningsBalances || { tradingInterest: { NGN: "0", USDT: "0" }, referral: { NGN: "0", USDT: "0" } };
+      user.earningsBalances.tradingInterest = user.earningsBalances.tradingInterest || { NGN: "0", USDT: "0" };
+      user.earningsBalances.tradingInterest.USDT = add(user.earningsBalances.tradingInterest.USDT || "0", pnlUsdt);
+      investment.status = "COMPLETED";
+      investment.settledPnlUsdt = pnlUsdt;
+      investment.updatedAt = nowIso();
+      const balance = financialService.getAvailableUsdtEquivalent(user.id);
+      db.transactions.unshift({ id: randomId(12), userId: user.id, type: "TRADING_PROFIT", currency: "USDT", amount: pnlUsdt, balanceBefore: balance, balanceAfter: balance, reference: ref, status: "APPROVED", description: `${plan.symbol} scheduled copy plan completed.`, createdBy: "system", createdAt: nowIso(), metadata: { copyPlanId: plan.id, investmentId: investment.id, profitPercent: plan.profitPercent, earningsBalance: "TRADING_INTEREST" } });
+      await persist({ required: true, fields: ["meta", "copyPlans", "tradeInvestments", "wallets", "transactions", "users"], operation: { reason: "COPY_PLAN_SETTLEMENT", reference: ref, userId: user.id } });
+      void released;
+    }).catch((error) => console.error(`Copy plan settlement failed for ${investment.id}:`, error.message || error));
+  }
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
@@ -9620,6 +9654,68 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/copy-plans") {
+    const viewer = requireAuth(req, res);
+    if (!viewer) return true;
+    const plans = (db.copyPlans || []).filter((plan) => viewer.role === "admin" || plan.status !== "CANCELED").map((plan) => serializeCopyPlan(plan, viewer.id));
+    sendJson(res, 200, { plans });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/admin/copy-plans") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    try {
+      const body = await readBody(req);
+      const symbol = String(body.symbol || "").trim().toUpperCase();
+      const profitPercent = Number(body.profitPercent);
+      const durationHours = Number(body.durationHours);
+      const scheduledAt = new Date(body.scheduledAt || "").toISOString();
+      const allowedPairs = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "TRXUSDT", "TONUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "LTCUSDT", "BCHUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "ETCUSDT"];
+      if (!allowedPairs.includes(symbol)) throw new Error("Choose one of the 20 supported strategy pairs.");
+      if (!Number.isFinite(profitPercent) || profitPercent < 0.01 || profitPercent > 1000) throw new Error("Profit must be between 0.01% and 1000%.");
+      if (!Number.isFinite(durationHours) || durationHours < 1 / 60 || durationHours > 8760) throw new Error("Timeframe must be between 1 minute and 365 days.");
+      if (!Number.isFinite(Date.parse(scheduledAt))) throw new Error("Choose a valid schedule time.");
+      const plan = { id: randomId(12), symbol, profitPercent: String(Number(profitPercent.toFixed(4))), durationHours, scheduledAt, endsAt: new Date(Date.parse(scheduledAt) + durationHours * 3600000).toISOString(), status: "ACTIVE", createdByUserId: admin.id, createdAt: nowIso() };
+      db.copyPlans.unshift(plan);
+      await persist({ required: true, fields: ["meta", "copyPlans"], operation: { reason: "COPY_PLAN_CREATED", reference: plan.id, userId: admin.id } });
+      sendJson(res, 201, { plan: serializeCopyPlan(plan) });
+    } catch (error) { sendJson(res, 400, { error: error.message }); }
+    return true;
+  }
+
+  const copyPlanJoinMatch = url.pathname.match(/^\/api\/copy-plans\/([^/]+)\/join$/);
+  if (req.method === "POST" && copyPlanJoinMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try { assertTradingOperationAllowed(); } catch (error) { sendJson(res, error.statusCode || 503, { error: error.message, code: error.code || "" }); return true; }
+    try {
+      const body = await readBody(req);
+      const plan = (db.copyPlans || []).find((item) => item.id === decodeURIComponent(copyPlanJoinMatch[1] || ""));
+      if (!plan || plan.status === "CANCELED") { sendJson(res, 404, { error: "Copy plan not found or unavailable." }); return true; }
+      const now = Date.now();
+      if (now < Date.parse(plan.scheduledAt)) { sendJson(res, 409, { error: "This copy plan is scheduled to open later.", code: "COPY_PLAN_NOT_OPEN" }); return true; }
+      if (now >= Date.parse(plan.endsAt)) { sendJson(res, 409, { error: "This copy plan has ended.", code: "COPY_PLAN_CLOSED" }); return true; }
+      if ((db.tradeInvestments || []).some((item) => item.copyPlanId === plan.id && item.userId === user.id)) { sendJson(res, 409, { error: "You already joined this copy plan." }); return true; }
+      const investment = await withUserFinancialLock(user.id, async () => {
+        if ((db.tradeInvestments || []).some((item) => item.copyPlanId === plan.id && item.userId === user.id)) throw new Error("You already joined this copy plan.");
+        const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id, body);
+        validateTradeJoinAmount(amountUsdt, freeUsdt);
+        const membership = financialService.assertMembershipTradeJoinAllowed(user);
+        const id = randomId(12);
+        const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, id);
+        markFinancialMutation(fundingSources.map((source) => financialService.ensureWallet(user.id, source.currency)), "COPY_PLAN_JOIN", id);
+        const next = { id, userId: user.id, tradeId: plan.id, copyPlanId: plan.id, amountUsdt, fundingSources, profitPercent: plan.profitPercent, durationHours: plan.durationHours, expiresAt: plan.endsAt, status: "ACTIVE", joinedAt: nowIso(), updatedAt: nowIso(), settledPnlUsdt: "0", membershipAtJoin: membership.plan };
+        db.tradeInvestments.unshift(next);
+        financialService.evaluateReferralQualification(user.id, getRequestMeta(req));
+        await persist({ required: true, fields: ["meta", "copyPlans", "tradeInvestments", "wallets", "transactions", "referrals", "users"], operation: { reason: "COPY_PLAN_JOIN", reference: id, userId: user.id } });
+        return next;
+      });
+      sendJson(res, 201, { investment: serializeTradeInvestment(investment), plan: serializeCopyPlan(plan, user.id), membership: financialService.getMembershipSummary(user) });
+    } catch (error) { sendJson(res, error.statusCode || 400, { error: error.message, code: error.code || "", ...(error.membership || {}) }); }
+    return true;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/trades") {
     const user = requireAuth(req, res);
     if (!user) {
@@ -9642,7 +9738,7 @@ async function handleApi(req, res, url) {
                 if ((trade.mirroredExecutions || []).some((row) => row.userId === user.id)) {
                   return true;
                 }
-                return !!trade.copyPlan || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
+                return !!trade.copyPlan;
               }
             )
             .map((trade) => serializeTradeForUser(trade, user.id));
@@ -9676,6 +9772,10 @@ async function handleApi(req, res, url) {
       }
       if (!isCurrentGenerationTrade(trade)) {
         sendJson(res, 409, { error: "Historical trades are read-only and cannot accept joins.", code: "HISTORICAL_TRADE_READ_ONLY" });
+        return true;
+      }
+      if (!trade.copyPlan) {
+        sendJson(res, 409, { error: "This is a live admin trade. Join a separately configured copy plan instead.", code: "TRADE_NOT_COPYABLE" });
         return true;
       }
       if (isTradeQuarantined(db, trade)) {
