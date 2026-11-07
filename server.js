@@ -3925,7 +3925,7 @@ function serializeTradeForUser(trade, userId) {
   const mirror = (trade.mirroredExecutions || []).find((item) => item.userId === userId);
   const investment = getUserTradeInvestmentRecord(trade.id, userId);
   const quarantined = isTradeQuarantined(db, trade);
-  const lifecycleStatus = quarantined ? "QUARANTINED" : !isCurrentGenerationTrade(trade) ? "HISTORICAL" : investment?.status === "STOPPED" ? "CANCELED" : deriveTradeLifecycle(trade);
+  const lifecycleStatus = quarantined ? "QUARANTINED" : !isCurrentGenerationTrade(trade) ? "HISTORICAL" : investment?.status === "STOPPED" ? "CANCELED" : investment?.status === "COMPLETED" ? "CLOSED" : investment?.status === "ACTIVE" || (!investment && trade.copyPlan) ? "OPEN" : deriveTradeLifecycle(trade);
   const exits = (trade.exitOrders || []).map((item) => ({
     ...item,
     mirroredExecution: (item.mirroredExecutions || []).find((row) => row.userId === userId) || null,
@@ -3949,6 +3949,7 @@ function serializeTradeForUser(trade, userId) {
     adminExecution: trade.adminExecution,
     mirroredExecution: mirror || null,
     userInvestment: investment ? serializeTradeInvestment(investment) : null,
+    copyPlan: trade.copyPlan || null,
     exitOrders: exits,
   };
 }
@@ -3979,6 +3980,7 @@ function projectLiveTrade(trade, user) {
     stopLossTargetPrice: source.stopLossTargetPrice,
     lifecycleStatus: source.lifecycleStatus,
     actualLifecycleStatus: source.actualLifecycleStatus,
+    copyPlan: source.copyPlan || null,
     adminExecution: source.adminExecution ? {
       status: source.adminExecution.status,
       orderId: source.adminExecution.orderId,
@@ -4003,10 +4005,10 @@ function buildLiveState(user) {
   const visibleTrades = (db.tradeIntents || []).filter((trade) => {
     if (!isCurrentGenerationTrade(trade)) return false;
     const lifecycle = deriveTradeLifecycle(trade);
-    if (!['OPEN', 'PENDING'].includes(lifecycle)) return false;
-    if (user.role === "admin") return true;
+    if (user.role === "admin") return ['OPEN', 'PENDING'].includes(lifecycle);
+    if (!['OPEN', 'PENDING'].includes(lifecycle) && !trade.copyPlan) return false;
     const investment = getUserTradeInvestmentRecord(trade.id, user.id);
-    return investment?.status !== "STOPPED" && (lifecycle === "OPEN" || trade.side === "BUY");
+    return investment?.status !== "STOPPED" && (trade.copyPlan || lifecycle === "OPEN" || trade.side === "BUY");
   });
   const projected = visibleTrades.map((trade) => projectLiveTrade(trade, user));
   return {
@@ -4052,6 +4054,9 @@ function serializeTradeInvestment(investment) {
     settledPnlUsdt: investment.settledPnlUsdt || "0",
     membershipAtJoin: investment.membershipAtJoin || "BASIC",
     fundingSources: getInvestmentFundingSources(investment),
+    profitPercent: investment.profitPercent || null,
+    durationHours: investment.durationHours || null,
+    expiresAt: investment.expiresAt || null,
   };
 }
 
@@ -4358,11 +4363,15 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
 
   for (const investment of activeInvestments) {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
-    if (!trade || !["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade))) {
+    if (!trade) {
       continue;
     }
-    const currentPnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
-    const pnlDeltaPercent = currentPnlPercent - Number(investment.baselinePnlPercent || 0);
+    const currentPnlPercent = investment.profitPercent != null
+      ? (Date.parse(investment.expiresAt || "") <= Date.now() ? Number(investment.profitPercent) : 0)
+      : await getTradePnlPercentSnapshot(trade, marketCache);
+    const pnlDeltaPercent = investment.profitPercent != null
+      ? currentPnlPercent
+      : currentPnlPercent - Number(investment.baselinePnlPercent || 0);
     const investmentPnlUsdt = multiplyRatio(investment.amountUsdt || "0", toMoneyDecimal(pnlDeltaPercent), "100");
     pnlUsdt = add(pnlUsdt, investmentPnlUsdt);
     enriched.push({
@@ -4406,8 +4415,30 @@ async function buildUserTradeInvestmentSummary(user, marketCache = new Map()) {
 function getWithdrawalBlockingTradeInvestments(userId) {
   return getActiveUserTradeInvestments(userId).filter((investment) => {
     const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (investment.profitPercent != null && Date.parse(investment.expiresAt || "") > Date.now()) return !!trade;
     return !!trade && !isTradeQuarantined(db, trade) && ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
   });
+}
+
+async function settleExpiredConfiguredTradeInvestments() {
+  const now = Date.now();
+  const active = ensureTradeInvestmentsState().filter((investment) => investment.status === "ACTIVE").filter(
+    (investment) => investment.profitPercent != null && Date.parse(investment.expiresAt || "") <= now
+  );
+  for (const investment of active) {
+    const user = db.users.find((item) => item.id === investment.userId && item.role === "user");
+    const trade = db.tradeIntents.find((item) => item.id === investment.tradeId);
+    if (!user || !isCurrentGenerationTrade(trade) || isTradeQuarantined(db, trade)) continue;
+    try {
+      await settleTradeInvestment(user, investment, trade, new Map(), {
+        reason: "CONFIGURED_PLAN_EXPIRED",
+        description: `${trade.symbol} configured copy plan completed.`,
+        createdBy: "system",
+      });
+    } catch (error) {
+      console.error(`Configured trade settlement failed for ${investment.id}:`, error.message || error);
+    }
+  }
 }
 
 async function settleTradeInvestment(user, investment, trade, marketCache = new Map(), options = {}) {
@@ -4440,15 +4471,20 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
 
     const userStop = options.reason === "USER_STOPPED";
     const lifecycle = deriveTradeLifecycle(trade);
-    if (userStop && !["OPEN", "CLOSED"].includes(lifecycle)) {
+    const configuredPlan = currentInvestment.profitPercent != null && currentInvestment.expiresAt;
+    const planExpired = configuredPlan && Date.parse(currentInvestment.expiresAt) <= Date.now();
+    if (configuredPlan && !userStop && !planExpired) return currentInvestment;
+    if (userStop && !configuredPlan && !["OPEN", "CLOSED"].includes(lifecycle)) {
       const error = new Error("This trade is changing state. Please retry after it finishes opening or closing.");
       error.code = "TRADE_STOP_STATE_UNAVAILABLE";
       error.statusCode = 409;
       throw error;
     }
-    let pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
+    let pnlPercent = configuredPlan
+      ? (userStop ? 0 : Number(currentInvestment.profitPercent))
+      : getAuthoritativeClosedTradePnlPercent(trade);
     let stopMarkPrice = null;
-    if (userStop && lifecycle === "OPEN") {
+    if (!configuredPlan && userStop && lifecycle === "OPEN") {
       const admin = db.users.find((item) => item.id === trade.createdByUserId) || db.users.find((item) => item.role === "admin");
       const exchange = getTradeExchange(trade);
       const adminAccount = getExchangeAccount(admin, exchange);
@@ -4467,7 +4503,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
         pnlPercent = getAuthoritativeClosedTradePnlPercent(trade);
       }
     }
-    if (userStop && !stopMarkPrice && deriveTradeLifecycle(trade) !== "CLOSED") {
+    if (!configuredPlan && userStop && !stopMarkPrice && deriveTradeLifecycle(trade) !== "CLOSED") {
       const error = new Error("This trade is changing state. Please retry after it finishes closing.");
       error.code = "TRADE_STOP_STATE_UNAVAILABLE";
       error.statusCode = 409;
@@ -4490,7 +4526,7 @@ async function settleTradeInvestment(user, investment, trade, marketCache = new 
     if (!touchedWallets.length) touchedWallets.push(financialService.ensureWallet(user.id, "USDT"));
     markFinancialMutation(touchedWallets, "TRADE_SETTLEMENT", settlementReference);
     const balanceAfter = financialService.getAvailableUsdtEquivalent(user.id);
-    currentInvestment.status = "STOPPED";
+    currentInvestment.status = configuredPlan && !userStop ? "COMPLETED" : "STOPPED";
     currentInvestment.stoppedAt = nowIso();
     currentInvestment.updatedAt = currentInvestment.stoppedAt;
     currentInvestment.stopPnlPercent = String(Number(pnlPercent.toFixed(8)));
@@ -5363,6 +5399,7 @@ async function createTradeIntent(admin, exchange, orderInput, options = {}) {
     exitOrders: [],
     settlementFeeModel: CURRENT_TRADE_FEE_MODEL,
     strategyContext: options.strategyContext || null,
+    copyPlan: options.copyPlan || null,
   };
 
   db.tradeIntents.unshift(trade);
@@ -9302,14 +9339,14 @@ async function handleApi(req, res, url) {
         sendJson(res, 409, { error: "Historical trades are read-only and cannot accept joins.", code: "HISTORICAL_TRADE_READ_ONLY" });
         return true;
       }
-      if (deriveTradeLifecycle(trade) !== "OPEN") {
+      if (!trade.copyPlan && deriveTradeLifecycle(trade) !== "OPEN") {
         sendJson(res, 400, { error: "This order is still queued. Users can only join filled open trades." });
         return true;
       }
-      await assertTradeCanAcceptInvestment(trade);
+      if (!trade.copyPlan) await assertTradeCanAcceptInvestment(trade);
       const marketCache = new Map();
-      const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
-      const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
+      const baselinePnlPercent = trade.copyPlan ? 0 : await getTradePnlPercentSnapshot(trade, marketCache);
+      const baselinePrice = trade.copyPlan ? 0 : await getTradeCurrentPriceSnapshot(trade, marketCache);
       const investment = await withUserFinancialLock(targetUser.id, async () => {
         if (getUserTradeInvestmentRecord(trade.id, targetUser.id)) throw new Error("User already joined this trade and cannot join it again.");
         const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(targetUser.id);
@@ -9318,7 +9355,8 @@ async function handleApi(req, res, url) {
         const investmentId = randomId(12);
         const fundingSources = reserveTradeInvestmentFunds(targetUser, amountUsdt, investmentId, admin.id);
         markFinancialMutation(fundingSources.map((source) => financialService.ensureWallet(targetUser.id, source.currency)), "ADMIN_TRADE_JOIN", investmentId);
-        const nextInvestment = { id: investmentId, userId: targetUser.id, tradeId: trade.id, amountUsdt, fundingSources, baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))), baselinePrice: String(Number(baselinePrice || 0).toFixed(8)), status: "ACTIVE", joinedAt: nowIso(), updatedAt: nowIso(), stoppedAt: null, settledPnlUsdt: "0", joinedBy: admin.id, membershipAtJoin: membershipAtJoin.plan };
+        const durationHours = Number(trade.copyPlan?.durationHours || 0);
+        const nextInvestment = { id: investmentId, userId: targetUser.id, tradeId: trade.id, amountUsdt, fundingSources, baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))), baselinePrice: String(Number(baselinePrice || 0).toFixed(8)), ...(trade.copyPlan ? { profitPercent: String(Number(trade.copyPlan.profitPercent)), durationHours, expiresAt: new Date(Date.now() + durationHours * 3600000).toISOString() } : {}), status: "ACTIVE", joinedAt: nowIso(), updatedAt: nowIso(), stoppedAt: null, settledPnlUsdt: "0", joinedBy: admin.id, membershipAtJoin: membershipAtJoin.plan };
         ensureTradeInvestmentsState().unshift(nextInvestment);
         financialService.createNotification({ userId: targetUser.id, type: "TRADE", title: "Trade joined", message: `Admin added you to ${trade.symbol}.`, entityType: "Trade", entityId: trade.id, category: "tradingSignals", route: `/?tab=signals&trade=${encodeURIComponent(trade.id)}` });
         financialService.notifyAdminTradeJoined(targetUser, nextInvestment, trade);
@@ -9599,7 +9637,7 @@ async function handleApi(req, res, url) {
                 if ((trade.mirroredExecutions || []).some((row) => row.userId === user.id)) {
                   return true;
                 }
-                return ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
+                return !!trade.copyPlan || ["OPEN", "PENDING"].includes(deriveTradeLifecycle(trade));
               }
             )
             .map((trade) => serializeTradeForUser(trade, user.id));
@@ -9640,21 +9678,21 @@ async function handleApi(req, res, url) {
         return true;
       }
       const lifecycleStatus = deriveTradeLifecycle(trade);
-      if (lifecycleStatus !== "OPEN") {
+      if (!trade.copyPlan && lifecycleStatus !== "OPEN") {
         sendJson(res, 400, { error: "This order is still queued. You can only join filled open trades." });
         return true;
       }
-      await assertTradeCanAcceptInvestment(trade);
+      if (!trade.copyPlan) await assertTradeCanAcceptInvestment(trade);
       const marketCache = new Map();
-      const baselinePnlPercent = await getTradePnlPercentSnapshot(trade, marketCache);
-      const baselinePrice = await getTradeCurrentPriceSnapshot(trade, marketCache);
+      const baselinePnlPercent = trade.copyPlan ? 0 : await getTradePnlPercentSnapshot(trade, marketCache);
+      const baselinePrice = trade.copyPlan ? 0 : await getTradeCurrentPriceSnapshot(trade, marketCache);
       const investment = await withUserFinancialLock(user.id, async () => {
         if (getUserTradeInvestmentRecord(trade.id, user.id)) {
           throw new Error("You already joined this trade and cannot join it again.");
         }
         const { amountUsdt, freeUsdt } = resolveTradeInvestmentAmount(user.id, body);
         const maxJoinAmountUsdt = getTradeAdminUsdtAmount(trade);
-        if (compare(amountUsdt, maxJoinAmountUsdt) > 0) {
+        if (!trade.copyPlan && compare(amountUsdt, maxJoinAmountUsdt) > 0) {
           const error = new Error("Sorry, you cannot join this trade with an amount higher than the admin's trade amount. Please reduce your amount to join.");
           error.code = "TRADE_JOIN_AMOUNT_EXCEEDS_ADMIN_TRADE";
           error.maxJoinAmountUsdt = maxJoinAmountUsdt;
@@ -9665,10 +9703,12 @@ async function handleApi(req, res, url) {
         const investmentId = randomId(12);
         const fundingSources = reserveTradeInvestmentFunds(user, amountUsdt, investmentId);
         markFinancialMutation(fundingSources.map((source) => financialService.ensureWallet(user.id, source.currency)), "TRADE_JOIN", investmentId);
+        const durationHours = Number(trade.copyPlan?.durationHours || 0);
         const nextInvestment = {
           id: investmentId, userId: user.id, tradeId: trade.id, amountUsdt, fundingSources,
           baselinePnlPercent: String(Number(baselinePnlPercent.toFixed(8))),
           baselinePrice: String(Number(baselinePrice || 0).toFixed(8)), status: "ACTIVE",
+          ...(trade.copyPlan ? { profitPercent: String(Number(trade.copyPlan.profitPercent)), durationHours, expiresAt: new Date(Date.now() + durationHours * 3600000).toISOString() } : {}),
           joinedAt: nowIso(), updatedAt: nowIso(), stoppedAt: null, settledPnlUsdt: "0",
           membershipAtJoin: membershipAtJoin.plan,
         };
@@ -10055,9 +10095,18 @@ async function handleApi(req, res, url) {
 
     try {
       const body = await readBody(req);
+      const profitPercent = Number(body.copyProfitPercent);
+      const durationHours = Number(body.copyDurationHours);
+      if (!Number.isFinite(profitPercent) || profitPercent < 0.01 || profitPercent > 1000) {
+        throw new Error("Set a copied trade profit between 0.01% and 1000%.");
+      }
+      if (!Number.isFinite(durationHours) || durationHours < 1 / 60 || durationHours > 8760) {
+        throw new Error("Set a copied trade duration between 1 minute and 365 days.");
+      }
       const orderInput = normalizeOrderInput(body);
       const { trade } = await createTradeIntent(admin, exchange, orderInput, {
         throwOnTpFailure: true,
+        copyPlan: { profitPercent, durationHours },
       });
       sendJson(res, 201, { trade: serializeTradeForAdmin(trade) });
     } catch (error) {
@@ -10499,6 +10548,9 @@ async function startServer() {
   setInterval(() => {
     void sweepExpiredSignals();
   }, SIGNAL_EXPIRY_SWEEP_MS);
+  setInterval(() => {
+    void settleExpiredConfiguredTradeInvestments();
+  }, 15000);
 }
 
 async function runPostListenStartupTasks() {
