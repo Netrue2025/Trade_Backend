@@ -933,7 +933,7 @@ function buildSecurityHeaders() {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "same-origin",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(self)",
   };
 }
 
@@ -1739,10 +1739,6 @@ function findUserByLogin(login) {
       String(item.email || "").trim().toLowerCase() === normalized ||
       String(item.name || "").trim().toLowerCase() === normalized
   );
-}
-
-function isAdminSelfSignupEnabled() {
-  return ["1", "true", "yes", "on"].includes(String(getEnvValue("ADMIN_SELF_SIGNUP_ENABLED") || "").trim().toLowerCase());
 }
 
 function writeSse(res, payload) {
@@ -6262,11 +6258,6 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/auth/register") {
     const body = await readBody(req);
     const password = String(body.password || "");
-    const registrationCountry = String(body.registrationCountry || body.country || "").trim().replace(/\s+/g, " ");
-    if (registrationCountry.length > 80) {
-      sendJson(res, 400, { error: "Country name is too long." });
-      return true;
-    }
     const role = normalizeAuthRole(body.role, "user");
     const exchange = normalizeExchange(body.exchange, "bybit");
     let identity;
@@ -6289,7 +6280,7 @@ async function handleApi(req, res, url) {
       sendJson(res, 400, { error: error.message });
       return true;
     }
-    if (role === "admin" && !isAdminSelfSignupEnabled()) {
+    if (role === "admin") {
       sendJson(res, 403, { error: "Admin signup is disabled. Sign in with an existing admin account." });
       return true;
     }
@@ -6323,7 +6314,6 @@ async function handleApi(req, res, url) {
       name,
       firstName,
       lastName,
-      registrationCountry,
       role,
       mirrorEnabled: role === "user",
       passwordSalt: salt,
@@ -6357,12 +6347,11 @@ async function handleApi(req, res, url) {
         profile,
         requestedRole,
         exchange: normalizeExchange(body.exchange, "bybit"),
-        allowAdminSignup: isAdminSelfSignupEnabled(),
+        allowAdminSignup: false,
         idGenerator: () => randomId(12),
         clock: nowIso,
       });
       if (isNewUser) {
-        user.registrationCountry = String(body.registrationCountry || body.country || "").trim().replace(/\s+/g, " ").slice(0, 80);
         financialService.ensureState();
         financialService.registerReferralForSignup(user, String(body.referralCode || body.referral || body.ref || "").trim(), getRequestMeta(req));
         financialService.audit(user, "USER_REGISTERED", "User", user.id, { provider: "google" }, getRequestMeta(req));
