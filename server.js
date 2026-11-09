@@ -6262,6 +6262,11 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/auth/register") {
     const body = await readBody(req);
     const password = String(body.password || "");
+    const registrationCountry = String(body.registrationCountry || body.country || "").trim().replace(/\s+/g, " ");
+    if (registrationCountry.length > 80) {
+      sendJson(res, 400, { error: "Country name is too long." });
+      return true;
+    }
     const role = normalizeAuthRole(body.role, "user");
     const exchange = normalizeExchange(body.exchange, "bybit");
     let identity;
@@ -6318,6 +6323,7 @@ async function handleApi(req, res, url) {
       name,
       firstName,
       lastName,
+      registrationCountry,
       role,
       mirrorEnabled: role === "user",
       passwordSalt: salt,
@@ -6356,6 +6362,7 @@ async function handleApi(req, res, url) {
         clock: nowIso,
       });
       if (isNewUser) {
+        user.registrationCountry = String(body.registrationCountry || body.country || "").trim().replace(/\s+/g, " ").slice(0, 80);
         financialService.ensureState();
         financialService.registerReferralForSignup(user, String(body.referralCode || body.referral || body.ref || "").trim(), getRequestMeta(req));
         financialService.audit(user, "USER_REGISTERED", "User", user.id, { provider: "google" }, getRequestMeta(req));
