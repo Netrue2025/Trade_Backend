@@ -72,6 +72,7 @@ const {
 const { SubscriberModel } = require("./models/subscriberModel");
 const { orderEvents } = require("./services/orderEvents");
 const { FinancialService } = require("./services/financialService");
+const { NairaExchangeService } = require("./services/nairaExchangeService");
 const { AdminBonusReversalService, EXECUTION_ACTION: BONUS_REVERSAL_EXECUTION_ACTION } = require("./services/adminBonusReversalService");
 const { ArxAbandonedPrincipalReleaseService, EXECUTION_ACTION: ARX_PRINCIPAL_RELEASE_EXECUTION_ACTION } = require("./services/arxAbandonedPrincipalReleaseService");
 const { LitStrandedTradeCancellationService, TARGET_TRADE_ID: LIT_RECOVERY_TRADE_ID, TRADE_CANCELLATION_REASON: LIT_RECOVERY_CANCELLATION_REASON } = require("./services/litStrandedTradeCancellationService");
@@ -160,6 +161,7 @@ const PERFORMANCE_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 
 let db = null;
 let financialService = null;
+let nairaExchangeService = null;
 let adminBonusReversalService = null;
 let arxAbandonedPrincipalReleaseService = null;
 let litStrandedTradeCancellationService = null;
@@ -6315,6 +6317,7 @@ async function handleApi(req, res, url) {
       firstName,
       lastName,
       role,
+      countryCode: ["NG", "OTHER"].includes(String(body.countryCode || "").toUpperCase()) ? String(body.countryCode).toUpperCase() : "",
       mirrorEnabled: role === "user",
       passwordSalt: salt,
       passwordHash: hash,
@@ -6351,6 +6354,9 @@ async function handleApi(req, res, url) {
         idGenerator: () => randomId(12),
         clock: nowIso,
       });
+      if (isNewUser && ["NG", "OTHER"].includes(String(body.countryCode || "").toUpperCase())) {
+        user.countryCode = String(body.countryCode).toUpperCase();
+      }
       if (isNewUser) {
         financialService.ensureState();
         financialService.registerReferralForSignup(user, String(body.referralCode || body.referral || body.ref || "").trim(), getRequestMeta(req));
@@ -6412,6 +6418,22 @@ async function handleApi(req, res, url) {
     clearSession(req);
     clearSessionCookie(req, res);
     sendJson(res, 200, { ok: true });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/user/location") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    const body = await readBody(req);
+    const countryCode = String(body.countryCode || "").trim().toUpperCase();
+    if (!["NG", "OTHER"].includes(countryCode)) {
+      sendJson(res, 400, { error: "Enable location to set your account country." });
+      return true;
+    }
+    user.countryCode = countryCode;
+    user.countryUpdatedAt = nowIso();
+    await persist({ required: true, fields: ["users"] });
+    sendJson(res, 200, { user: sanitizeUser(user) });
     return true;
   }
 
@@ -7110,6 +7132,87 @@ async function handleApi(req, res, url) {
       const deposit = financialService.createDeposit(user, await readBody(req), getRequestMeta(req));
       await persist({ required: true, fields: ["deposits", "idempotencyKeys"] });
       sendJson(res, 201, { deposit });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/naira-exchange") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      sendJson(res, 200, { settings: nairaExchangeService.getSettings(user), requests: nairaExchangeService.list(user) });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/naira-exchange") {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    if (isPaymentRateLimited(req, user.id, "naira-exchange-create")) {
+      sendJson(res, 429, { error: "Too many exchange requests. Try again shortly." });
+      return true;
+    }
+    try {
+      const request = nairaExchangeService.create(user, await readBody(req));
+      await persist({ required: true, fields: ["exchangeRequests"] });
+      sendJson(res, 201, { request });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  const exchangePaymentMatch = url.pathname.match(/^\/api\/naira-exchange\/([^/]+)\/payment$/);
+  if (req.method === "POST" && exchangePaymentMatch) {
+    const user = requireAuth(req, res, "user");
+    if (!user) return true;
+    try {
+      const request = nairaExchangeService.submitPayment(user, decodeURIComponent(exchangePaymentMatch[1]), await readBody(req));
+      await persist({ required: true, fields: ["exchangeRequests", "notifications"] });
+      sendJson(res, 200, { request });
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { error: error.message });
+    }
+    return true;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/admin/naira-exchange") {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    sendJson(res, 200, { requests: nairaExchangeService.listAdmin() });
+    return true;
+  }
+
+  const adminExchangeActionMatch = url.pathname.match(/^\/api\/admin\/naira-exchange\/([^/]+)\/(approve|reject)$/);
+  if (req.method === "POST" && adminExchangeActionMatch) {
+    const admin = requireAuth(req, res, "admin");
+    if (!admin) return true;
+    const requestId = decodeURIComponent(adminExchangeActionMatch[1]);
+    const action = adminExchangeActionMatch[2];
+    const existing = (db.exchangeRequests || []).find((item) => item.id === requestId);
+    if (!existing) { sendJson(res, 404, { error: "Exchange request not found." }); return true; }
+    try {
+      const body = await readBody(req);
+      const result = await withUserFinancialLock(existing.userId, async () => {
+        if (action === "approve") {
+          const approved = nairaExchangeService.approve(admin, requestId, body);
+          if (!approved.duplicate) {
+            markFinancialMutation(approved.wallet, "NAIRA_EXCHANGE_APPROVED", requestId);
+            financialService.audit(admin, "NAIRA_EXCHANGE_APPROVED", "ExchangeRequest", requestId, { side: approved.request.side, amount: approved.request.amount, receiveAmount: approved.request.receiveAmount }, getRequestMeta(req));
+            await persist({ required: true, fields: ["meta", "exchangeRequests", "wallets", "transactions", "notifications", "auditLogs"], operation: { reason: "NAIRA_EXCHANGE_APPROVED", reference: requestId, userId: existing.userId } });
+          }
+          return approved.request;
+        }
+        const rejected = nairaExchangeService.reject(admin, requestId, body);
+        financialService.audit(admin, "NAIRA_EXCHANGE_REJECTED", "ExchangeRequest", requestId, { side: rejected.side }, getRequestMeta(req));
+        await persist({ required: true, fields: ["exchangeRequests", "notifications", "auditLogs"] });
+        return rejected;
+      });
+      sendJson(res, 200, { request: result });
     } catch (error) {
       sendJson(res, error.statusCode || 400, { error: error.message });
     }
@@ -10547,6 +10650,7 @@ async function startServer() {
     notificationPublisher: (notification) => pushNotificationService.sendForNotification(notification),
     emailPublisher: (message) => emailNotificationService.sendAdminOtpRequest(message),
   });
+  nairaExchangeService = new NairaExchangeService({ db, financialService });
   depositApprovalService = new DepositApprovalService({
     financialService,
     withUserFinancialLock,

@@ -3284,6 +3284,9 @@ class FinancialService {
 
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Deposit amount");
+    if (currency === "NGN" && user.role === "user" && user.countryCode !== "NG") {
+      throw new Error("Naira deposits are available only to Nigerian accounts. Use USDT or enable location in Settings.");
+    }
     const settings = this.db.systemSettings.deposit;
     if (currency === "NGN" && settings.ngnEnabled === false) {
       throw new Error("NGN deposits are currently disabled.");
@@ -4067,6 +4070,9 @@ class FinancialService {
 
     const currency = normalizeCurrency(input.currency);
     const amount = normalizeAmount(input.amount, "Withdrawal amount");
+    if (currency === "NGN" && user.role === "user" && user.countryCode !== "NG") {
+      throw new Error("Naira withdrawals are available only to Nigerian accounts. Use USDT or enable location in Settings.");
+    }
     this.validateWithdrawalSettings(currency, amount);
     const fee = currency === "NGN"
       ? normalizeNonNegativeAmount(this.db.systemSettings.withdrawal.ngnFee || DEFAULT_NGN_WITHDRAWAL_FEE, "NGN withdrawal fee")
